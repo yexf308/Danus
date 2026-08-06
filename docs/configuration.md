@@ -62,6 +62,10 @@ These live in `config/codex.env`. See `getting-started.md` §2 and
   `claude` CLI), web-only tools, and the prompt on stdin (never argv, which is
   world-readable on a shared host). It sees the elaboration and the public web,
   nothing else.
+- Consult effort is selected per call with `--effort`. Accepted values are
+  `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`. All transports support
+  through `max`; a `gpt_pro` `max` request is never silently retried without its
+  requested reasoning effort.
 
 ## Models & reasoning effort
 

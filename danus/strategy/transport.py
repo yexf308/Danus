@@ -2,10 +2,10 @@
 
 A ``Transport`` takes a prompt and returns a uniform JSON envelope (see
 ``shape_envelope``). The configured default is ``off``. When explicitly
-selected, ``GptProTransport`` drives an
-OpenAI-compatible **Responses** API in ``background=True, stream=True`` mode
-(required — a synchronous xhigh call hangs the proxy) and steps its params down
-only on a 400. ``OffTransport`` short-circuits to a disabled result.
+selected, ``GptProTransport`` drives an OpenAI-compatible **Responses** API in
+streaming mode (preferring
+``background=True`` when supported) and steps its params down only on a 400.
+``OffTransport`` short-circuits to a disabled result.
 
 This module is a STATELESS gateway: prompt in, envelope out. It never touches the
 truth stores; the only side effect (the spend ledger) lives in ``ledger.py`` and
@@ -51,6 +51,7 @@ def shape_envelope(
     status: Optional[str],
     price_in: float,
     price_out: float,
+    output_text_override: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Shape a raw Responses result into the pinned JSON envelope.
 
@@ -71,6 +72,8 @@ def shape_envelope(
                 tool_calls.append(ty)
         output_text = getattr(final, "output_text", "") or ""
         usage = getattr(final, "usage", None)
+    if not output_text and output_text_override:
+        output_text = output_text_override
     u = usage.model_dump() if (usage is not None and hasattr(usage, "model_dump")) else {}
     in_tok = int(u.get("input_tokens", 0) or 0)
     out_tok = int(u.get("output_tokens", 0) or 0)
@@ -133,7 +136,7 @@ class OffTransport(Transport):
 
 
 class GptProTransport(Transport):
-    """OpenAI-compatible Responses transport (the default).
+    """Explicitly selected OpenAI-compatible Responses transport.
 
     ``client_factory`` lets tests inject a stub client without a real OpenAI
     package or network; production builds it from the config.
@@ -157,14 +160,44 @@ class GptProTransport(Transport):
     @staticmethod
     def _run_stream(client, create_kwargs, on_progress=None):
         """Drive ONE background+stream Responses call to its end. Returns
-        (final_response_or_None, n_events, status, seconds). Streamed events keep
-        the connection alive so a long initial reasoning gap never hangs."""
+        (final_response_or_None, n_events, status, seconds, streamed_text).
+        Streamed events keep
+        the connection alive so a long initial reasoning gap never hangs. A
+        compatible gateway may reject ``background`` or ``max_output_tokens``;
+        retry without only the named parameter while preserving every
+        reasoning/tool parameter in those specific cases."""
+        from openai import BadRequestError
+
         t0 = time.time()
         n = 0
         status: Optional[str] = None
         final = None
+        text_chunks: List[str] = []
         last_hb = t0
-        stream = client.responses.create(background=True, stream=True, **create_kwargs)
+        request_kwargs = {
+            "background": True,
+            "stream": True,
+            "store": False,
+            **create_kwargs,
+        }
+        while True:
+            try:
+                stream = client.responses.create(**request_kwargs)
+                break
+            except BadRequestError as exc:
+                message = str(exc).lower()
+                background_rejected = "background" in message and (
+                    "unsupported" in message
+                    or ("store" in message and "true" in message)
+                )
+                if background_rejected and "background" in request_kwargs:
+                    request_kwargs.pop("background")
+                    continue
+                if "unsupported" in message and "max_output_tokens" in message \
+                        and "max_output_tokens" in request_kwargs:
+                    request_kwargs.pop("max_output_tokens")
+                    continue
+                raise
         for ev in stream:
             n += 1
             et = getattr(ev, "type", "?")
@@ -178,32 +211,53 @@ class GptProTransport(Transport):
             elif et in ("response.failed", "response.incomplete"):
                 final = ev.response
                 status = getattr(ev.response, "status", et)
+            elif et == "response.output_text.delta":
+                delta = getattr(ev, "delta", "") or ""
+                if delta:
+                    text_chunks.append(delta)
             now = time.time()
             if on_progress and (now - last_hb >= 30 or et == "response.completed"):
                 on_progress(now - t0, status, n)
                 last_hb = now
-        return final, n, status, time.time() - t0
+        return final, n, status, time.time() - t0, "".join(text_chunks)
 
     def consult(self, prompt, *, effort, tools, max_output_tokens, on_progress=None):
-        """Background+stream consult; step params down ONLY on a 400 (param
-        rejected), never on a timeout/connection error (those must surface)."""
+        """Streaming consult; prefer background and step params down ONLY on a
+        400 (param rejected), never on a timeout/connection error (those must
+        surface)."""
         from openai import BadRequestError
 
         client = self._client_factory()
         tool_list = tools_for(tools)
-        # richest first; a 400 (a tool/effort the model rejects) steps down.
+        # Use the canonical Responses message-list shape. OpenAI accepts this and
+        # stricter compatible gateways reject the otherwise convenient string form.
+        input_items = [{
+            "role": "user",
+            "content": [{"type": "input_text", "text": prompt}],
+        }]
+        # Richest first. `max` is an explicit strongest-level request: simplify
+        # summary/tools if necessary, but never silently remove its effort. Lower
+        # levels retain the historical no-effort/bare compatibility fallback.
         attempts = [
             ("full", dict(reasoning={"effort": effort, "summary": "detailed"}, tools=tool_list)),
             ("no-tools", dict(reasoning={"effort": effort, "summary": "detailed"})),
-            ("no-effort", dict(reasoning={"summary": "detailed"}, tools=tool_list)),
-            ("bare", dict()),
         ]
+        if effort == "max":
+            attempts.extend([
+                ("no-summary", dict(reasoning={"effort": effort}, tools=tool_list)),
+                ("effort-only", dict(reasoning={"effort": effort})),
+            ])
+        else:
+            attempts.extend([
+                ("no-effort", dict(reasoning={"summary": "detailed"}, tools=tool_list)),
+                ("bare", dict()),
+            ])
         last: Optional[Exception] = None
         for name, extra in attempts:
             try:
-                final, n, status, dt = self._run_stream(
+                final, n, status, dt, streamed_text = self._run_stream(
                     client,
-                    dict(model=self.config.model, input=prompt,
+                    dict(model=self.config.model, input=input_items,
                          max_output_tokens=max_output_tokens, **extra),
                     on_progress=on_progress,
                 )
@@ -217,6 +271,7 @@ class GptProTransport(Transport):
                     status=status,
                     price_in=self.config.price_in,
                     price_out=self.config.price_out,
+                    output_text_override=streamed_text or None,
                 )
             except BadRequestError as e:
                 last = e
@@ -266,9 +321,20 @@ _SCRUB_ENV = (
     "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL",
 )
 
-# claude --effort accepts these; the consult CLI also offers "minimal", which claude
-# ignores (warns + uses default) — normalize it to the nearest supported level.
-_CLAUDE_CODE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+# Claude transports accept these; the consult CLI also offers "minimal", which is
+# normalized to the nearest supported level. Other unsupported values fail closed
+# instead of silently becoming a weak effort.
+_CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
+
+def _normalize_claude_effort(effort: str) -> str:
+    if effort == "minimal":
+        return "low"
+    if effort not in _CLAUDE_EFFORTS:
+        raise ValueError(
+            f"unsupported Claude effort {effort!r}; use low, medium, high, xhigh, or max"
+        )
+    return effort
 
 
 class ClaudeCodeTransport(Transport):
@@ -357,7 +423,7 @@ class ClaudeCodeTransport(Transport):
         }
 
     def consult(self, prompt, *, effort, tools, max_output_tokens, on_progress=None):
-        effort = effort if effort in _CLAUDE_CODE_EFFORTS else "low"  # "minimal" -> "low"
+        effort = _normalize_claude_effort(effort)
         cmd = [
             self.claude_bin, "-p",
             "--model", self.model,
@@ -424,9 +490,8 @@ class ClaudeCodeTransport(Transport):
 # do not "update" the date.
 _CLAUDE_API_FALLBACK_BETA = "server-side-fallback-2026-06-01"
 
-# `output_config.effort` accepts these; the consult CLI also offers "minimal",
-# which we normalize to the nearest supported level.
-_CLAUDE_API_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+# `output_config.effort` uses the same levels as Claude Code. The shared
+# normalizer maps only `minimal` to `low` and rejects unsupported levels.
 
 # Server tools hit an internal iteration cap and return stop_reason="pause_turn";
 # the documented handling is to re-send and let the server resume. Bound it.
@@ -563,7 +628,7 @@ class ClaudeApiTransport(Transport):
         from anthropic import BadRequestError  # lazy, mirrors the openai import
 
         client = self._client_factory()
-        eff = effort if effort in _CLAUDE_API_EFFORTS else "low"  # "minimal" -> "low"
+        eff = _normalize_claude_effort(effort)
         tool_list = claude_api_tools_for(tools)
         thinking = {"type": "adaptive", "display": "summarized"}
         # richest first; a 400 (a param/tool the model rejects) steps down.

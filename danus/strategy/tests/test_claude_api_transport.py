@@ -200,6 +200,18 @@ def test_request_shape_full_attempt():
     assert kw["messages"] == [{"role": "user", "content": "prove the lemma"}]
 
 
+def test_claude_api_transport_rejects_ultra():
+    _install_fake_anthropic()
+    client = _StubClient([_final()])
+    try:
+        _consult(ClaudeApiTransport(_config(), client_factory=lambda: client),
+                 effort="ultra")
+        assert False, "Claude transport must not silently weaken ultra"
+    except ValueError as exc:
+        assert "unsupported Claude effort" in str(exc)
+    assert client.calls == []
+
+
 def test_tools_none_omits_tools_param():
     _install_fake_anthropic()
     client = _StubClient([_final(web_calls=0)])

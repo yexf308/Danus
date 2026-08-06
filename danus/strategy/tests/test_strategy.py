@@ -61,9 +61,10 @@ class _Response:
 
 
 class _Event:
-    def __init__(self, type, response=None):
+    def __init__(self, type, response=None, delta=None):
         self.type = type
         self.response = response
+        self.delta = delta
 
 
 class _FakeBadRequest(Exception):
@@ -140,6 +141,7 @@ def test_api_transport_completed():
 
     def create(**kw):
         assert kw["background"] is True and kw["stream"] is True
+        assert kw["store"] is False
         return iter([_Event("response.completed", response=resp)])
 
     factory = _install_fake_openai(create)
@@ -147,6 +149,111 @@ def test_api_transport_completed():
         "prompt", effort="high", tools="auto", max_output_tokens=100)
     assert env["status"] == "completed" and env["reply"] == "hi"
     assert env["attempt"] == "full"
+
+
+def test_api_transport_recovers_text_from_stream_deltas():
+    """Some compatible gateways leave the completed response output empty."""
+    resp = _Response(output_text="", output=[],
+                     usage={"input_tokens": 10, "output_tokens": 20})
+
+    def create(**kw):
+        return iter([
+            _Event("response.output_text.delta", delta="CON"),
+            _Event("response.output_text.delta", delta="NECTED"),
+            _Event("response.completed", response=resp),
+        ])
+
+    factory = _install_fake_openai(create)
+    env = GptProTransport(_CFG, client_factory=factory).consult(
+        "prompt", effort="high", tools="none", max_output_tokens=100)
+    assert env["status"] == "completed"
+    assert env["reply"] == "CONNECTED"
+
+
+def test_api_transport_forwards_max_effort():
+    """The strongest supported effort passes through the gpt_pro request unchanged."""
+    resp = _Response(output_text="hi", usage={"input_tokens": 10, "output_tokens": 20})
+
+    def create(**kw):
+        assert kw["reasoning"]["effort"] == "max"
+        assert kw["store"] is False
+        assert kw["input"] == [{
+            "role": "user",
+            "content": [{"type": "input_text", "text": "prompt"}],
+        }]
+        return iter([_Event("response.completed", response=resp)])
+
+    factory = _install_fake_openai(create)
+    env = GptProTransport(_CFG, client_factory=factory).consult(
+        "prompt", effort="max", tools="none", max_output_tokens=100)
+    assert env["status"] == "completed"
+    assert env["attempt"] == "full"
+    assert env["effort"] == "max"
+
+
+def test_unsupported_gateway_params_retry_without_dropping_max():
+    calls = []
+    resp = _Response(output_text="hi", usage={"input_tokens": 10, "output_tokens": 20})
+
+    def create(**kw):
+        calls.append(kw)
+        assert kw["reasoning"]["effort"] == "max"
+        assert kw["store"] is False and kw["stream"] is True
+        if kw.get("background") is True:
+            raise _FakeBadRequest("Unsupported parameter: background")
+        if "max_output_tokens" in kw:
+            raise _FakeBadRequest("Unsupported parameter: max_output_tokens")
+        return iter([_Event("response.completed", response=resp)])
+
+    factory = _install_fake_openai(create)
+    env = GptProTransport(_CFG, client_factory=factory).consult(
+        "prompt", effort="max", tools="none", max_output_tokens=100)
+    assert len(calls) == 3
+    assert "background" not in calls[1]
+    assert "background" not in calls[2]
+    assert "max_output_tokens" not in calls[2]
+    assert env["status"] == "completed"
+    assert env["attempt"] == "full"
+    assert env["effort"] == "max"
+
+
+def test_background_store_requirement_retries_without_dropping_max():
+    calls = []
+    resp = _Response(output_text="hi", usage={"input_tokens": 10, "output_tokens": 20})
+
+    def create(**kw):
+        calls.append(kw)
+        assert kw["reasoning"]["effort"] == "max"
+        assert kw["store"] is False and kw["stream"] is True
+        if kw.get("background") is True:
+            raise _FakeBadRequest("Background mode requires store=true")
+        return iter([_Event("response.completed", response=resp)])
+
+    factory = _install_fake_openai(create)
+    env = GptProTransport(_CFG, client_factory=factory).consult(
+        "prompt", effort="max", tools="none", max_output_tokens=100)
+    assert len(calls) == 2
+    assert "background" not in calls[1]
+    assert env["status"] == "completed"
+    assert env["attempt"] == "full"
+    assert env["effort"] == "max"
+
+
+def test_max_effort_is_never_silently_removed_on_400():
+    seen = []
+
+    def create(**kw):
+        seen.append(kw["reasoning"]["effort"])
+        raise _FakeBadRequest("unsupported effort")
+
+    factory = _install_fake_openai(create)
+    try:
+        GptProTransport(_CFG, client_factory=factory).consult(
+            "prompt", effort="max", tools="auto", max_output_tokens=100)
+        assert False, "max must fail rather than run without the requested effort"
+    except _FakeBadRequest:
+        pass
+    assert seen == ["max", "max", "max", "max"]
 
 
 def test_step_down_ordering_on_400():
@@ -458,6 +565,11 @@ def test_cli_api_success_full_path(capsys):
             assert rec["cost_usd"] == 220.5
     finally:
         GptProTransport.__init__ = orig_init
+
+
+def test_cli_accepts_max_effort():
+    args = cli._build_parser().parse_args(["--stdin", "--effort", "max"])
+    assert args.effort == "max"
 
 
 def test_cli_api_warns_and_fails_on_non_completed_status(capsys):

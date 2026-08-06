@@ -172,6 +172,17 @@ def test_claude_effort_minimal_normalized_to_low():
     assert cmd[i + 1] == "low"  # "minimal" (not a claude effort) -> "low"
 
 
+def test_claude_code_transport_rejects_ultra():
+    rec = _Recorder(_fake_claude_json())
+    try:
+        ClaudeCodeTransport("m", runner=rec).consult(
+            "p", effort="ultra", tools="auto", max_output_tokens=10)
+        assert False, "Claude transport must not silently weaken ultra"
+    except ValueError as exc:
+        assert "unsupported Claude effort" in str(exc)
+    assert rec.calls == []
+
+
 def test_claude_code_transport_fallback_detected():
     # requested Fable, but Opus actually did the work => flagged as a fallback
     rec = _Recorder(_fake_claude_json(model="claude-opus-4-8"))

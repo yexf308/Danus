@@ -33,6 +33,9 @@ from .transport import (
 )
 
 
+EFFORT_CHOICES = ("minimal", "low", "medium", "high", "xhigh", "max")
+
+
 def _claude_available(binary: str) -> bool:
     """True if the ``claude`` CLI is invokable (on PATH, or an executable path)."""
     if shutil.which(binary):
@@ -65,8 +68,12 @@ def _build_parser() -> argparse.ArgumentParser:
     src = ap.add_mutually_exclusive_group(required=True)
     src.add_argument("--file", help="read the elaboration / prompt from this file")
     src.add_argument("--stdin", action="store_true", help="read the prompt from stdin")
-    ap.add_argument("--effort", choices=["minimal", "low", "medium", "high", "xhigh"],
-                    default="high", help="reasoning effort (default high; xhigh = strongest)")
+    ap.add_argument(
+        "--effort",
+        choices=EFFORT_CHOICES,
+        default="high",
+        help="reasoning effort (default high; max = strongest supported level)",
+    )
     ap.add_argument("--tools", choices=["auto", "web", "none"], default="auto",
                     help="tool set for the richest attempts (auto = web_search + code_interpreter)")
     ap.add_argument("--project", help="project dir — append a spend record to "
