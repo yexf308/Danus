@@ -46,6 +46,7 @@ import sys
 import tempfile
 
 from danus import codex
+from danus.gateway_runtime import require_gateway_runtime
 
 DEFAULT_MODEL = codex.DEFAULT_MODEL
 DEFAULT_EFFORT = codex.DEFAULT_EFFORT
@@ -66,7 +67,7 @@ def _gateway_config_arg(gateway_role: str) -> str:
         + command
         + ',args=["-m","danus.gateway"],env={DANUS_ROLE='
         + role
-        + "}}"
+        + '},default_tools_approval_mode="approve",required=true}'
     )
 
 
@@ -116,6 +117,8 @@ def run_codex(
       gateway's read-only tool + web search — codex still cannot touch the project
       tree; the caller (``server.reference_verify``) is the sole writer of the ledger.
     """
+    if networked:
+        require_gateway_runtime()
     codex_bin = codex.resolve_bin()
     if networked:
         tail = (

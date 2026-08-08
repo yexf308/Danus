@@ -22,6 +22,8 @@ import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from danus.gateway_runtime import GatewayRuntimeUnavailable
+
 PROJECT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 _STDERR_TAIL_CHARS = 2000
@@ -116,10 +118,12 @@ def classify_outcome(cp_or_exc: Any, *, artifact_noun: str = "artifact") -> Dict
 
     ``cp_or_exc`` is either a ``subprocess.CompletedProcess`` (the driver
     returned) or the exception the driver raised (``TimeoutExpired`` /
-    ``FileNotFoundError``). Returns ``{status, returncode, stdout, stderr_tail}``
+    ``FileNotFoundError`` / ``GatewayRuntimeUnavailable``). Returns
+    ``{status, returncode, stdout, stderr_tail}``
     plus an ``error`` message when not ``ok``. ``status="ok"`` requires a zero exit
-    code AND non-empty stdout — a nonzero exit, a timeout, a missing binary, or
-    empty stdout is never reported as success. ``artifact_noun`` names the thing
+    code AND non-empty stdout — a nonzero exit, a timeout, a missing binary, a
+    broken gateway runtime, or empty stdout is never reported as success.
+    ``artifact_noun`` names the thing
     that was expected ("artifact" / "report") for the empty-stdout message."""
     if isinstance(cp_or_exc, subprocess.TimeoutExpired):
         return {"status": "timeout", "returncode": None, "stdout": "",
@@ -127,6 +131,10 @@ def classify_outcome(cp_or_exc: Any, *, artifact_noun: str = "artifact") -> Dict
     if isinstance(cp_or_exc, FileNotFoundError):
         return {"status": "error", "returncode": None, "stdout": "",
                 "stderr_tail": "", "error": f"codex binary not found: {cp_or_exc}"}
+    if isinstance(cp_or_exc, GatewayRuntimeUnavailable):
+        return {"status": "error", "returncode": None, "stdout": "",
+                "stderr_tail": "",
+                "error": f"gateway runtime unavailable: {cp_or_exc}"}
 
     cp = cp_or_exc
     stdout = cp.stdout or ""

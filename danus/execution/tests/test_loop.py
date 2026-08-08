@@ -37,6 +37,8 @@ from danus.execution import loop, scaffold
 @contextmanager
 def _env(**kw):
     old = {k: os.environ.get(k) for k in kw}
+    old_preflight = loop.require_gateway_runtime
+    loop.require_gateway_runtime = lambda: None
     for k, v in kw.items():
         if v is None:
             os.environ.pop(k, None)
@@ -45,6 +47,7 @@ def _env(**kw):
     try:
         yield
     finally:
+        loop.require_gateway_runtime = old_preflight
         for k, v in old.items():
             if v is None:
                 os.environ.pop(k, None)
@@ -128,6 +131,29 @@ def test_run_round_missing_binary_returns_127(tmp: Path):
                             "prompt", log, hard_timeout=30)
     assert rc == 127
     assert "codex binary not found" in log.read_text()
+
+
+def test_run_round_gateway_preflight_failure_starts_no_codex(tmp: Path, monkeypatch):
+    wl = _mk_worker(tmp)
+    log = wl.dir / "preflight.log"
+    codex_calls = []
+
+    def fail_preflight():
+        raise loop.GatewayRuntimeUnavailable("broken mcp import")
+
+    monkeypatch.setattr(loop, "require_gateway_runtime", fail_preflight)
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: codex_calls.append(a))
+    rc = loop.run_round(
+        wl,
+        {"MODEL": "m", "REASONING_EFFORT": "high"},
+        "prompt",
+        log,
+        hard_timeout=1,
+    )
+
+    assert rc == 126
+    assert codex_calls == []
+    assert "gateway runtime unavailable" in log.read_text()
 
 
 # --- run_round: unresponsive child → terminate times out → kill → 124 ------ #
@@ -275,6 +301,37 @@ def test_main_codex_missing_127(tmp: Path):
 def test_main_missing_worker_dir(tmp: Path):
     rc = loop.main(str(tmp / "nope"))
     assert rc == 2
+
+
+def test_main_gateway_preflight_fails_before_any_state_or_launch(tmp: Path, monkeypatch):
+    wl = _mk_worker(tmp)
+    calls = {"config": 0, "status": 0, "popen": 0}
+
+    def fail_preflight():
+        raise loop.GatewayRuntimeUnavailable("missing danus.gateway.server")
+
+    monkeypatch.setattr(loop, "require_gateway_runtime", fail_preflight)
+    monkeypatch.setattr(
+        scaffold,
+        "write_codex_config",
+        lambda *_args, **_kwargs: calls.__setitem__("config", calls["config"] + 1),
+    )
+    monkeypatch.setattr(
+        loop,
+        "write_status",
+        lambda *_args, **_kwargs: calls.__setitem__("status", calls["status"] + 1),
+    )
+    monkeypatch.setattr(
+        subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: calls.__setitem__("popen", calls["popen"] + 1),
+    )
+
+    assert loop.main(str(wl.dir)) == 126
+    assert calls == {"config": 0, "status": 0, "popen": 0}
+    assert not wl.codex_config.exists()
+    assert not wl.logs.exists()
+    assert not wl.status.exists()
 
 
 # --- SIGTERM handler: terminate child, write terminated, exit 0 ------------ #

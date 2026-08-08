@@ -20,7 +20,8 @@ danus/execution/
 `project.json`; each `workers/<worker>/` is a codex cwd with `AGENTS.md` →
 `agents/contracts/worker.md`, `.agents/skills` → `agents/skills/worker`, a
 `.codex/config.toml` (MCP = `python -m danus.gateway`, `DANUS_ROLE=worker`,
-`DANUS_VERIFY_URL`, `tool_timeout_sec=3600`), `TASK.md`, `local_memory/`, and the
+`DANUS_VERIFY_URL`, `tool_timeout_sec=3600`, tool approval `approve`,
+`required=true`), `TASK.md`, `local_memory/`, and the
 control files (`.status.json` `.pid` `.stop` `logs/`). `agents_root` =
 `DANUS_AGENTS_ROOT` (default `runtime/projects`).
 
@@ -34,6 +35,9 @@ loop + its codex child. Stop conditions checked at the round boundary: `.stop` f
 (5). Config read at call time (`DANUS_ROUND_HARD_TIMEOUT` 4h, `DANUS_ROUND_BEAT` 5s).
 `.status.json` is written atomically. **Resumability is continuity in the stores**,
 not process state — a fresh `start` rebuilds context from memory + the fact graph.
+Before any worker Codex process starts, a separate interpreter probe imports the
+gateway server and FastMCP runtime; a failed import ends the worker without a
+Codex call. Codex also treats the configured gateway as required.
 
 ## Connects to
 

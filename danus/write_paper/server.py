@@ -40,6 +40,7 @@ from danus._mcp import FastMCP
 
 from danus.authoring import driver
 from danus.authoring.common import classify_outcome, leak_findings, resolve_project
+from danus.gateway_runtime import GatewayRuntimeUnavailable
 from danus.core import FactGraph
 from danus.core._util import utc_now
 
@@ -115,12 +116,13 @@ def _drive_networked(prompt: str) -> Dict[str, Any]:
     gateway injected at ``DANUS_ROLE=verifier`` (read-only ``search_arxiv_theorems``,
     minimum privilege) + codex's built-in ``web_search``. Used ONLY by
     ``reference_verify`` — the sole tool that needs live arXiv/web access. Same honesty
-    classifier (a nonzero exit / empty stdout / timeout is never ``ok``); also
-    attaches ``stderr_full`` + ``cmd`` for the run log."""
+    classifier (a nonzero exit / empty stdout / timeout / gateway-preflight
+    failure is never ``ok``); also attaches ``stderr_full`` + ``cmd`` for the run
+    log."""
     try:
         cp: Any = driver.run_codex(prompt, model=_model(), effort=_effort(),
                                    networked=True, gateway_role="verifier")
-    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+    except (subprocess.TimeoutExpired, FileNotFoundError, GatewayRuntimeUnavailable) as e:
         cp = e
     return _attach_raw(classify_outcome(cp, artifact_noun="verdicts"), cp)
 

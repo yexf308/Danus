@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import tempfile
+import tomllib
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -109,10 +111,25 @@ def test_do_new_scaffolds_project(tmp: Path):
             assert (wl.dir / "AGENTS.md").resolve() == L.worker_md().resolve()
             assert (wl.dir / ".agents" / "skills").resolve() == L.worker_skills_dir().resolve()
             cfg = wl.codex_config.read_text()
-            assert 'DANUS_ROLE = "worker"' in cfg
-            assert 'args = ["-m", "danus.gateway"]' in cfg  # pinned MCP launch
-            assert "tool_timeout_sec = 3600" in cfg
-            assert f'DANUS_AUTHOR = "{w}"' in cfg and str(pdir) in cfg
+            parsed = tomllib.loads(cfg)
+            assert Path(sys.executable).is_absolute()
+            assert parsed == {
+                "mcp_servers": {
+                    "danus": {
+                        "command": sys.executable,
+                        "args": ["-m", "danus.gateway"],
+                        "default_tools_approval_mode": "approve",
+                        "required": True,
+                        "tool_timeout_sec": 3600,
+                        "env": {
+                            "DANUS_PROJECT_DIR": str(pdir),
+                            "DANUS_AUTHOR": w,
+                            "DANUS_ROLE": "worker",
+                            "DANUS_VERIFY_URL": "http://127.0.0.1:8091/verify",
+                        },
+                    }
+                }
+            }
             role = wl.role.read_text()
             assert f"REASONING_EFFORT={eff}" in role and "MODEL=gpt-5.5" in role
             assert "(unassigned" in wl.task.read_text()

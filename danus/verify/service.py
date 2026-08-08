@@ -31,6 +31,7 @@ from danus.core import (
     VERIFICATION_CONTEXT_SCHEMA_VERSION,
     verification_context_digest,
 )
+from danus.gateway_runtime import GatewayRuntimeUnavailable, require_gateway_runtime
 
 from .launcher import _allocate_run_id, run_codex_verification
 from .prechecks import run_prechecks
@@ -66,6 +67,17 @@ VERIFY_MAX_CONCURRENT_REQUESTS = _positive_int_env(
     "DANUS_VERIFY_MAX_CONCURRENT_REQUESTS", 1
 )
 _ADMISSION_SLOTS = threading.BoundedSemaphore(VERIFY_MAX_CONCURRENT_REQUESTS)
+
+
+def _preflight_gateway_or_500() -> None:
+    """Reject before allocating a verifier run when its MCP runtime is broken."""
+    try:
+        require_gateway_runtime()
+    except GatewayRuntimeUnavailable as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"gateway runtime preflight failed: {exc}",
+        ) from exc
 
 
 def _require_exact_keys(value: Dict[str, Any], expected: set[str], path: str) -> None:
@@ -476,6 +488,7 @@ def verify(request: VerifyRequest) -> Dict[str, Any]:
                     "internal fact_id"
                 ),
             )
+        _preflight_gateway_or_500()
         run_id = _allocate_run_id(request.statement)
         # Keep old monkeypatches/callers that implement the original three-arg
         # launcher seam working for self-contained requests.
@@ -518,6 +531,7 @@ def verify(request: VerifyRequest) -> Dict[str, Any]:
             + "; ".join(details)
             + ")",
         )
+    _preflight_gateway_or_500()
     run_id = _allocate_run_id(request.statement)
     result = run_codex_verification(
         run_id=run_id,

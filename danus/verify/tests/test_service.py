@@ -34,6 +34,7 @@ from danus.core import (
     VERIFICATION_CONTEXT_SCHEMA_VERSION,
     verification_context_digest,
 )
+from danus.verify import launcher as verify_launcher
 from danus.verify import service
 
 _STMT = "For every integer n, n + 0 equals n."
@@ -134,13 +135,16 @@ def _fake_run(fn):
     """Replace the launcher's codex-run (imported into service) with a fake."""
     orig_run = service.run_codex_verification
     orig_alloc = service._allocate_run_id
+    orig_preflight = service.require_gateway_runtime
     service.run_codex_verification = fn
     service._allocate_run_id = lambda statement: "RID-fake"
+    service.require_gateway_runtime = lambda: None
     try:
         yield
     finally:
         service.run_codex_verification = orig_run
         service._allocate_run_id = orig_alloc
+        service.require_gateway_runtime = orig_preflight
 
 
 def _client():
@@ -472,6 +476,60 @@ def test_verify_p1_precheck_400():
     with _fake_run(_must_not_run):
         resp = _client().post("/verify", json={"statement": _STMT, "proof": bad})
     assert resp.status_code == 400 and "[P1 on proof]" in resp.json()["detail"]
+
+
+def test_gateway_preflight_failure_allocates_nothing_and_starts_no_codex(monkeypatch):
+    calls = {"allocate": 0, "codex": 0}
+
+    def fail_preflight():
+        raise service.GatewayRuntimeUnavailable("bad gateway import")
+
+    def allocate(_statement):
+        calls["allocate"] += 1
+        return "must-not-exist"
+
+    def codex(*args, **kwargs):
+        calls["codex"] += 1
+        raise AssertionError("codex must not run")
+
+    monkeypatch.setattr(service, "require_gateway_runtime", fail_preflight)
+    monkeypatch.setattr(service, "_allocate_run_id", allocate)
+    monkeypatch.setattr(service, "run_codex_verification", codex)
+    resp = _client().post("/verify", json={"statement": _STMT, "proof": _PROOF})
+
+    assert resp.status_code == 500
+    assert calls == {"allocate": 0, "codex": 0}
+    assert "gateway runtime preflight failed" in resp.json()["detail"]
+
+
+def test_second_preflight_failure_returns_500_without_result_or_codex(
+    tmp_path, monkeypatch
+):
+    results_root = tmp_path / "runs"
+    codex_calls = []
+
+    def fail_second_preflight():
+        raise verify_launcher.GatewayRuntimeUnavailable("runtime broke after admission")
+
+    monkeypatch.setattr(service, "require_gateway_runtime", lambda: None)
+    monkeypatch.setattr(
+        verify_launcher, "require_gateway_runtime", fail_second_preflight
+    )
+    monkeypatch.setattr(
+        verify_launcher.subprocess,
+        "run",
+        lambda *args, **kwargs: codex_calls.append((args, kwargs)),
+    )
+    monkeypatch.setenv("VERIFIER_RESULTS_DIR", str(results_root))
+
+    resp = _client().post("/verify", json={"statement": _STMT, "proof": _PROOF})
+
+    assert resp.status_code == 500
+    assert "runtime broke after admission" in resp.json()["detail"]
+    assert codex_calls == []
+    allocated = list(results_root.iterdir())
+    assert len(allocated) == 1
+    assert list(allocated[0].iterdir()) == []
 
 
 # --------------------------------------------------------------------------- #

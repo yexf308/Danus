@@ -145,6 +145,11 @@ proof unless a verifier requests a specific strict ancestor.
 
 ## Trust assumptions (security)
 
+- Before allocating a run id or result directory, the service uses the exact
+  current Python in an isolated subprocess to import `danus.gateway.server` and
+  `FastMCP`. Failure returns 500 without starting Codex; the trusted read-only
+  gateway is configured with tool approval `approve` and `required=true` in the
+  strict Codex config.
 - The verifier runs an ephemeral Codex session with a read-only shell sandbox,
   ignores user config/rules, and returns through a strict output schema. Its
   `VERIFY_AGENT_HOME` contract and skills remain trusted input. Read-only is not

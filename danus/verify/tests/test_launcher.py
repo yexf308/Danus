@@ -24,6 +24,7 @@ import os
 import stat
 import sys
 import tempfile
+import tomllib
 from contextlib import contextmanager
 from importlib import resources
 from pathlib import Path
@@ -187,7 +188,12 @@ def _service(stub_body: str, *, timeout: str = "0"):
                   VERIFY_AGENT_HOME=str(tmpd / "home"),
                   CODEX_TIMEOUT_SECONDS=timeout):
             (tmpd / "home").mkdir(exist_ok=True)
-            yield
+            original_preflight = launcher.require_gateway_runtime
+            launcher.require_gateway_runtime = lambda: None
+            try:
+                yield
+            finally:
+                launcher.require_gateway_runtime = original_preflight
 
 
 # --------------------------------------------------------------------------- #
@@ -208,11 +214,21 @@ def test_build_codex_command_shape():
     # gateway injected via -c with role=verifier
     assert "-c" in cmd
     assert any('mcp_servers.danus=' in a and 'DANUS_ROLE="verifier"' in a for a in cmd)
-    assert any(
-        "mcp_servers.danus=" in argument
-        and f"command={json.dumps(sys.executable)}" in argument
-        for argument in cmd
-    )
+    mcp_arguments = [
+        argument for argument in cmd if argument.startswith("mcp_servers.danus=")
+    ]
+    assert len(mcp_arguments) == 1
+    assert tomllib.loads(mcp_arguments[0]) == {
+        "mcp_servers": {
+            "danus": {
+                "command": sys.executable,
+                "args": ["-m", "danus.gateway"],
+                "env": {"DANUS_ROLE": "verifier"},
+                "default_tools_approval_mode": "approve",
+                "required": True,
+            }
+        }
+    }
     assert "--dangerously-bypass-approvals-and-sandbox" not in cmd
     assert cmd[cmd.index("--sandbox") + 1] == "read-only"
     assert "--ephemeral" in cmd and "--ignore-user-config" in cmd
@@ -229,6 +245,33 @@ def test_build_codex_command_shape():
     assert prompt.endswith("Do not write files or invoke a tool to persist the verdict.")
     assert "Run_id: RID" in prompt and _STMT in prompt
     assert "BEGIN_AUTHORITATIVE_FACT_CONTEXT_JSON" not in prompt
+
+
+def test_preflight_failure_creates_no_result_dir_and_starts_no_codex(
+    tmp_path, monkeypatch
+):
+    results_root = tmp_path / "runs"
+    codex_calls = []
+
+    def fail_preflight():
+        raise launcher.GatewayRuntimeUnavailable("broken gateway runtime")
+
+    monkeypatch.setattr(launcher, "require_gateway_runtime", fail_preflight)
+    monkeypatch.setattr(
+        launcher.subprocess,
+        "run",
+        lambda *args, **kwargs: codex_calls.append((args, kwargs)),
+    )
+    with _env(VERIFIER_RESULTS_DIR=str(results_root)):
+        try:
+            launcher.run_codex_verification("RID", _STMT, _PROOF)
+            assert False, "gateway failure must abort before verifier setup"
+        except HTTPException as exc:
+            assert exc.status_code == 500
+            assert "broken gateway runtime" in str(exc.detail)
+
+    assert codex_calls == []
+    assert not results_root.exists()
 
 
 def test_verifier_effort_is_independent_from_neutral_effort():

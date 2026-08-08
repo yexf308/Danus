@@ -37,6 +37,7 @@ from typing import Optional
 from . import layout as L
 from . import scaffold
 from danus import codex
+from danus.gateway_runtime import GatewayRuntimeUnavailable, require_gateway_runtime
 
 _FACT_ID_RE = re.compile(r'"?fact_id"?\s*[:=]\s*"?([0-9a-f]{16})"?')
 
@@ -132,6 +133,12 @@ def run_round(wl: L.WorkerLayout, role: dict, prompt: str, log_path: Path,
     hard-timeout (terminate → wait 10s → kill), or 127 if the codex binary is
     missing."""
     wdir = wl.dir
+    try:
+        require_gateway_runtime()
+    except GatewayRuntimeUnavailable as exc:
+        with open(log_path, "w", encoding="utf-8") as logf:
+            logf.write(f"[worker_loop] gateway runtime unavailable: {exc}\n")
+        return 126
     codex_bin = codex.resolve_bin()
     cmd = codex.exec_cmd(
         codex_bin, role["MODEL"], role["REASONING_EFFORT"],
@@ -184,6 +191,11 @@ def main(worker_dir: str) -> int:
         print(f"worker dir not found: {wdir}", file=sys.stderr)
         return 2
     wl = L.WorkerLayout(wdir)
+    try:
+        require_gateway_runtime()
+    except GatewayRuntimeUnavailable as exc:
+        print(f"gateway runtime unavailable: {exc}", file=sys.stderr)
+        return 126
     project_dir = wl.project_dir
     project = wl.project
     worker = wl.name
@@ -236,9 +248,14 @@ def main(worker_dir: str) -> int:
                 last_rc=rc, last_fact_id=_parse_last_fact_id(log_path),
             )
 
-            if rc == 127:                    # codex missing — do not spin
-                write_status(wl, state="error", error="codex binary not found")
-                return 127
+            if rc in (126, 127):             # launch prerequisite missing — do not spin
+                error = (
+                    "gateway runtime unavailable"
+                    if rc == 126
+                    else "codex binary not found"
+                )
+                write_status(wl, state="error", error=error)
+                return rc
             consec_fail = consec_fail + 1 if rc not in (0, 124) else 0
             if max_fail and consec_fail >= max_fail:
                 write_status(wl, state="error", error=f"{consec_fail} consecutive failed rounds")

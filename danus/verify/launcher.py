@@ -38,6 +38,7 @@ from fastapi import HTTPException
 
 from danus import codex
 from danus.core import validate_verification_output
+from danus.gateway_runtime import GatewayRuntimeUnavailable, require_gateway_runtime
 
 _HERE = Path(__file__).resolve().parent  # danus/verify/
 _REPO_ROOT = _HERE.parent.parent         # source-checkout root (parity tests only)
@@ -205,7 +206,8 @@ def _mcp_config_arg() -> str:
     return (
         "mcp_servers.danus={command="
         + command
-        + ',args=["-m","danus.gateway"],env={DANUS_ROLE="verifier"}}'
+        + ',args=["-m","danus.gateway"],env={DANUS_ROLE="verifier"},'
+        + 'default_tools_approval_mode="approve",required=true}'
     )
 
 
@@ -427,6 +429,13 @@ def run_codex_verification(
     JSON. Raises HTTPException 504 (timeout) / 500 (nonzero exit, no output, or
     bad/non-dict JSON) — the callers translate these into the fact_submit
     verify-error path."""
+    try:
+        require_gateway_runtime()
+    except GatewayRuntimeUnavailable as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"gateway runtime preflight failed: {exc}",
+        ) from exc
     results_dir = _results_dir(run_id)
     results_dir.mkdir(parents=True, exist_ok=True)
     log_path = results_dir / "log.md"

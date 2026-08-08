@@ -151,6 +151,9 @@ transport (paid), `claude_api` (the Anthropic API, per-token), or `claude_code`
   is truth; global memory is awareness.
 - Permission is enforced by the MCP role table (main cannot `fact_submit`; the
   verifier is read-only).
+- Gateway-backed Codex launches first probe the exact Python interpreter in an
+  isolated subprocess; a missing Danus/FastMCP runtime prevents the Codex call,
+  and Codex also requires the configured MCP server to start.
 - Content-addressed, cascade-revocable facts; a correct verdict plus the gateway's
   locked context-CAS/add is the sole write path.
 - The finished paper is itself re-verified as written (a dedicated paper-math

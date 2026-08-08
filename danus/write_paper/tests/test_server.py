@@ -746,6 +746,26 @@ def test_reference_verify_timeout_writes_nothing():
         assert ledger.read_text(encoding="utf-8") == led_before
 
 
+def test_reference_verify_gateway_preflight_failure_is_honest_and_writes_nothing():
+    with temp_project(with_tex=True) as pdir, env(
+        DANUS_PROJECT_DIR=str(pdir), DANUS_AGENTS_ROOT=None
+    ):
+        ledger = pdir / "paper" / "REFERENCE_LEDGER.md"
+        led_before = ledger.read_text(encoding="utf-8")
+        failure = server.GatewayRuntimeUnavailable("missing FastMCP")
+        with _fake_codex(raise_exc=failure):
+            out = server.reference_verify(findings="verify AC24")
+
+        assert out["status"] == "error"
+        assert out["returncode"] is None
+        assert out["verdicts"] == []
+        assert "gateway runtime unavailable" in out["error"]
+        assert ledger.read_text(encoding="utf-8") == led_before
+        log = Path(out["log_path"]).read_text(encoding="utf-8")
+        assert "status: error" in log
+        assert "gateway runtime unavailable" in log
+
+
 def test_apply_ledger_verdicts_updates_row_in_place():
     # The core fix: a seeded `verified-by: unverified` row is rewritten IN PLACE to
     # `verified-by: verifier` — no stale dual state, no duplicate section, no delta.

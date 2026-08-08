@@ -9,15 +9,16 @@ Runs standalone (``python -m danus.authoring.tests.test_driver``) and under pyte
 
 from __future__ import annotations
 
-import json
 import os
 import stat
 import subprocess
 import sys
 import tempfile
+import tomllib
 from pathlib import Path
 
 from danus.authoring import driver
+from danus.gateway_runtime import GatewayRuntimeUnavailable
 
 from ._fixtures import env
 
@@ -93,9 +94,45 @@ def test_neutral_default_model_and_effort():
 
 def test_gateway_uses_the_running_interpreter():
     config = driver._gateway_config_arg("verifier")
-    assert f'command={json.dumps(sys.executable)}' in config
-    assert 'args=["-m","danus.gateway"]' in config
-    assert 'env={DANUS_ROLE="verifier"}' in config
+    assert tomllib.loads(config) == {
+        "mcp_servers": {
+            "danus": {
+                "command": sys.executable,
+                "args": ["-m", "danus.gateway"],
+                "env": {"DANUS_ROLE": "verifier"},
+                "default_tools_approval_mode": "approve",
+                "required": True,
+            }
+        }
+    }
+
+
+def test_networked_preflight_failure_starts_no_codex(monkeypatch):
+    calls = []
+
+    def fail_preflight():
+        raise GatewayRuntimeUnavailable("bad gateway import")
+
+    monkeypatch.setattr(driver, "require_gateway_runtime", fail_preflight)
+    monkeypatch.setattr(driver.subprocess, "run", lambda *a, **k: calls.append(a))
+    try:
+        driver.run_codex("anything", networked=True)
+        assert False, "networked authoring must fail before Codex"
+    except GatewayRuntimeUnavailable as exc:
+        assert "bad gateway import" in str(exc)
+    assert calls == []
+
+
+def test_offline_authoring_does_not_require_gateway(monkeypatch):
+    _ensure_fake_executable()
+
+    def fail_preflight():
+        raise AssertionError("offline authoring must not probe the gateway")
+
+    monkeypatch.setattr(driver, "require_gateway_runtime", fail_preflight)
+    with env(DANUS_CODEX_BIN=str(FAKE)):
+        cp = driver.run_codex("please write the paper", timeout=60, networked=False)
+    assert cp.returncode == 0
 
 
 def test_resolve_bin_bare_name_resolved_via_which():
