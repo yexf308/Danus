@@ -87,7 +87,7 @@ def test_neutral_default_model_and_effort():
         assert driver.default_model() == "my-model"
         assert driver.default_effort() == "low"
     with env(DANUS_CODEX_MODEL=None, DANUS_CODEX_EFFORT=None):
-        assert driver.default_model() == driver.DEFAULT_MODEL == "gpt-5.5"
+        assert driver.default_model() == driver.DEFAULT_MODEL == "gpt-5.6-sol"
         assert driver.default_effort() == driver.DEFAULT_EFFORT == "xhigh"
 
 

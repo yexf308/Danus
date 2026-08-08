@@ -6,7 +6,7 @@ calls it. A `correct` verdict is necessary but not sufficient for a graph write;
 the gateway must also recheck the exact context and add under the graph mutation
 lock, and can return an accept-but-write-failed result.
 
-It is **not** a formal / Lean checker — a gpt-5.5 codex agent reads the
+It is **not** a formal / Lean checker — a gpt-5.6-sol codex agent reads the
 natural-language markdown proof (logic, theorem application, external-citation
 checking) and returns a verdict. There is **no human in the loop by default** —
 research-level target theorems still need expert review before being trusted.
@@ -71,7 +71,7 @@ to the response; the gateway refuses responses without that exact attestation.
 - `prechecks.py` — pure, offline-testable: vacuousness + P1/P3/P5 hard prohibitions
   (all env-toggleable, all purely additive — they can only *reject* more).
 - `launcher.py` — cold-start codex launcher (via the shared `danus.codex`): `codex
-  exec --model gpt-5.5 --config model_reasoning_effort="xhigh" -C <AGENT_HOME>
+  exec --model gpt-5.6-sol --config model_reasoning_effort="xhigh" -C <AGENT_HOME>
   -c <danus MCP, role=verifier> --sandbox read-only --ephemeral
   --ignore-user-config --output-schema <schema> -o <verification.json> -`;
   the bounded prompt is delivered over stdin (never process argv), uses an atomic
@@ -108,7 +108,7 @@ system Python without `danus`.
 | `VERIFY_AGENT_HOME` | `<state>/verify/agent-<resource-digest>` | writable codex `-C` home; packaged AGENTS.md + skills are materialized here, with resource-versioned defaults |
 | `VERIFIER_RESULTS_DIR` | `<state>/verify/runs` | per-verification run dirs (sanitized metadata-only `log.md` + CLI-captured `verification.json`) |
 | `DANUS_CODEX_BIN` | `<repo>/bin/codex` → `which codex` → bare `"codex"` | the codex binary; resolved via the shared `danus.codex` launcher |
-| `DANUS_VERIFY_MODEL` / `DANUS_VERIFY_EFFORT` (fall back to neutral `DANUS_CODEX_MODEL` / `DANUS_CODEX_EFFORT`) | `gpt-5.5` / `xhigh` | codex knobs |
+| `DANUS_VERIFY_MODEL` / `DANUS_VERIFY_EFFORT` | `gpt-5.6-sol` / `xhigh` | Model falls back to neutral `DANUS_CODEX_MODEL`; effort is verifier-specific and does not inherit `DANUS_CODEX_EFFORT` |
 | `CODEX_TIMEOUT_SECONDS` | `0` lib / **`900`** via `python -m danus.verify` | per-verification codex timeout |
 | `DANUS_VERIFY_CONTEXT_MAX_CHARS` | `200000` | gateway whole-record budget for the full statement closure, expanded records, and immutable definitions; overflow blocks before `/verify` |
 | `DANUS_VERIFY_MAX_EXPANSION_ROUNDS` | `2` | maximum successful proof-hydration rounds after statement-only round zero (at most three fresh verifier calls) |

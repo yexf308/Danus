@@ -10,7 +10,7 @@ is testable/reconfigurable).
 
 Config (env):
   DANUS_CODEX_BIN,
-  DANUS_VERIFY_MODEL (default gpt-5.5),
+  DANUS_VERIFY_MODEL (default gpt-5.6-sol),
   DANUS_VERIFY_EFFORT (default xhigh),
   CODEX_TIMEOUT_SECONDS (0 = no timeout),
   VERIFY_AGENT_HOME (the writable codex `-C` dir: AGENTS.md + .agents/skills),
@@ -44,6 +44,7 @@ _REPO_ROOT = _HERE.parent.parent         # source-checkout root (parity tests on
 VERIFICATION_FILENAMES = ("verification.json", "verificationt.json")
 _OUTPUT_SCHEMA = _HERE / "verification_output.schema.json"
 _RESOURCE_PACKAGE = "danus.verify._resources"
+_DEFAULT_VERIFY_EFFORT = "xhigh"
 
 
 # --------------------------------------------------------------------------- #
@@ -174,7 +175,14 @@ def _model() -> str:
 
 
 def _effort() -> str:
-    return codex.effort("DANUS_VERIFY_EFFORT")
+    # Verification is a separate correctness boundary. Do not inherit a neutral
+    # generator/renderer effort (for example ``max``); only the verifier-specific
+    # override may change its explicit xhigh default.
+    return codex.effort(
+        "DANUS_VERIFY_EFFORT",
+        default=_DEFAULT_VERIFY_EFFORT,
+        inherit_neutral=False,
+    )
 
 
 def _timeout() -> Optional[int]:

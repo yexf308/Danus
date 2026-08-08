@@ -49,7 +49,7 @@ Then pick your **codex backend** (workers + verifier):
 
 - **API key (recommended, no login):** in `config/codex.env` set
   `CODEX_BACKEND=api`, `CODEX_API_BASE_URL=<your OpenAI-compatible endpoint>`,
-  `CODEX_API_MODEL=gpt-5.5`, `DANUS_CODEX_API_KEY=<your key>`. Then
+  `CODEX_API_MODEL=gpt-5.6-sol`, `DANUS_CODEX_API_KEY=<your key>`. Then
   `bash scripts/setup-codex.sh api` (bootstrap already did this if the key was
   present) writes the provider — the key is read from the env var at run time, never
   stored in a config file.

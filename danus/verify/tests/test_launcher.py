@@ -231,6 +231,13 @@ def test_build_codex_command_shape():
     assert "BEGIN_AUTHORITATIVE_FACT_CONTEXT_JSON" not in prompt
 
 
+def test_verifier_effort_is_independent_from_neutral_effort():
+    with _env(DANUS_VERIFY_EFFORT=None, DANUS_CODEX_EFFORT="max"):
+        assert launcher._effort() == "xhigh"
+    with _env(DANUS_VERIFY_EFFORT="low", DANUS_CODEX_EFFORT="max"):
+        assert launcher._effort() == "low"
+
+
 def test_build_prompt_delimits_json_context_and_requires_completeness():
     injected = dict(_FACT_CONTEXT)
     injected["complete"] = False

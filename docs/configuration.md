@@ -20,7 +20,7 @@ The `bin/` wrappers source `env.sh` for you. Values below are the defaults from
 | `CODEX_BACKEND` | `api` | `api` (BYO OpenAI-compatible key) or `chatgpt` (your ChatGPT login) |
 | `CODEX_HOME` | `runtime/codex-home` | codex auth/config home (gitignored) |
 | `CODEX_API_BASE_URL` | — | (api) your OpenAI-compatible Responses endpoint |
-| `CODEX_API_MODEL` | `gpt-5.5` | (api) backend model |
+| `CODEX_API_MODEL` | `gpt-5.6-sol` | (api) backend model |
 | `DANUS_CODEX_API_KEY` | — | (api) key, **read at run time**, never stored in a file |
 
 These live in `config/codex.env`. See `getting-started.md` §2 and
@@ -60,14 +60,17 @@ These live in `config/codex.env`. See `getting-started.md` §2 and
 
 All three codex-exec sites (workers, verifier, paper/report renderers) resolve
 binary + model + effort through the shared launcher, so names are unified. Neutral
-defaults apply everywhere; per-service overrides win.
+model defaults apply everywhere; per-service overrides win. The verifier effort
+is an independent `xhigh` default and intentionally does not inherit
+`DANUS_CODEX_EFFORT`.
 
 | variable | default | applies to |
 |---|---|---|
 | `DANUS_CODEX_BIN` | `<repo>/bin/codex`, else `codex` on PATH | all codex calls |
-| `DANUS_CODEX_MODEL` | `gpt-5.5` | neutral default (all sites) |
+| `DANUS_CODEX_MODEL` | `gpt-5.6-sol` | neutral default (all sites) |
 | `DANUS_CODEX_EFFORT` | `xhigh` | neutral default effort (all sites) |
-| `DANUS_VERIFY_MODEL` / `_EFFORT` | neutral | verifier — the correctness authority; keep effort at `xhigh` |
+| `DANUS_VERIFY_MODEL` | neutral (`gpt-5.6-sol`) | verifier model |
+| `DANUS_VERIFY_EFFORT` | `xhigh` | verifier effort; independent from the neutral effort |
 | `DANUS_WRITE_PAPER_MODEL` / `_EFFORT` | neutral | paper renderer |
 | `DANUS_HUMAN_SUMMARY_MODEL` / `_EFFORT` | neutral | human-summary renderer |
 

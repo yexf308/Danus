@@ -12,13 +12,13 @@ testable/reconfigurable.
 
 Env contract (neutral defaults + back-compat aliases):
   DANUS_CODEX_BIN     codex binary; back-compat alias: CODEX_BIN
-  DANUS_CODEX_MODEL   neutral default model (default "gpt-5.5")
+  DANUS_CODEX_MODEL   neutral default model (default "gpt-5.6-sol")
   DANUS_CODEX_EFFORT  neutral default reasoning effort (default "xhigh")
 
 Each site layers its own per-service override env names on top of the neutral
-defaults via ``model(*overrides)`` / ``effort(*overrides)`` (e.g. the verify
-service passes ``DANUS_VERIFY_MODEL``; the renderers pass
-``DANUS_WRITE_PAPER_MODEL`` / ``DANUS_HUMAN_SUMMARY_MODEL``).
+defaults via ``model(*overrides)`` / ``effort(*overrides)``. A correctness
+service may deliberately set ``inherit_neutral=False`` for effort so a generator
+effort override cannot silently weaken or change the verifier.
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ from typing import Dict, List
 # lives at <repo>/bin/codex.
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 
-DEFAULT_MODEL = "gpt-5.5"
+DEFAULT_MODEL = "gpt-5.6-sol"
 DEFAULT_EFFORT = "xhigh"
 
 
@@ -72,15 +72,21 @@ def model(*override_env_names: str, default: str = DEFAULT_MODEL) -> str:
     return os.environ.get("DANUS_CODEX_MODEL") or default
 
 
-def effort(*override_env_names: str, default: str = DEFAULT_EFFORT) -> str:
+def effort(
+    *override_env_names: str,
+    default: str = DEFAULT_EFFORT,
+    inherit_neutral: bool = True,
+) -> str:
     """The reasoning effort: first non-empty among the given per-service override
-    env vars (in order), then the neutral ``DANUS_CODEX_EFFORT``, then
-    ``default``."""
+    env vars (in order), then—when ``inherit_neutral`` is true—the neutral
+    ``DANUS_CODEX_EFFORT``, then ``default``."""
     for name in override_env_names:
         val = os.environ.get(name)
         if val:
             return val
-    return os.environ.get("DANUS_CODEX_EFFORT") or default
+    if inherit_neutral:
+        return os.environ.get("DANUS_CODEX_EFFORT") or default
+    return default
 
 
 def subprocess_env(codex_bin: str) -> Dict[str, str]:

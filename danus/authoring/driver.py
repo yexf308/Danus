@@ -32,7 +32,7 @@ Config (env, read at CALL time — never import time; resolved via the shared
 ``danus.codex`` launcher):
   DANUS_CODEX_BIN     codex binary (alias: CODEX_BIN; default: the deployment's
                       bin/codex wrapper, else "codex" on PATH)
-  DANUS_CODEX_MODEL   neutral default model (default "gpt-5.5"); each renderer's
+  DANUS_CODEX_MODEL   neutral default model (default "gpt-5.6-sol"); each renderer's
                       server layers its own per-service override on top
   DANUS_CODEX_EFFORT  neutral default reasoning effort (default "xhigh")
   timeout             default 7200s (0 = no timeout)

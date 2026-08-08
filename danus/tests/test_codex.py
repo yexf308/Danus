@@ -94,16 +94,35 @@ def test_model_override_wins_then_neutral_then_default():
     with env(**{**_ALL, "DANUS_CODEX_MODEL": "neutral-m"}):
         assert codex.model("DANUS_VERIFY_MODEL") == "neutral-m"
     with env(**_ALL):
-        assert codex.model("DANUS_VERIFY_MODEL") == codex.DEFAULT_MODEL == "gpt-5.5"
+        assert codex.model("DANUS_VERIFY_MODEL") == codex.DEFAULT_MODEL == "gpt-5.6-sol"
 
 
 def test_effort_override_wins_then_neutral_then_default():
-    with env(**{**_ALL, "DANUS_VERIFY_EFFORT": "override-e", "DANUS_CODEX_EFFORT": "neutral-e"}):
-        assert codex.effort("DANUS_VERIFY_EFFORT") == "override-e"
+    with env(**{
+        **_ALL,
+        "DANUS_WRITE_PAPER_EFFORT": "override-e",
+        "DANUS_CODEX_EFFORT": "neutral-e",
+    }):
+        assert codex.effort("DANUS_WRITE_PAPER_EFFORT") == "override-e"
     with env(**{**_ALL, "DANUS_CODEX_EFFORT": "neutral-e"}):
-        assert codex.effort("DANUS_VERIFY_EFFORT") == "neutral-e"
+        assert codex.effort("DANUS_WRITE_PAPER_EFFORT") == "neutral-e"
     with env(**_ALL):
-        assert codex.effort("DANUS_VERIFY_EFFORT") == codex.DEFAULT_EFFORT == "xhigh"
+        assert codex.effort("DANUS_WRITE_PAPER_EFFORT") == codex.DEFAULT_EFFORT == "xhigh"
+
+
+def test_effort_can_explicitly_skip_neutral_fallback():
+    with env(**{**_ALL, "DANUS_CODEX_EFFORT": "max"}):
+        assert codex.effort(
+            "DANUS_VERIFY_EFFORT", default="xhigh", inherit_neutral=False
+        ) == "xhigh"
+    with env(**{
+        **_ALL,
+        "DANUS_VERIFY_EFFORT": "low",
+        "DANUS_CODEX_EFFORT": "max",
+    }):
+        assert codex.effort(
+            "DANUS_VERIFY_EFFORT", default="xhigh", inherit_neutral=False
+        ) == "low"
 
 
 def test_first_override_in_order_wins():
