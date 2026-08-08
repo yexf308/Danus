@@ -3,10 +3,10 @@
 # Danus services — start/stop/inspect the long-running services so they PERSIST
 # beyond the session that launched them (a Claude Code session, an ssh shell…).
 #
-# Why setsid: a plain `… &` background job started from a transient shell gets
-# reaped when that shell exits. `setsid` puts the service in its OWN session
-# (reparented to init), with stdio detached — so it keeps running after the
-# Claude Code session ends / the laptop disconnects.
+# A plain `… &` background job started from a transient shell can be reaped when
+# that shell exits.  Linux uses `setsid` to give the service its own session;
+# macOS does not ship `setsid`, so it falls back to `nohup`.  Both paths detach
+# stdio and keep the service alive after the launching shell disconnects.
 #
 #   bash scripts/services.sh up   verify
 #   bash scripts/services.sh up   dashboard <project>
@@ -29,17 +29,36 @@ AUTO="$RUN/autostart"
 _auto_add(){ touch "$AUTO"; grep -qxF "$1" "$AUTO" 2>/dev/null || echo "$1" >> "$AUTO"; }
 _auto_del(){ [ -f "$AUTO" ] || return 0; grep -vxF "$1" "$AUTO" > "$AUTO.tmp" 2>/dev/null || true; mv -f "$AUTO.tmp" "$AUTO" 2>/dev/null || true; }
 
-# _spawn <name> <command…> : detach via setsid; the inner shell records its own
-# pid then exec's the service, so the pidfile holds the real service pid (exec
-# preserves the pid down the start-*.sh → python chain).
+# _spawn <name> <command> [args…] : detach via setsid (Linux) or Python's
+# os.setsid (macOS).  The process inside the new session records its own pid and
+# immediately execs the service, so the pidfile is also the process-group id.
 _spawn(){
   local name="$1"; shift
-  local pf; pf="$(_pf "$name")"
+  local pf setsid_bin; pf="$(_pf "$name")"
   if _alive "$name"; then echo "[$name] already up (pid $(cat "$pf"))"; return 0; fi
-  setsid bash -c "echo \$\$ > '$pf'; exec $*" >"$LOG/$name.log" 2>&1 </dev/null &
+  rm -f "$pf"
+  if [ "${DANUS_SETSID_BIN+x}" = x ]; then
+    setsid_bin="$DANUS_SETSID_BIN"
+  else
+    setsid_bin="$(command -v setsid 2>/dev/null || true)"
+  fi
+  if [ -n "$setsid_bin" ]; then
+    "$setsid_bin" bash -c '
+      pidfile="$1"; shift
+      printf "%s\n" "$$" > "$pidfile"
+      exec "$@"
+    ' danus-service "$pf" "$@" >"$LOG/$name.log" 2>&1 </dev/null &
+  elif command -v nohup >/dev/null 2>&1; then
+    nohup "$DANUS_PY" -c \
+      'import os,sys; os.setsid(); p=open(sys.argv[1], "w", encoding="ascii"); p.write(str(os.getpid())+"\n"); p.close(); os.execvp(sys.argv[2], sys.argv[2:])' \
+      "$pf" "$@" >"$LOG/$name.log" 2>&1 </dev/null &
+  else
+    echo "[$name] FAILED to start — neither setsid nor nohup is available" >&2
+    return 1
+  fi
   sleep 1
   if _alive "$name"; then echo "[$name] up (pid $(cat "$pf"); log: runtime/logs/$name.log)";
-  else echo "[$name] FAILED to start — see runtime/logs/$name.log"; tail -5 "$LOG/$name.log" 2>/dev/null; return 1; fi
+  else echo "[$name] FAILED to start — see runtime/logs/$name.log"; tail -5 "$LOG/$name.log" 2>/dev/null; rm -f "$pf"; return 1; fi
 }
 
 _stop(){
@@ -57,9 +76,9 @@ case "${1:-}" in
   up)
     svc="${2:?usage: services.sh up verify|dashboard <project>}"
     case "$svc" in
-      verify)    _spawn verify    "bash '$DANUS_ROOT/scripts/start-verify.sh'" && _auto_add "verify" ;;
+      verify)    _spawn verify bash "$DANUS_ROOT/scripts/start-verify.sh" && _auto_add "verify" ;;
       dashboard) proj="${3:?usage: services.sh up dashboard <project>}"
-                 _spawn "dashboard-$proj" "bash '$DANUS_ROOT/scripts/start-dashboard.sh' '$proj'" && _auto_add "dashboard $proj" ;;
+                 _spawn "dashboard-$proj" bash "$DANUS_ROOT/scripts/start-dashboard.sh" "$proj" && _auto_add "dashboard $proj" ;;
       *) echo "unknown service: $svc"; exit 1 ;;
     esac ;;
   down)

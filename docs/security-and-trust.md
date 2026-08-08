@@ -89,6 +89,11 @@ config/rules, stdin prompt transport, and a schema-constrained CLI output file.
 Worker execution remains separately configured and may be more permissive. Danus's
 host-level safety still rests on two assumptions you must uphold:
 
+Each worker round passes its complete required gateway server object directly on
+the Codex CLI. The project-local `.codex/config.toml` is retained for inspection,
+but is not a production trust dependency; failure to discover that file cannot
+silently remove the worker's gateway tools.
+
 - **The agent home is trusted.** The verifier runs inside a fixed `AGENT_HOME`
   (its contract + skills). Treat that directory — and the worker/verifier prompts and
   skills — as **trusted code**: a malicious or tampered prompt/skill could act with

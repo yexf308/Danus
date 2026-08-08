@@ -9,6 +9,11 @@ per-round hard timeout, or it bails); the loop then relaunches a fresh session
 that resumes from memory. Stops on the ``.stop`` flag (graceful, at a round
 boundary), the project deadline, or a round backstop.
 
+The worker gateway is passed to every ``codex exec`` as one complete inline
+``mcp_servers.danus={...}`` object. The scaffolded ``.codex/config.toml`` remains
+useful for interactive inspection, but production execution never depends on
+Codex discovering project-local configuration.
+
 Config:
   - codex binary resolved via the shared ``danus.codex`` launcher
     (``DANUS_CODEX_BIN`` / ``CODEX_BIN`` alias / PATH);
@@ -120,6 +125,30 @@ def _parse_last_fact_id(log_path: Path) -> Optional[str]:
     return ids[-1] if ids else None
 
 
+def _worker_mcp_config_arg(wl: L.WorkerLayout) -> str:
+    """Return one complete Codex CLI override for the worker gateway.
+
+    Keep the whole server object in one override: a collection of partial
+    ``mcp_servers.danus.*`` overrides can be merged differently across Codex
+    releases. In particular, do not rely on ``wl/.codex/config.toml`` being
+    auto-loaded. ``sys.executable`` is intentionally used byte-for-byte (not
+    ``Path.resolve()``) so the MCP child is bound to the interpreter running this
+    loop, including a virtual-environment launcher path.
+    """
+    return (
+        "mcp_servers.danus={command="
+        + json.dumps(sys.executable)
+        + ',args=["-m","danus.gateway"],env={DANUS_PROJECT_DIR='
+        + json.dumps(str(wl.project_dir))
+        + ",DANUS_AUTHOR="
+        + json.dumps(wl.name)
+        + ',DANUS_ROLE="worker",DANUS_VERIFY_URL='
+        + json.dumps(scaffold._verify_url())
+        + "},tool_timeout_sec=3600,"
+        + 'default_tools_approval_mode="approve",required=true}'
+    )
+
+
 # --- one round ------------------------------------------------------------- #
 
 class _Child:
@@ -143,6 +172,10 @@ def run_round(wl: L.WorkerLayout, role: dict, prompt: str, log_path: Path,
     cmd = codex.exec_cmd(
         codex_bin, role["MODEL"], role["REASONING_EFFORT"],
         "-C", str(wdir),
+        # Inject the complete gateway object explicitly. Codex does not
+        # consistently auto-load ``<worker>/.codex/config.toml`` for exec/MCP
+        # discovery, so that file cannot be the production authority.
+        "--config", _worker_mcp_config_arg(wl),
         # on an install without .git (tarball download), codex's
         # trusted-directory check refuses to run the worker round
         "--skip-git-repo-check",

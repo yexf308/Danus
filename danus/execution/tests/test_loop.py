@@ -27,6 +27,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -103,6 +104,91 @@ def test_run_round_success_rc0(tmp: Path):
         rc = loop.run_round(wl, {"MODEL": "m", "REASONING_EFFORT": "high"},
                             "prompt", log, hard_timeout=0)   # 0 => no timeout (wait forever)
     assert rc == 0
+
+
+def test_worker_mcp_config_arg_is_one_complete_toml_object(tmp: Path):
+    wl = _mk_worker(tmp, "author7")
+    with _env(DANUS_VERIFY_URL="http://127.0.0.1:18091/verify"):
+        config_arg = loop._worker_mcp_config_arg(wl)
+
+    # Codex CLI --config accepts a TOML assignment. Parsing it with the stdlib
+    # catches quoting/inline-table mistakes without launching Codex.
+    assert tomllib.loads(config_arg) == {
+        "mcp_servers": {
+            "danus": {
+                "command": sys.executable,
+                "args": ["-m", "danus.gateway"],
+                "env": {
+                    "DANUS_PROJECT_DIR": str(wl.project_dir),
+                    "DANUS_AUTHOR": "author7",
+                    "DANUS_ROLE": "worker",
+                    "DANUS_VERIFY_URL": "http://127.0.0.1:18091/verify",
+                },
+                "tool_timeout_sec": 3600,
+                "default_tools_approval_mode": "approve",
+                "required": True,
+            }
+        }
+    }
+
+
+def test_run_round_injects_complete_mcp_without_project_config(tmp: Path):
+    wl = _mk_worker(tmp, "worker9")
+    assert not wl.codex_config.exists()  # regression: production cannot rely on it
+    log = wl.dir / "round.log"
+    captured = {}
+
+    class _StubProc:
+        def wait(self, timeout=None):
+            return 0
+
+    def fake_popen(command, **kwargs):
+        captured["command"] = command
+        return _StubProc()
+
+    original_popen = subprocess.Popen
+    subprocess.Popen = fake_popen
+    try:
+        with _env(
+            DANUS_CODEX_BIN=str(tmp / "fake-codex"),
+            DANUS_VERIFY_URL="http://127.0.0.1:18091/verify",
+        ):
+            rc = loop.run_round(
+                wl,
+                {"MODEL": "gpt-test", "REASONING_EFFORT": "xhigh"},
+                "prompt",
+                log,
+                hard_timeout=30,
+            )
+    finally:
+        subprocess.Popen = original_popen
+
+    assert rc == 0
+    command = captured["command"]
+    mcp_overrides = [
+        (token, command[index + 1])
+        for index, token in enumerate(command[:-1])
+        if token in ("--config", "-c")
+        and command[index + 1].startswith("mcp_servers.danus")
+    ]
+    assert len(mcp_overrides) == 1
+    assert mcp_overrides[0][0] == "--config"
+    assert not any(part.startswith("mcp_servers.danus.") for part in command)
+    parsed = tomllib.loads(mcp_overrides[0][1])["mcp_servers"]["danus"]
+    assert parsed == {
+        "command": sys.executable,
+        "args": ["-m", "danus.gateway"],
+        "env": {
+            "DANUS_PROJECT_DIR": str(wl.project_dir),
+            "DANUS_AUTHOR": "worker9",
+            "DANUS_ROLE": "worker",
+            "DANUS_VERIFY_URL": "http://127.0.0.1:18091/verify",
+        },
+        "tool_timeout_sec": 3600,
+        "default_tools_approval_mode": "approve",
+        "required": True,
+    }
+    assert not wl.codex_config.exists()
 
 
 # --- run_round: hard timeout → terminate → 124 ----------------------------- #
@@ -546,6 +632,8 @@ def main() -> None:
     tests = [
         test_run_round_returns_codex_rc,
         test_run_round_success_rc0,
+        test_worker_mcp_config_arg_is_one_complete_toml_object,
+        test_run_round_injects_complete_mcp_without_project_config,
         test_run_round_hard_timeout_terminates,
         test_run_round_missing_binary_returns_127,
         test_run_round_timeout_then_kill,

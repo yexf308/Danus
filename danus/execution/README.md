@@ -21,7 +21,7 @@ danus/execution/
 `agents/contracts/worker.md`, `.agents/skills` → `agents/skills/worker`, a
 `.codex/config.toml` (MCP = `python -m danus.gateway`, `DANUS_ROLE=worker`,
 `DANUS_VERIFY_URL`, `tool_timeout_sec=3600`, tool approval `approve`,
-`required=true`), `TASK.md`, `local_memory/`, and the
+`required=true`) for interactive inspection, `TASK.md`, `local_memory/`, and the
 control files (`.status.json` `.pid` `.stop` `logs/`). `agents_root` =
 `DANUS_AGENTS_ROOT` (default `runtime/projects`).
 
@@ -37,7 +37,11 @@ loop + its codex child. Stop conditions checked at the round boundary: `.stop` f
 not process state — a fresh `start` rebuilds context from memory + the fact graph.
 Before any worker Codex process starts, a separate interpreter probe imports the
 gateway server and FastMCP runtime; a failed import ends the worker without a
-Codex call. Codex also treats the configured gateway as required.
+Codex call. Every production round also injects the entire
+`mcp_servers.danus={command,args,env,tool_timeout_sec,default_tools_approval_mode,required}`
+object as one CLI `--config` value, with `command` pinned to the loop's exact
+`sys.executable`. Therefore execution does not depend on Codex auto-loading the
+worker's `.codex/config.toml`; the inline gateway is required and fail-closed.
 
 ## Connects to
 
