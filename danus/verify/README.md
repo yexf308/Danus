@@ -134,6 +134,12 @@ re-sending ancestor statements or any predecessor proofs.
   a host confidentiality boundary: for adversarial proof text, still run this
   service in a dedicated container or low-privilege account with no unrelated
   readable secrets.
+- The CLI output schema deliberately uses only a conservative OpenAI Responses
+  Structured Outputs subset: exact object shapes, required fields, primitive
+  types, arrays, references, and the verdict enum. Cross-field rules cannot be
+  expressed there with `allOf`/`if`/`then`; production code immediately runs
+  `validate_verification_output()` and fails closed on empty findings, empty
+  repair hints, or any verdict/report contradiction before a graph write.
 - It is an **LLM judge, not a formal (Lean) checker**, with **no human in the loop
   by default**; a `correct` verdict merely authorizes the gateway's locked
   context-CAS/add step. Research-level target theorems need expert human review

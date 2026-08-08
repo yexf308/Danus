@@ -29,49 +29,9 @@
       "additionalProperties": false,
       "required": ["location", "issue"],
       "properties": {
-        "location": {"type": "string", "minLength": 1},
-        "issue": {"type": "string", "minLength": 1}
+        "location": {"type": "string"},
+        "issue": {"type": "string"}
       }
     }
-  },
-  "allOf": [
-    {
-      "if": {"properties": {"verdict": {"const": "correct"}}},
-      "then": {
-        "properties": {
-          "repair_hints": {"const": ""},
-          "verification_report": {
-            "properties": {
-              "critical_errors": {"maxItems": 0},
-              "gaps": {"maxItems": 0}
-            }
-          }
-        }
-      }
-    },
-    {
-      "if": {"properties": {"verdict": {"const": "wrong"}}},
-      "then": {
-        "properties": {
-          "repair_hints": {"pattern": "\\S"}
-        },
-        "anyOf": [
-          {
-            "properties": {
-              "verification_report": {
-                "properties": {"critical_errors": {"minItems": 1}}
-              }
-            }
-          },
-          {
-            "properties": {
-              "verification_report": {
-                "properties": {"gaps": {"minItems": 1}}
-              }
-            }
-          }
-        ]
-      }
-    }
-  ]
+  }
 }
