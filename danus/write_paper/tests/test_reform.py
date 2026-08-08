@@ -23,7 +23,7 @@ from pathlib import Path
 from danus.core import FactGraph
 from danus.write_paper import assemble
 
-from ._fixtures import MAIN_SKILL_DIR, SKILL_DIR, env, temp_project, seed_ledger_text
+from ._fixtures import MAIN_SKILL_DIR, SKILL_DIR, env, temp_project
 
 
 # --------------------------------------------------------------------------- #

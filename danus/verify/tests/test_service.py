@@ -43,40 +43,48 @@ _PROOF = (
 )
 
 _CANNED_OK = {
+    "output_schema_version": 2,
+    "verification_status": "final",
     "verification_report": {"summary": "fake accept", "critical_errors": [], "gaps": []},
     "verdict": "correct",
+    "needs_expanded_proofs": [],
     "repair_hints": "",
 }
 
 def _make_context(
     facts=None,
-    ancestor_definitions=None,
     glossary=None,
     *,
-    closure_count=None,
+    requested=None,
+    expanded_proofs=None,
+    expansion_round=0,
+    candidate_fact_id="cccccccccccccccc",
 ):
     facts = list(facts or [])
-    ancestor_definitions = list(ancestor_definitions or [])
+    expanded_proofs = list(expanded_proofs or [])
     glossary = dict(glossary or {})
-    requested = [record["fact_id"] for record in facts]
+    requested = list(
+        requested
+        if requested is not None
+        else [record["fact_id"] for record in facts]
+    )
+    closure_ids = [record["fact_id"] for record in facts]
+    expanded_ids = [record["fact_id"] for record in expanded_proofs]
     scope = {
+        "candidate_fact_id": candidate_fact_id,
         "requested_fact_ids": requested,
         "predecessor_depth": None,
-        "proof_mode": "none",
+        "proof_mode": "adaptive",
         "include_project_glossary": False,
         "projection": VERIFICATION_CONTEXT_PROJECTION,
-        "ancestor_definition_terms": [
-            record["term"] for record in ancestor_definitions
-        ],
+        "expansion_round": expansion_round,
+        "closure_fact_ids": closure_ids,
+        "expanded_proof_ids": expanded_ids,
         "glossary_terms": list(glossary),
-    }
-    closure = {
-        "count": len(requested) if closure_count is None else closure_count,
-        "digest": "sha256:" + "1" * 64,
     }
     characters_used = sum(
         len(json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
-        for record in facts + ancestor_definitions
+        for record in facts + expanded_proofs
     )
     characters_used += sum(
         len(json.dumps(
@@ -91,8 +99,7 @@ def _make_context(
         "schema_version": VERIFICATION_CONTEXT_SCHEMA_VERSION,
         "scope": scope,
         "facts": facts,
-        "ancestor_definitions": ancestor_definitions,
-        "dependency_closure": closure,
+        "expanded_proofs": expanded_proofs,
         "glossary": glossary,
         "complete": True,
         "truncated": False,
@@ -100,16 +107,21 @@ def _make_context(
         "revoked_fact_ids": [],
         "omitted_fact_ids": [],
         "omitted_glossary_terms": [],
+        "omitted_expanded_proof_ids": [],
         "characters_used": characters_used,
         "character_budget": 200000,
+        "expanded_proof_characters": sum(
+            len(json.dumps(
+                record,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ))
+            for record in expanded_proofs
+        ),
+        "expanded_proof_character_budget": 200000,
     }
-    context["digest"] = verification_context_digest(
-        scope=scope,
-        facts=facts,
-        ancestor_definitions=ancestor_definitions,
-        dependency_closure=closure,
-        glossary=glossary,
-    )
+    context["digest"] = verification_context_digest(context=context)
     return context
 
 
@@ -171,12 +183,15 @@ def test_verify_accept_contract():
 def test_verify_reject_verdict_still_200():
     # a "wrong" verdict is a normal 200 response (the verdict is the payload).
     canned = {
+        "output_schema_version": 2,
+        "verification_status": "final",
         "verification_report": {
             "summary": "gap",
             "critical_errors": [],
             "gaps": [{"location": "proof", "issue": "missing step"}],
         },
         "verdict": "wrong",
+        "needs_expanded_proofs": [],
         "repair_hints": "fix the gap",
     }
     with _fake_run(lambda run_id, statement, proof: canned):
@@ -222,19 +237,14 @@ def test_verify_rejects_incomplete_or_tampered_context_before_codex():
     inconsistent_glossary = dict(_FACT_CONTEXT, glossary={"Q_X": "changed"})
     cases.append(inconsistent_glossary)
     project_glossary_scope = dict(_SCOPE, include_project_glossary=True)
-    cases.append(
-        dict(
-            _FACT_CONTEXT,
-            scope=project_glossary_scope,
-            digest=verification_context_digest(
-                scope=project_glossary_scope,
-                facts=[],
-                ancestor_definitions=[],
-                dependency_closure=_FACT_CONTEXT["dependency_closure"],
-                glossary={},
-            ),
-        )
+    project_glossary_context = dict(
+        _FACT_CONTEXT, scope=project_glossary_scope
     )
+    project_glossary_context.pop("digest")
+    project_glossary_context["digest"] = verification_context_digest(
+        context=project_glossary_context
+    )
+    cases.append(project_glossary_context)
     malformed = dict(_FACT_CONTEXT)
     malformed.pop("scope")
     cases.append(malformed)
@@ -305,6 +315,63 @@ def test_verify_matches_declared_predecessors_across_statement_and_proof():
             json={"statement": statement, "proof": proof, "fact_context": context},
         )
     assert resp.status_code == 200
+
+
+def test_verify_accepts_exact_adaptive_expansion_and_rejects_proof_leakage():
+    direct = "aaaaaaaaaaaaaaaa"
+    ancestor = "bbbbbbbbbbbbbbbb"
+    facts = [
+        {
+            "fact_id": direct,
+            "statement": "Direct premise",
+            "predecessors": [ancestor],
+            "glossary_introduces": {},
+        },
+        {
+            "fact_id": ancestor,
+            "statement": "Ancestor premise",
+            "predecessors": [],
+            "glossary_introduces": {"A": "the ancestor object"},
+        },
+    ]
+    expanded = [{"fact_id": ancestor, "proof": "complete ancestor proof"}]
+    context = _make_context(
+        facts,
+        requested=[direct],
+        expanded_proofs=expanded,
+        expansion_round=1,
+    )
+
+    def fake(run_id, statement, proof, fact_context=None, glossary_introduces=None):
+        assert fact_context == context
+        return _CANNED_OK
+
+    with _fake_run(fake):
+        resp = _client().post(
+            "/verify",
+            json={
+                "statement": _STMT,
+                "proof": _PROOF + f" Apply {direct}.",
+                "fact_context": context,
+            },
+        )
+    assert resp.status_code == 200
+
+    leaked = json.loads(json.dumps(context))
+    leaked["facts"][1]["proof"] = "leaked ancestor proof"
+    leaked.pop("digest")
+    leaked["digest"] = verification_context_digest(context=leaked)
+    with _fake_run(_must_not_run):
+        resp = _client().post(
+            "/verify",
+            json={
+                "statement": _STMT,
+                "proof": _PROOF + f" Apply {direct}.",
+                "fact_context": leaked,
+            },
+        )
+    assert resp.status_code == 400
+    assert "fact statement card" in resp.json()["detail"]
 
 
 def test_verify_rejects_undeclared_fact_id_in_statement_with_context():

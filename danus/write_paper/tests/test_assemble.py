@@ -14,7 +14,7 @@ from pathlib import Path
 
 from danus.write_paper import assemble
 
-from ._fixtures import SKILL_DIR, env, temp_project, write_ledger, write_main_tex
+from ._fixtures import SKILL_DIR, env, temp_project
 
 
 def _fixed(rel: str) -> str:
@@ -258,7 +258,8 @@ def test_anchor_block_embeds_text_and_names_binary():
     # verbatim) + one undecodable "binary" file (named, not embedded). Point
     # DANUS_WRITE_PAPER_SKILL_DIR at a temp skill dir so we can add the anchor
     # without touching the shipped skill.
-    import shutil, tempfile
+    import shutil
+    import tempfile
     with tempfile.TemporaryDirectory() as sd:
         skill = Path(sd)
         # mirror the real skill dir so read_fixed still finds roles/style/boilerplate
@@ -294,13 +295,14 @@ def test_anchor_block_none_and_missing_dir():
     # no anchor requested -> None; a requested anchor whose dir is absent -> None
     assert assemble._anchor_block(None) is None
     assert assemble._anchor_block("") is None
-    with temp_project() as pdir:  # shipped skill has no 'ghost' anchor
+    with temp_project():  # shipped skill has no 'ghost' anchor
         assert assemble._anchor_block("ghost_anchor_that_does_not_exist") is None
 
 
 def test_anchor_block_empty_dir_returns_none():
     # an anchor dir that exists but holds no files -> None (parts empty; assemble.py:188)
-    import shutil, tempfile
+    import shutil
+    import tempfile
     with tempfile.TemporaryDirectory() as sd:
         skill = Path(sd)
         shutil.copytree(SKILL_DIR, skill, dirs_exist_ok=True)

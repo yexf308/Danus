@@ -1,9 +1,17 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
   "additionalProperties": false,
-  "required": ["verification_report", "verdict", "repair_hints"],
+  "required": [
+    "output_schema_version",
+    "verification_status",
+    "verification_report",
+    "verdict",
+    "needs_expanded_proofs",
+    "repair_hints"
+  ],
   "properties": {
+    "output_schema_version": {"type": "integer", "enum": [2]},
+    "verification_status": {"type": "string", "enum": ["final", "needs_context"]},
     "verification_report": {
       "type": "object",
       "additionalProperties": false,
@@ -20,7 +28,19 @@
         }
       }
     },
-    "verdict": {"enum": ["correct", "wrong"]},
+    "verdict": {"type": "string", "enum": ["correct", "wrong"]},
+    "needs_expanded_proofs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "reason"],
+        "properties": {
+          "id": {"type": "string"},
+          "reason": {"type": "string"}
+        }
+      }
+    },
     "repair_hints": {"type": "string"}
   },
   "$defs": {

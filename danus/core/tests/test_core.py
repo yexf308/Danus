@@ -21,6 +21,7 @@ from danus.core import (
     clean_external_refs,
     compute_fact_id,
     parse_frontmatter,
+    verification_context_digest,
 )
 from danus.core import glossary as _glossary
 from danus.core import factgraph as _factgraph
@@ -643,6 +644,12 @@ def test_factgraph_lazy_context_deep_dag_is_iterative():
         assert "proof" in context["facts"][0]
         assert all("proof" not in record for record in context["facts"][1:])
 
+        verification = fg.verification_context([tip], max_chars=None)
+        assert verification["complete"] is True
+        assert verification["scope"]["closure_fact_ids"] == list(reversed(expected))
+        assert verification["expanded_proofs"] == []
+        assert all("proof" not in record for record in verification["facts"])
+
         # Descendant discovery must use one active-file snapshot rather than
         # re-listing/re-reading the whole graph once per node (quadratic on this
         # 1,100-node chain).
@@ -662,8 +669,8 @@ def test_factgraph_lazy_context_deep_dag_is_iterative():
         assert list_calls == 1
 
 
-def test_verification_context_compacts_large_dag_and_keeps_all_ancestor_definitions():
-    """Large closures commit topology without transporting ancestor statements."""
+def test_verification_context_carries_large_statement_closure_without_proofs():
+    """Large closures carry every statement/edge/definition but no proof in round zero."""
     with tempfile.TemporaryDirectory() as d:
         fg = FactGraph(Path(d) / "compact-verification-context")
         tip = None
@@ -686,22 +693,125 @@ def test_verification_context_compacts_large_dag_and_keeps_all_ancestor_definiti
 
         context = fg.verification_context(
             [tip],
-            max_chars=200_000,
+            max_chars=1_000_000,
             # Deliberately use a notation variant that literal matching misses.
             glossary_texts=["Use K_F in the candidate."],
         )
         assert context["complete"] is True and context["truncated"] is False
-        assert [record["fact_id"] for record in context["facts"]] == [tip]
-        assert context["dependency_closure"]["count"] == len(ids)
-        assert context["dependency_closure"]["digest"].startswith("sha256:")
-        assert context["ancestor_definitions"] == [{
-            "term": "K_{F}",
-            "definition": "the ancestor-defined compact-set invariant",
-            "source_fact_id": ids[0],
-        }]
+        assert [record["fact_id"] for record in context["facts"]] == list(reversed(ids))
+        assert context["scope"]["closure_fact_ids"] == list(reversed(ids))
+        assert context["scope"]["expansion_round"] == 0
+        assert context["scope"]["expanded_proof_ids"] == []
+        assert context["expanded_proofs"] == []
+        assert all("proof" not in record for record in context["facts"])
+        assert context["facts"][-1]["glossary_introduces"] == {
+            "K_{F}": "the ancestor-defined compact-set invariant"
+        }
         serialized = json.dumps(context, ensure_ascii=False)
-        assert "Fact 0:" not in serialized
-        assert len(serialized.encode("utf-8")) < 100_000
+        assert "Fact 0:" in serialized
+
+
+def test_adaptive_verification_context_diamond_deduplicates_and_binds_every_layer():
+    with tempfile.TemporaryDirectory() as d:
+        fg = FactGraph(Path(d) / "adaptive-diamond")
+        base = fg.add(
+            problem_id="P", author="w", statement="Base",
+            proof="base proof bytes", glossary_introduces={"B": "base object"},
+        )
+        left = fg.add(
+            problem_id="P", author="w", statement="Left", proof="left proof",
+            predecessors=[base],
+        )
+        right = fg.add(
+            problem_id="P", author="w", statement="Right", proof="right proof",
+            predecessors=[base],
+        )
+        root = fg.add(
+            problem_id="P", author="w", statement="Root", proof="root proof",
+            predecessors=[left, right],
+        )
+
+        reads = []
+        original_get_raw = fg._get_raw_unchecked
+
+        def counted_get_raw(fact_id):
+            reads.append(fact_id)
+            return original_get_raw(fact_id)
+
+        fg._get_raw_unchecked = counted_get_raw  # type: ignore[assignment]
+        try:
+            first = fg.verification_context([root], max_chars=None)
+        finally:
+            fg._get_raw_unchecked = original_get_raw  # type: ignore[assignment]
+        closure_order = [root, left, right, base]
+        assert reads == closure_order
+        assert first["scope"]["closure_fact_ids"] == closure_order
+        assert [record["fact_id"] for record in first["facts"]] == closure_order
+        assert len(first["facts"]) == len({record["fact_id"] for record in first["facts"]})
+        assert first["expanded_proofs"] == []
+        assert all("proof" not in record for record in first["facts"])
+
+        second = fg.verification_context(
+            [root],
+            max_chars=None,
+            expanded_proof_ids=[base, right],
+            expansion_round=1,
+            expanded_proof_max_chars=200000,
+        )
+        # Caller order cannot perturb attestation: expanded records follow the
+        # authenticated closure order and every proof remains a whole record.
+        assert second["scope"]["expanded_proof_ids"] == [right, base]
+        assert second["expanded_proofs"] == [
+            {"fact_id": right, "proof": "right proof"},
+            {"fact_id": base, "proof": "base proof bytes"},
+        ]
+        assert second["digest"] != first["digest"]
+
+        variants = []
+        for mutate in (
+            lambda value: value["facts"][0].__setitem__("statement", "Root!"),
+            lambda value: value["facts"][0]["predecessors"].__setitem__(0, base),
+            lambda value: value["facts"][-1]["glossary_introduces"].__setitem__(
+                "B", "base object!"
+            ),
+            lambda value: value["scope"].__setitem__("expansion_round", 2),
+            lambda value: value["scope"].__setitem__(
+                "candidate_fact_id", "ffffffffffffffff"
+            ),
+            lambda value: value["expanded_proofs"][0].__setitem__(
+                "proof", "right proof!"
+            ),
+            lambda value: value.__setitem__("characters_used", value["characters_used"] + 1),
+        ):
+            variant = json.loads(json.dumps(second))
+            variant.pop("digest")
+            mutate(variant)
+            variants.append(verification_context_digest(context=variant))
+        assert all(digest != second["digest"] for digest in variants)
+
+        proof_record = {"fact_id": base, "proof": "base proof bytes"}
+        record_chars = len(json.dumps(
+            proof_record, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ))
+        omitted = fg.verification_context(
+            [root],
+            max_chars=None,
+            expanded_proof_ids=[base],
+            expansion_round=1,
+            expanded_proof_max_chars=record_chars - 1,
+        )
+        assert omitted["expanded_proofs"] == []
+        assert omitted["omitted_expanded_proof_ids"] == [base]
+        assert omitted["complete"] is False and omitted["truncated"] is True
+        exact = fg.verification_context(
+            [root],
+            max_chars=None,
+            expanded_proof_ids=[base],
+            expansion_round=1,
+            expanded_proof_max_chars=record_chars,
+        )
+        assert exact["expanded_proofs"] == [proof_record]
+        assert exact["expanded_proof_characters"] == record_chars
 
 
 def test_factgraph_public_snapshot_lock_linearizes_list_against_revoke():

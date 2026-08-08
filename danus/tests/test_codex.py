@@ -15,8 +15,6 @@ from __future__ import annotations
 
 import contextlib
 import os
-import stat
-import tempfile
 from pathlib import Path
 
 from danus import codex

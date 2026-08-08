@@ -204,7 +204,8 @@ def test_ledger_append_and_total():
     with tempfile.TemporaryDirectory() as tmp:
         e1 = {"model": "m", "effort": "high", "attempt": "full", "status": "completed",
               "usage": {"input": 1, "output": 2, "reasoning": 3}, "cost_usd": 1.5, "seconds": 1.0}
-        e2 = dict(e1); e2["cost_usd"] = 2.25
+        e2 = dict(e1)
+        e2["cost_usd"] = 2.25
         t1 = ledger.log_spend(tmp, e1)
         t2 = ledger.log_spend(tmp, e2)
         assert t1 == "1.5000" and t2 == "3.7500"

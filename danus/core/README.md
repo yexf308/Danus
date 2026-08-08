@@ -52,6 +52,7 @@ fid = fg.add(problem_id="KMMP", author="KMMP_high", statement="...", proof="..."
 fg.undefined_symbols(statement="...", proof="...", predecessors=["<id>"])  # coverage check
 fg.search("query")                        # statement-only ranked summaries
 fg.context([fid], predecessor_depth=None, proof_mode="selected", max_chars=200000)
+fg.verification_context([fid], max_chars=200000)  # internal v3 write-gate context
 fg.get_raw(fid); fg.list(); fg.predecessors(fid); fg.glossary(); fg.descendants(fid)
 fg.revoke(fid, reason="...")     # cascades to dependents
 ```
@@ -74,6 +75,11 @@ does not expose a separate `promote()` shortcut.
   the discovery glossary from remaining active facts.
 - `FactGraph.context` reports an explicit scope, completeness state, and digest;
   budgets omit whole records rather than returning partial facts.
+- `FactGraph.verification_context` is a separate v3 write-gate protocol. Round
+  zero carries every transitive ancestor statement, direct edge, and fact-local
+  definition exactly once with `expanded_proofs=[]`; later rounds add only named
+  whole proof records. Its digest binds the complete envelope and accounting.
+  The public `context`/`fact_context` v1 API remains compatible.
 - Append-only everywhere; status is an appended note folded at read.
 
 Enforced by **prose**, not code: "global memory is awareness, never a correctness

@@ -60,20 +60,22 @@ Load-bearing separations:
 The single path a fact enters truth is a worker's `fact_submit`, which is a
 state machine, not a suggestion:
 
-1. lazily load full cards for the declared direct predecessors, every inherited
-   fact-local definition, immutable global definitions, and a digest/count
-   commitment to the core-validated transitive closure (never predecessor proofs,
-   ancestor statements, the closure edge skeleton, or implicit project-glossary
-   entries), and block missing, revoked, incomplete, or over-budget context;
+1. load the complete transitive ancestor statement/edge/fact-local-definition
+   closure and selected immutable definitions, with no ancestor proof in round
+   zero, and block missing, revoked, incomplete, or over-budget context;
 2. call the verify service with the statement, proof, and complete authoritative
    fact context; both context and returned verdict are checked by deterministic
    schemas, not only prompts, and the service must attest the context digest;
-3. after verification, rebuild the context snapshot under the graph's
+3. if the verifier needs exact ancestor proofs, allow only strict closure ids and
+   hydrate their whole canonical records within bounded fresh-session rounds;
+   Graphify/discovery never participates in completeness, hydration, digest, or
+   judgment;
+4. after final verification, rebuild the exact expansion snapshot under the graph's
    cross-process mutation lock;
-4. only after a `correct` verdict and unchanged locked snapshot, attempt the fact
+5. only after a `final/correct` verdict and unchanged locked snapshot, attempt the fact
    add; revoke uses the same lock, closing add/revoke races, while storage errors
    remain explicit accept-but-write-failed outcomes;
-5. durably attempt to trace an actual verdict to global memory (accept, reject,
+6. durably attempt to trace every adaptive round and the final verdict to global memory (accept, reject,
    or write-failed). A trace I/O failure is returned explicitly as `trace_error`
    without hiding an already-written fact id.
 

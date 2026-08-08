@@ -340,6 +340,13 @@ the verification write-gate sets `include_project_glossary=false`, leaving only
 declared fact-local definitions and immutable global entries. Exposed as
 `fact_context` to worker and main.
 
+The internal `fact_submit` verifier projection is independently versioned. Its
+v3 round zero contains the complete transitive ancestor statement/edge/local-
+definition closure and no proof; later rounds attach only explicitly requested
+strict-ancestor whole proof records. Completeness/omissions, expansion scope and
+round, exact proof bytes, and budget accounting are digest-bound. This does not
+change the public `fact_context` API above.
+
 **Operations (code = data-structure I/O only).** `compute_fact_id(...)`,
 `add(problem_id, author, statement, proof, predecessors=[], intuition="",
 external_refs=[]) -> fact_id`, `get_raw(fact_id)`, `list()`, `search(query, limit)`,

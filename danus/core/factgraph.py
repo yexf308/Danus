@@ -41,8 +41,8 @@ _SAFE_FACT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _CONTENT_FACT_ID_RE = re.compile(r"^[0-9a-f]{16}$")
 _LINE_BREAK_RE = re.compile(r"[\n\r\v\f\x1c-\x1e\x85\u2028\u2029]")
 FACT_CONTEXT_SCHEMA_VERSION = 1
-VERIFICATION_CONTEXT_SCHEMA_VERSION = 2
-VERIFICATION_CONTEXT_PROJECTION = "direct-premises-ancestor-definitions-v1"
+VERIFICATION_CONTEXT_SCHEMA_VERSION = 3
+VERIFICATION_CONTEXT_PROJECTION = "full-statement-closure-adaptive-proofs-v1"
 
 
 def _term_occurs(term: str, text: str) -> bool:
@@ -83,25 +83,23 @@ def fact_context_digest(
 
 def verification_context_digest(
     *,
-    scope: Dict[str, object],
-    facts: List[Dict[str, object]],
-    ancestor_definitions: List[Dict[str, object]],
-    dependency_closure: Dict[str, object],
-    glossary: Optional[Dict[str, str]] = None,
+    context: Dict[str, object],
 ) -> str:
-    """Bind the compact verifier projection and its complete dependency skeleton."""
+    """Bind the complete adaptive envelope except for its digest field itself.
+
+    This includes every statement, edge, fact-local/global definition, exact
+    proof byte sequence, scope/round, completeness marker, omission report, and
+    budget accounting value. Replaying a verdict against any materially
+    different context therefore changes the attestation.
+    """
+    if "digest" in context:
+        raise ValueError("verification context digest input must omit digest")
     canonical = json.dumps(
-        {
-            "schema_version": VERIFICATION_CONTEXT_SCHEMA_VERSION,
-            "scope": scope,
-            "facts": facts,
-            "ancestor_definitions": ancestor_definitions,
-            "dependency_closure": dependency_closure,
-            "glossary": glossary or {},
-        },
+        context,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
+        allow_nan=False,
     )
     return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
@@ -643,9 +641,39 @@ class FactGraph:
                 == VERIFICATION_CONTEXT_SCHEMA_VERSION
                 and scope.get("projection") == VERIFICATION_CONTEXT_PROJECTION
             ):
+                expanded_proof_ids = scope.get("expanded_proof_ids")
+                expansion_round = scope.get("expansion_round")
+                candidate_fact_id = scope.get("candidate_fact_id")
+                expanded_proof_max_chars = expected_context.get(
+                    "expanded_proof_character_budget"
+                )
+                if (
+                    not isinstance(expanded_proof_ids, list)
+                    or not isinstance(expansion_round, int)
+                    or not isinstance(candidate_fact_id, str)
+                ):
+                    raise ValueError(
+                        "verification_context_changed: malformed adaptive scope"
+                    )
+                actual_candidate_fact_id = compute_fact_id(
+                    problem_id=problem_id,
+                    predecessors=roots,
+                    glossary_introduces=glossary_introduces or {},
+                    statement=statement,
+                    proof=proof,
+                )
+                if candidate_fact_id != actual_candidate_fact_id:
+                    raise ValueError(
+                        "verification_context_changed: candidate content does not "
+                        "match the verified adaptive scope"
+                    )
                 current_context = self._verification_context_unlocked(
                     roots,
                     max_chars=context_max_chars,
+                    candidate_fact_id=candidate_fact_id,
+                    expanded_proof_ids=expanded_proof_ids,
+                    expansion_round=expansion_round,
+                    expanded_proof_max_chars=expanded_proof_max_chars,
                     glossary_texts=context_glossary_texts,
                     glossary_exclude_terms=context_glossary_exclude_terms,
                 )
@@ -1130,21 +1158,30 @@ class FactGraph:
         fact_ids: List[str],
         *,
         max_chars: Optional[int],
+        candidate_fact_id: Optional[str] = None,
+        expanded_proof_ids: Optional[List[str]] = None,
+        expansion_round: int = 0,
+        expanded_proof_max_chars: Optional[int] = 200000,
         glossary_texts: Optional[List[str]] = None,
         glossary_exclude_terms: Optional[List[str]] = None,
     ) -> Dict[str, object]:
-        """Build the compact, full-closure context used only by ``fact_submit``.
+        """Build the adaptive full-closure context used only by ``fact_submit``.
 
-        Direct predecessors are complete premise cards. Ancestors contribute all
-        fact-local definitions but no statements or proofs. Core traverses and
-        validates the full closure, then transports only a canonical digest/count
-        commitment to its edge skeleton. The public ``context`` API intentionally
-        retains its existing v1 shape and hydration modes.
+        Round zero contains every transitive ancestor's statement, direct edges,
+        and fact-local definitions, but no ancestor proof. Later rounds hydrate
+        only the explicitly named closure facts, always as whole proof records.
+        Traversal is a de-duplicating breadth-first walk, hence graph construction
+        is ``O(V + E)`` even for deep or diamond-shaped closures. The public
+        :meth:`context` API intentionally retains its v1 shape and proof modes.
         """
         with self._snapshot_lock():
             return self._verification_context_unlocked(
                 fact_ids,
                 max_chars=max_chars,
+                candidate_fact_id=candidate_fact_id,
+                expanded_proof_ids=expanded_proof_ids,
+                expansion_round=expansion_round,
+                expanded_proof_max_chars=expanded_proof_max_chars,
                 glossary_texts=glossary_texts,
                 glossary_exclude_terms=glossary_exclude_terms,
             )
@@ -1154,6 +1191,10 @@ class FactGraph:
         fact_ids: List[str],
         *,
         max_chars: Optional[int],
+        candidate_fact_id: Optional[str] = None,
+        expanded_proof_ids: Optional[List[str]] = None,
+        expansion_round: int = 0,
+        expanded_proof_max_chars: Optional[int] = 200000,
         glossary_texts: Optional[List[str]] = None,
         glossary_exclude_terms: Optional[List[str]] = None,
     ) -> Dict[str, object]:
@@ -1163,6 +1204,39 @@ class FactGraph:
             raise ValueError("max_chars must be a non-negative integer or None")
         if not isinstance(fact_ids, list) or any(not isinstance(fid, str) for fid in fact_ids):
             raise ValueError("fact_ids must be a list of strings")
+        if candidate_fact_id is not None and (
+            not isinstance(candidate_fact_id, str)
+            or not _CONTENT_FACT_ID_RE.fullmatch(candidate_fact_id)
+        ):
+            raise ValueError("candidate_fact_id must be a 16-hex fact_id or None")
+        if expanded_proof_ids is None:
+            expanded_proof_ids = []
+        if not isinstance(expanded_proof_ids, list) or any(
+            not isinstance(fid, str) for fid in expanded_proof_ids
+        ):
+            raise ValueError("expanded_proof_ids must be a list of strings")
+        if len(expanded_proof_ids) != len(set(expanded_proof_ids)):
+            raise ValueError("expanded_proof_ids contains duplicates")
+        if any(not _CONTENT_FACT_ID_RE.fullmatch(fid) for fid in expanded_proof_ids):
+            raise ValueError("expanded_proof_ids must contain only 16-hex fact_ids")
+        if (
+            isinstance(expansion_round, bool)
+            or not isinstance(expansion_round, int)
+            or expansion_round < 0
+        ):
+            raise ValueError("expansion_round must be a non-negative integer")
+        if expansion_round == 0 and expanded_proof_ids:
+            raise ValueError("round zero may not contain expanded proofs")
+        if expansion_round > 0 and not expanded_proof_ids:
+            raise ValueError("an expansion round requires at least one expanded proof")
+        if expanded_proof_max_chars is not None and (
+            isinstance(expanded_proof_max_chars, bool)
+            or not isinstance(expanded_proof_max_chars, int)
+            or expanded_proof_max_chars < 0
+        ):
+            raise ValueError(
+                "expanded_proof_max_chars must be a non-negative integer or None"
+            )
         if glossary_texts is not None and (
             not isinstance(glossary_texts, list)
             or any(not isinstance(text, str) for text in glossary_texts)
@@ -1185,16 +1259,17 @@ class FactGraph:
                 roots.append(fact_id)
                 seen_roots.add(fact_id)
 
-        root_set = set(roots)
         queue: Deque[str] = deque(roots)
         discovered: Set[str] = set(roots)
+        closure_order: List[str] = []
         full_records: List[Dict[str, object]] = []
-        dependency_closure: List[Dict[str, object]] = []
+        raw_by_id: Dict[str, str] = {}
         missing: List[str] = []
         revoked: List[str] = []
 
         while queue:
             fact_id = queue.popleft()
+            closure_order.append(fact_id)
             if not _CONTENT_FACT_ID_RE.fullmatch(fact_id):
                 raise ValueError(
                     "verification context closure contains a non-content fact_id: "
@@ -1230,135 +1305,127 @@ class FactGraph:
                 "predecessors": predecessors,
                 "glossary_introduces": local_glossary,
             }
-            if fact_id in root_set and not str(record["statement"]).strip():
+            if not str(record["statement"]).strip():
                 raise ValueError(
-                    f"fact_integrity_error: direct premise {fact_id} has an empty statement"
+                    f"fact_integrity_error: closure fact {fact_id} has an empty statement"
                 )
             full_records.append(record)
-            dependency_closure.append(
-                {"fact_id": fact_id, "predecessors": predecessors}
-            )
+            raw_by_id[fact_id] = raw
             for predecessor in predecessors:
                 if predecessor not in discovered:
                     discovered.add(predecessor)
                     queue.append(predecessor)
 
-        by_id = {str(record["fact_id"]): record for record in full_records}
-        direct_cards = [by_id[fact_id] for fact_id in roots if fact_id in by_id]
+        outside_closure = [fid for fid in expanded_proof_ids if fid not in raw_by_id]
+        if outside_closure:
+            raise ValueError(
+                "expanded proof ids are not in the verified dependency closure: "
+                + ", ".join(outside_closure)
+            )
+        if candidate_fact_id is not None and candidate_fact_id in discovered:
+            raise ValueError("candidate_fact_id must not belong to its ancestor closure")
 
-        excluded_terms = set(glossary_exclude_terms or [])
-        local_definitions: Dict[str, str] = {}
-        direct_terms: Set[str] = set()
-        for record in full_records:
-            local = record["glossary_introduces"]
-            assert isinstance(local, dict)
-            for term, definition in sorted(local.items()):
-                term = str(term)
-                definition = str(definition)
-                prior = local_definitions.get(term)
-                if prior is not None and prior != definition:
-                    raise ValueError(
-                        "glossary_integrity_error: conflicting closure definitions "
-                        f"for {term}"
-                    )
-                local_definitions[term] = definition
-        for card in direct_cards:
-            local = card["glossary_introduces"]
-            assert isinstance(local, dict)
-            direct_terms.update(str(term) for term in local)
-        excluded_terms.update(direct_terms)
-
-        ancestor_sources: Dict[str, Tuple[str, str]] = {}
+        expanded_set = set(expanded_proof_ids)
+        stable_expanded_ids = [fid for fid in closure_order if fid in expanded_set]
+        expanded_proof_characters = 0
+        omitted_expanded_proof_ids: List[str] = []
+        expanded_proof_records: List[Dict[str, object]] = []
+        glossary_reference_texts = list(glossary_texts or [])
+        local_glossary_terms = set(glossary_exclude_terms or [])
         for record in full_records:
             fact_id = str(record["fact_id"])
-            if fact_id in root_set:
-                continue
+            glossary_reference_texts.append(str(record["statement"]))
             local = record["glossary_introduces"]
             assert isinstance(local, dict)
-            for term, definition in sorted(local.items()):
-                term = str(term)
-                if term and term not in excluded_terms:
-                    prior = ancestor_sources.get(term)
-                    if prior is not None and prior[0] != str(definition):
-                        raise ValueError(
-                            "glossary_integrity_error: conflicting ancestor definitions "
-                            f"for {term}"
-                        )
-                    ancestor_sources.setdefault(term, (str(definition), fact_id))
-
-        global_available: Dict[str, str] = {}
-        for term, definition in _glossary.global_glossary().items():
-            term = str(term)
-            definition = str(definition)
-            local_definition = local_definitions.get(term)
-            if local_definition is not None and local_definition != definition:
+            local_glossary_terms.update(str(term) for term in local)
+            glossary_reference_texts.extend(str(value) for value in local.values())
+        proof_characters_considered = 0
+        for fact_id in stable_expanded_ids:
+            raw = raw_by_id.get(fact_id)
+            if raw is None:
+                continue
+            proof_text = _proof_of(raw)
+            if not proof_text:
                 raise ValueError(
-                    "glossary_integrity_error: closure conflicts with global term "
-                    + term
+                    f"fact_integrity_error: expanded fact {fact_id} has an empty proof"
                 )
+            proof_record = {"fact_id": fact_id, "proof": proof_text}
+            proof_record_chars = len(json.dumps(
+                proof_record,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ))
             if (
-                term
-                and term not in excluded_terms
-                and term not in local_definitions
+                expanded_proof_max_chars is not None
+                and proof_characters_considered + proof_record_chars
+                > expanded_proof_max_chars
             ):
-                global_available[term] = definition
-        global_available = {
-            str(term): str(definition)
-            for term, definition in sorted(global_available.items())
-        }
+                omitted_expanded_proof_ids.append(fact_id)
+                continue
+            proof_characters_considered += proof_record_chars
+            expanded_proof_records.append(proof_record)
+            glossary_reference_texts.append(proof_text)
 
-        all_ancestor_definitions = [
-            {
-                "term": term,
-                "definition": ancestor_sources[term][0],
-                "source_fact_id": ancestor_sources[term][1],
-            }
-            for term in sorted(ancestor_sources)
-        ]
-        all_glossary = dict(global_available)
+        resolved_glossary = self._resolved_glossary_for_texts(
+            glossary_reference_texts,
+            local_glossary_terms,
+            include_project_glossary=False,
+        )
+        all_glossary = dict(resolved_glossary)
 
-        included_cards: List[Dict[str, object]] = []
-        included_ancestor_definitions: List[Dict[str, object]] = []
+        included_records: List[Dict[str, object]] = []
         included_glossary: Dict[str, str] = {}
         omitted_fact_ids: List[str] = []
         omitted_glossary_terms: List[str] = []
         characters_used = 0
 
-        for index, card in enumerate(direct_cards):
-            card_chars = len(json.dumps(
-                card, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        for index, record in enumerate(full_records):
+            record_chars = len(json.dumps(
+                record, ensure_ascii=False, sort_keys=True, separators=(",", ":")
             ))
-            if max_chars is not None and characters_used + card_chars > max_chars:
-                omitted_fact_ids = [str(item["fact_id"]) for item in direct_cards[index:]]
+            if max_chars is not None and characters_used + record_chars > max_chars:
+                omitted_fact_ids = [
+                    str(item["fact_id"]) for item in full_records[index:]
+                ]
                 break
-            included_cards.append(card)
-            characters_used += card_chars
+            included_records.append(record)
+            characters_used += record_chars
 
+        included_expanded_proofs: List[Dict[str, object]] = []
         if omitted_fact_ids:
-            omitted_glossary_terms = [
-                str(item["term"]) for item in all_ancestor_definitions
-            ] + list(all_glossary)
+            omitted_expanded_proof_ids = list(stable_expanded_ids)
+            omitted_glossary_terms = list(all_glossary)
         else:
-            for index, definition_record in enumerate(all_ancestor_definitions):
-                definition_chars = len(json.dumps(
-                    definition_record,
+            for index, proof_record in enumerate(expanded_proof_records):
+                proof_record_chars = len(json.dumps(
+                    proof_record,
                     ensure_ascii=False,
                     sort_keys=True,
                     separators=(",", ":"),
                 ))
                 if (
                     max_chars is not None
-                    and characters_used + definition_chars > max_chars
+                    and characters_used + proof_record_chars > max_chars
                 ):
-                    omitted_glossary_terms = [
-                        str(item["term"])
-                        for item in all_ancestor_definitions[index:]
-                    ] + list(all_glossary)
+                    omitted_expanded_proof_ids.extend(
+                        str(item["fact_id"])
+                        for item in expanded_proof_records[index:]
+                    )
                     break
-                included_ancestor_definitions.append(definition_record)
-                characters_used += definition_chars
+                included_expanded_proofs.append(proof_record)
+                expanded_proof_characters += proof_record_chars
+                characters_used += proof_record_chars
 
-            if not omitted_glossary_terms:
+            if omitted_expanded_proof_ids:
+                # Preserve closure order and uniqueness even when two independent
+                # budgets reject proof records.
+                omitted_set = set(omitted_expanded_proof_ids)
+                omitted_expanded_proof_ids = [
+                    fid for fid in stable_expanded_ids if fid in omitted_set
+                ]
+                omitted_glossary_terms = list(all_glossary)
+            else:
                 glossary_terms = list(all_glossary)
                 for index, term in enumerate(glossary_terms):
                     definition = all_glossary[term]
@@ -1377,49 +1444,50 @@ class FactGraph:
                     included_glossary[term] = definition
                     characters_used += definition_chars
 
-        truncated = bool(omitted_fact_ids or omitted_glossary_terms)
-        dependency_commitment: Dict[str, object] = {
-            "count": len(dependency_closure),
-            "digest": dependency_closure_digest(dependency_closure),
-        }
+        truncated = bool(
+            omitted_fact_ids
+            or omitted_glossary_terms
+            or omitted_expanded_proof_ids
+        )
         scope: Dict[str, object] = {
+            "candidate_fact_id": candidate_fact_id,
             "requested_fact_ids": roots,
             "predecessor_depth": None,
-            "proof_mode": "none",
+            "proof_mode": "adaptive",
             "include_project_glossary": False,
             "projection": VERIFICATION_CONTEXT_PROJECTION,
-            "ancestor_definition_terms": [
-                str(item["term"]) for item in all_ancestor_definitions
-            ],
+            "expansion_round": expansion_round,
+            "closure_fact_ids": closure_order,
+            "expanded_proof_ids": stable_expanded_ids,
             "glossary_terms": list(all_glossary),
         }
-        return {
+        context_without_digest: Dict[str, object] = {
             "schema_version": VERIFICATION_CONTEXT_SCHEMA_VERSION,
             "scope": scope,
-            "facts": included_cards,
-            "ancestor_definitions": included_ancestor_definitions,
-            "dependency_closure": dependency_commitment,
+            "facts": included_records,
+            "expanded_proofs": included_expanded_proofs,
             "glossary": included_glossary,
-            "digest": verification_context_digest(
-                scope=scope,
-                facts=included_cards,
-                ancestor_definitions=included_ancestor_definitions,
-                dependency_closure=dependency_commitment,
-                glossary=included_glossary,
-            ),
             "complete": not (
                 missing
                 or revoked
                 or omitted_fact_ids
                 or omitted_glossary_terms
+                or omitted_expanded_proof_ids
             ),
             "truncated": truncated,
             "missing_fact_ids": missing,
             "revoked_fact_ids": revoked,
             "omitted_fact_ids": omitted_fact_ids,
             "omitted_glossary_terms": omitted_glossary_terms,
+            "omitted_expanded_proof_ids": omitted_expanded_proof_ids,
             "characters_used": characters_used,
             "character_budget": max_chars,
+            "expanded_proof_characters": expanded_proof_characters,
+            "expanded_proof_character_budget": expanded_proof_max_chars,
+        }
+        return {
+            **context_without_digest,
+            "digest": verification_context_digest(context=context_without_digest),
         }
 
     def predecessors(self, fact_id: str) -> List[str]:

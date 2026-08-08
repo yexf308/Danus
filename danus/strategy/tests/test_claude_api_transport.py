@@ -26,7 +26,7 @@ import types
 from contextlib import contextmanager
 from pathlib import Path
 
-from danus.strategy import cli, ledger
+from danus.strategy import cli
 from danus.strategy.config import (
     DEFAULT_CLAUDE_API_FALLBACK, DEFAULT_CLAUDE_API_MODEL,
     load_claude_api_config, resolve_transport,
@@ -265,7 +265,6 @@ def test_step_down_on_400():
     class _SteppingClient(_StubClient):
         def __init__(self):
             super().__init__([_final()])
-            outer = self
 
             class _Messages:
                 def stream(self, **kwargs):
@@ -366,7 +365,7 @@ def _run_cli(argv, stdin_text="the elaboration"):
         buf = io.StringIO()
         with redirect_stdout(buf):
             code = cli.main(["--file", str(p), *argv])
-        lines = [l for l in buf.getvalue().splitlines() if l.strip()]
+        lines = [line for line in buf.getvalue().splitlines() if line.strip()]
         return code, (json.loads(lines[-1]) if lines else None)
 
 
@@ -393,7 +392,7 @@ def test_cli_success_and_ledger():
             assert res["status"] == "completed"
             assert res["cost_usd"] == 0.182
             assert float(res["project_total_usd"]) == 0.182
-            events = [json.loads(l) for l in
+            events = [json.loads(line) for line in
                       (Path(proj) / "spend" / "consult.jsonl").read_text().splitlines()]
             assert events[-1]["cost_usd"] == 0.182
     finally:

@@ -38,11 +38,14 @@ holds every verified result and is the system's only source of truth.
 
 For large graphs, agents do not inject the graph wholesale. They discover facts
 through full-text search that returns statement-only summaries, then hydrate only
-explicit ids. Verification carries full cards only for direct predecessors, all
-inherited fact-local and immutable global definitions, and a digest/count
-commitment to the machine-checked full dependency closure. Ancestor statements,
-proofs, and the edge skeleton stay out of the model prompt, and the verifier never
-reads project fact files directly.
+explicit ids. Verification round zero carries the complete candidate proof plus
+all transitive ancestor statements, direct dependency edges, fact-local definitions,
+and selected immutable global definitions. Round zero carries no ancestor proof.
+If the verifier returns `needs_context`, the gateway may hydrate only the named
+strict ancestors from canonical fact files (whole proof records, bounded to two
+expansion rounds/eight proofs/200000 record characters by default) and starts a
+fresh verifier session. The digest binds the complete envelope, expansion round,
+and exact proof bytes. The verifier never reads project fact files directly.
 The mutable project glossary is a discovery index only; it is never injected as
 an implicit verifier premise.
 

@@ -36,6 +36,8 @@ def main() -> int:
 
     if "[[FAKE:wrong]]" in prompt:
         payload = {
+            "output_schema_version": 2,
+            "verification_status": "final",
             "verification_report": {
                 "summary": "FAKE stub verdict (plumbing test): marker [[FAKE:wrong]] present.",
                 "critical_errors": [
@@ -44,16 +46,20 @@ def main() -> int:
                 "gaps": [],
             },
             "verdict": "wrong",
+            "needs_expanded_proofs": [],
             "repair_hints": "This is a fake reject from fake_codex.py (plumbing only).",
         }
     else:
         payload = {
+            "output_schema_version": 2,
+            "verification_status": "final",
             "verification_report": {
                 "summary": "FAKE stub verdict (plumbing test): no error marker; accepting.",
                 "critical_errors": [],
                 "gaps": [],
             },
             "verdict": "correct",
+            "needs_expanded_proofs": [],
             "repair_hints": "",
         }
 

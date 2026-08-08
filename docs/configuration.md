@@ -78,7 +78,10 @@ defaults apply everywhere; per-service overrides win.
 | `VERIFY_PORT` | `8091` | verify service (`127.0.0.1`) |
 | `DASHBOARD_PORT` | `8099` | read-only dashboard (`127.0.0.1`) |
 | `DANUS_VERIFY_URL` | `http://127.0.0.1:8091/verify` | where `fact_submit` posts |
-| `DANUS_VERIFY_CONTEXT_MAX_CHARS` | `200000` | maximum complete predecessor-card plus selected-glossary context; overflow blocks submission before verification |
+| `DANUS_VERIFY_CONTEXT_MAX_CHARS` | `200000` | maximum complete statement-closure/expanded-record/selected-definition context; overflow blocks submission before verification |
+| `DANUS_VERIFY_MAX_EXPANSION_ROUNDS` | `2` | maximum adaptive proof-hydration rounds after statement-only round zero |
+| `DANUS_VERIFY_MAX_EXPANDED_PROOFS` | `8` | maximum cumulative strict-ancestor whole proof records |
+| `DANUS_VERIFY_MAX_EXPANDED_PROOF_CHARS` | `200000` | maximum canonical JSON characters across expanded proof records; never sliced |
 | `DANUS_VERIFY_MAX_PROMPT_BYTES` | `200000` | maximum final UTF-8 verifier prompt (candidate + escaped context + envelope); overflow returns 413 before Codex starts |
 | `DANUS_VERIFY_MAX_REQUEST_BYTES` | `1000000` | maximum `/verify` request-body bytes, enforced before JSON model parsing |
 | `DANUS_VERIFY_BODY_TIMEOUT_SECONDS` | `10` | total request-body upload deadline before HTTP 408 |

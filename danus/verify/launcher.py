@@ -23,9 +23,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime, timezone
 from functools import lru_cache
 from importlib import resources
@@ -247,15 +249,67 @@ def _write_run_log(
     status: str,
     returncode: object,
     finished_at: Optional[str] = None,
+    model: Optional[str] = None,
+    effort: Optional[str] = None,
+    elapsed_seconds: Optional[float] = None,
+    tokens_used: Optional[int] = None,
+    context_round: Optional[int] = None,
+    expanded_proof_ids: Optional[List[str]] = None,
+    verification_status: Optional[str] = None,
+    verdict: Optional[str] = None,
 ) -> None:
     """Persist only service-owned execution metadata, never Codex output."""
+    def safe_atom(value: str) -> str:
+        return value if re.fullmatch(r"[A-Za-z0-9._:/+\-]+", value) else "redacted"
+
     lines = [f"started_at_utc: {started_at}"]
     if finished_at is not None:
         lines.append(f"finished_at_utc: {finished_at}")
     lines.extend((f"status: {status}", f"returncode: {returncode}"))
+    if model is not None:
+        lines.append(f"model: {safe_atom(model)}")
+    if effort is not None:
+        lines.append(f"effort: {safe_atom(effort)}")
+    if elapsed_seconds is not None:
+        lines.append(f"elapsed_seconds: {elapsed_seconds:.3f}")
+    if tokens_used is not None:
+        lines.append(f"tokens_used: {tokens_used}")
+    if context_round is not None:
+        lines.append(f"context_round: {context_round}")
+    if expanded_proof_ids is not None:
+        lines.append(
+            "expanded_proof_ids: "
+            + json.dumps(expanded_proof_ids, separators=(",", ":"))
+        )
+    if verification_status is not None:
+        lines.append(f"verification_status: {safe_atom(verification_status)}")
+    if verdict is not None:
+        lines.append(f"verdict: {safe_atom(verdict)}")
     with path.open("w", encoding="utf-8") as handle:
         os.fchmod(handle.fileno(), 0o600)
         handle.write("\n".join(lines) + "\n")
+
+
+_TOKENS_USED_RE = re.compile(
+    rb"tokens\s+used\s*(?:\r?\n)+\s*([0-9][0-9,]*)",
+    re.IGNORECASE,
+)
+
+
+def _parse_tokens_used(raw_output: Any) -> Optional[int]:
+    """Extract only the final numeric token count from an unlinked raw stream."""
+    raw_output.flush()
+    raw_output.seek(0, os.SEEK_END)
+    end = raw_output.tell()
+    raw_output.seek(max(0, end - 131072), os.SEEK_SET)
+    tail = raw_output.read()
+    matches = _TOKENS_USED_RE.findall(tail)
+    if not matches:
+        return None
+    try:
+        return int(matches[-1].replace(b",", b""))
+    except ValueError:
+        return None
 
 
 def _prompt_json(value: object) -> str:
@@ -268,16 +322,17 @@ def _prompt_json(value: object) -> str:
 def _prompt_fact_context(context: Dict[str, Any]) -> Dict[str, Any]:
     """Project the machine envelope to only mathematics the model must read.
 
-    Core/service validate and digest the full dependency closure. Its topology is
-    intentionally represented across the HTTP seam only by a digest/count and is
-    not model context. Ancestor statements and proofs never appear here.
+    Every ancestor statement, direct edge, and fact-local definition is present.
+    A proof key appears only for ids explicitly hydrated by the gateway in this
+    adaptive round; round zero therefore contains no ancestor proof bytes.
     """
     return {
         "schema_version": context.get("schema_version"),
         "complete": context.get("complete"),
         "digest": context.get("digest"),
-        "premise_cards": context.get("facts", []),
-        "ancestor_definitions": context.get("ancestor_definitions", []),
+        "scope": context.get("scope", {}),
+        "fact_statement_closure": context.get("facts", []),
+        "expanded_proofs": context.get("expanded_proofs", []),
         "global_definitions": context.get("glossary", {}),
     }
 
@@ -316,6 +371,9 @@ def build_prompt(
         ])
     parts.extend([
         "Use AGENTS.md to verify the candidate proof for the candidate statement. "
+        "If a specific strict-ancestor proof is genuinely required, return "
+        "verification_status=needs_context and name only ids from the supplied "
+        "fact statement closure; otherwise return verification_status=final. "
         "Return only the final verification JSON matching the required output schema. "
         "Do not write files or invoke a tool to persist the verdict.",
     ])
@@ -389,14 +447,32 @@ def run_codex_verification(
         glossary_introduces=glossary_introduces,
     )
     env = codex.subprocess_env(cmd[0])
+    model_name = cmd[cmd.index("--model") + 1]
+    effort_name = _effort()
+    context_scope = fact_context.get("scope", {}) if fact_context else {}
+    context_round = (
+        context_scope.get("expansion_round")
+        if isinstance(context_scope.get("expansion_round"), int)
+        else None
+    )
+    expanded_ids = context_scope.get("expanded_proof_ids")
+    if not isinstance(expanded_ids, list) or any(
+        not isinstance(fact_id, str) for fact_id in expanded_ids
+    ):
+        expanded_ids = None
 
     started_at = datetime.now(timezone.utc).isoformat()
+    started_monotonic = time.monotonic()
     try:
         _write_run_log(
             log_path,
             started_at=started_at,
             status="running",
             returncode="unavailable",
+            model=model_name,
+            effort=effort_name,
+            context_round=context_round,
+            expanded_proof_ids=expanded_ids,
         )
     except OSError as exc:
         raise HTTPException(
@@ -404,41 +480,69 @@ def run_codex_verification(
             detail=f"could not create sanitized verifier run log at {log_path}: {exc}",
         ) from exc
 
-    try:
-        completed = subprocess.run(
-            cmd, cwd=_agent_home(), env=env,
-            input=prompt, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            text=True, timeout=_timeout(), check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        _write_run_log(
-            log_path,
-            started_at=started_at,
-            finished_at=datetime.now(timezone.utc).isoformat(),
-            status="timed_out",
-            returncode="unavailable",
-        )
-        raise HTTPException(status_code=504,
-                            detail=f"codex exec timed out after {exc.timeout}s. See log at {log_path}") from exc
-    except OSError as exc:
-        _write_run_log(
-            log_path,
-            started_at=started_at,
-            finished_at=datetime.now(timezone.utc).isoformat(),
-            status="start_failed",
-            returncode="unavailable",
-        )
-        raise HTTPException(
-            status_code=500,
-            detail=f"could not start codex exec: {exc}. See log at {log_path}",
-        ) from exc
+    tokens_used: Optional[int] = None
+    with tempfile.TemporaryFile(mode="w+b") as raw_output:
+        try:
+            completed = subprocess.run(
+                cmd, cwd=_agent_home(), env=env,
+                input=prompt, stdout=raw_output, stderr=subprocess.STDOUT,
+                text=True, timeout=_timeout(), check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            tokens_used = _parse_tokens_used(raw_output)
+            elapsed_seconds = time.monotonic() - started_monotonic
+            _write_run_log(
+                log_path,
+                started_at=started_at,
+                finished_at=datetime.now(timezone.utc).isoformat(),
+                status="timed_out",
+                returncode="unavailable",
+                model=model_name,
+                effort=effort_name,
+                elapsed_seconds=elapsed_seconds,
+                tokens_used=tokens_used,
+                context_round=context_round,
+                expanded_proof_ids=expanded_ids,
+            )
+            raise HTTPException(
+                status_code=504,
+                detail=f"codex exec timed out after {exc.timeout}s. See log at {log_path}",
+            ) from exc
+        except OSError as exc:
+            elapsed_seconds = time.monotonic() - started_monotonic
+            _write_run_log(
+                log_path,
+                started_at=started_at,
+                finished_at=datetime.now(timezone.utc).isoformat(),
+                status="start_failed",
+                returncode="unavailable",
+                model=model_name,
+                effort=effort_name,
+                elapsed_seconds=elapsed_seconds,
+                context_round=context_round,
+                expanded_proof_ids=expanded_ids,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=f"could not start codex exec: {exc}. See log at {log_path}",
+            ) from exc
+        tokens_used = _parse_tokens_used(raw_output)
+
+    elapsed_seconds = time.monotonic() - started_monotonic
+    finished_at = datetime.now(timezone.utc).isoformat()
 
     _write_run_log(
         log_path,
         started_at=started_at,
-        finished_at=datetime.now(timezone.utc).isoformat(),
+        finished_at=finished_at,
         status="completed",
         returncode=completed.returncode,
+        model=model_name,
+        effort=effort_name,
+        elapsed_seconds=elapsed_seconds,
+        tokens_used=tokens_used,
+        context_round=context_round,
+        expanded_proof_ids=expanded_ids,
     )
 
     if completed.returncode != 0:
@@ -456,9 +560,35 @@ def run_codex_verification(
         raise HTTPException(status_code=500,
                             detail=f"verification output at {verification_path} is not valid JSON") from exc
     try:
-        return validate_verification_output(payload)
+        validated = validate_verification_output(payload)
     except ValueError as exc:
         raise HTTPException(
             status_code=500,
             detail=f"verification output at {verification_path} violates the JSON contract: {exc}",
         ) from exc
+    _write_run_log(
+        log_path,
+        started_at=started_at,
+        finished_at=finished_at,
+        status="completed",
+        returncode=completed.returncode,
+        model=model_name,
+        effort=effort_name,
+        elapsed_seconds=elapsed_seconds,
+        tokens_used=tokens_used,
+        context_round=context_round,
+        expanded_proof_ids=expanded_ids,
+        verification_status=validated["verification_status"],
+        verdict=validated["verdict"],
+    )
+    return {
+        **validated,
+        "verification_metrics": {
+            "model": model_name,
+            "effort": effort_name,
+            "elapsed_seconds": round(elapsed_seconds, 3),
+            "tokens_used": tokens_used,
+            "context_round": context_round,
+            "expanded_proof_ids": list(expanded_ids or []),
+        },
+    }

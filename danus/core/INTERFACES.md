@@ -76,17 +76,20 @@ Install: `danus/gateway/INSTALL.md`.
      every reused project term must have a direct active predecessor that
      introduced the same definition, and project entries cannot redefine global
      notation;
-  3. lazily constructs compact verification context from declared predecessors:
-     full direct-premise cards, every inherited definition, immutable global
-     definitions, and a digest/count commitment to the validated transitive
-     closure (no ancestor statements, predecessor proofs, or edge skeleton),
-     blocking any missing, revoked, incomplete, or over-budget context;
-  4. **calls the verifier**; after acceptance it rechecks the exact context and
+  3. constructs verification context from declared predecessors: the complete
+     transitive ancestor statement/edge/fact-local-definition closure, immutable
+     selected definitions, and no ancestor proof, blocking missing, revoked,
+     incomplete, or over-budget context;
+  4. **calls the verifier**; a `needs_context` control response may hydrate only
+     exact strict-ancestor whole proofs from canonical fact files within the
+     configured round/count/record budgets, with a fresh session per round. After
+     a final acceptance it rechecks the exact expanded context and
      adds under the graph mutation lock, also merging the fact's introduced
      symbols into the project glossary. A stale snapshot returns `write_error`;
      on reject it returns repair hints (and any undefined symbols) and writes no fact.
   5. **either way, logs the verification outcome** to global memory (kind
-     `verification`: verdict + `fact_id` on accept / `repair_hints` on reject), so
+     `verification`: per-round ids/digests/requests plus the final verdict and
+     `fact_id` on accept / `repair_hints` on reject), so
      the verifier's feedback is not lost and siblings learn from rejections. The
      verifier itself stays stateless — `fact_submit` (the worker's tool) does this
      write.

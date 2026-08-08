@@ -1,7 +1,9 @@
 """Danus verify service — the mathematical authority behind the write-gate.
 
     POST /verify {statement, proof, glossary_introduces?, fact_context?}
-      -> {verification_report, verdict, repair_hints}
+      -> {output_schema_version, verification_status, verification_report,
+          verdict, needs_expanded_proofs, repair_hints,
+          verification_context_digest?, verification_metrics?}
     GET  /health                    -> {status: "ok", pid: <int>}
 
 /verify runs the deterministic pre-checks (``prechecks.run_prechecks``) and, if
@@ -41,6 +43,7 @@ _UNAVAILABLE_CONTEXT_FIELDS = (
     "revoked_fact_ids",
     "omitted_fact_ids",
     "omitted_glossary_terms",
+    "omitted_expanded_proof_ids",
 )
 
 
@@ -85,15 +88,14 @@ def _validate_fact_context(
     proof: str,
     glossary_introduces: Dict[str, str],
 ) -> None:
-    """Fail closed on the compact full-closure verification envelope."""
+    """Fail closed on the full statement-closure adaptive envelope."""
     _require_exact_keys(
         context,
         {
             "schema_version",
             "scope",
             "facts",
-            "ancestor_definitions",
-            "dependency_closure",
+            "expanded_proofs",
             "glossary",
             "digest",
             "complete",
@@ -102,8 +104,11 @@ def _validate_fact_context(
             "revoked_fact_ids",
             "omitted_fact_ids",
             "omitted_glossary_terms",
+            "omitted_expanded_proof_ids",
             "characters_used",
             "character_budget",
+            "expanded_proof_characters",
+            "expanded_proof_character_budget",
         },
         "fact_context",
     )
@@ -126,16 +131,24 @@ def _validate_fact_context(
     _require_exact_keys(
         scope,
         {
+            "candidate_fact_id",
             "requested_fact_ids",
             "predecessor_depth",
             "proof_mode",
             "include_project_glossary",
             "projection",
-            "ancestor_definition_terms",
+            "expansion_round",
+            "closure_fact_ids",
+            "expanded_proof_ids",
             "glossary_terms",
         },
         "scope",
     )
+    candidate_fact_id = scope.get("candidate_fact_id")
+    if not isinstance(candidate_fact_id, str) or not _FACT_ID_RE.fullmatch(
+        candidate_fact_id
+    ):
+        raise ValueError("scope.candidate_fact_id must be a 16-hex fact_id")
     requested = scope.get("requested_fact_ids")
     if not isinstance(requested, list) or any(
         not isinstance(fid, str) or not _FACT_ID_RE.fullmatch(fid) for fid in requested
@@ -145,25 +158,45 @@ def _validate_fact_context(
         raise ValueError("scope.requested_fact_ids contains duplicates")
     if scope.get("predecessor_depth", object()) is not None:
         raise ValueError("verification context must contain the full predecessor closure")
-    if scope.get("proof_mode") != "none":
-        raise ValueError("verification context proof_mode must be none")
+    if scope.get("proof_mode") != "adaptive":
+        raise ValueError("verification context proof_mode must be adaptive")
     if scope.get("include_project_glossary") is not False:
         raise ValueError("verification context include_project_glossary must be exactly false")
     if scope.get("projection") != VERIFICATION_CONTEXT_PROJECTION:
         raise ValueError(
             f"verification context projection must be {VERIFICATION_CONTEXT_PROJECTION}"
         )
-    ancestor_definition_terms = scope.get("ancestor_definition_terms")
-    if not isinstance(ancestor_definition_terms, list) or any(
-        not isinstance(term, str) or not term for term in ancestor_definition_terms
+    expansion_round = scope.get("expansion_round")
+    if (
+        isinstance(expansion_round, bool)
+        or not isinstance(expansion_round, int)
+        or expansion_round < 0
+    ):
+        raise ValueError("scope.expansion_round must be a non-negative integer")
+    expanded_proof_ids = scope.get("expanded_proof_ids")
+    if not isinstance(expanded_proof_ids, list) or any(
+        not isinstance(fid, str) or not _FACT_ID_RE.fullmatch(fid)
+        for fid in expanded_proof_ids
     ):
         raise ValueError(
-            "scope.ancestor_definition_terms must be a list of non-empty strings"
+            "scope.expanded_proof_ids must be a list of 16-hex fact_ids"
         )
-    if ancestor_definition_terms != sorted(set(ancestor_definition_terms)):
-        raise ValueError(
-            "scope.ancestor_definition_terms must be sorted and unique"
-        )
+    if len(expanded_proof_ids) != len(set(expanded_proof_ids)):
+        raise ValueError("scope.expanded_proof_ids contains duplicates")
+    if expansion_round == 0 and expanded_proof_ids:
+        raise ValueError("round zero may not contain expanded proofs")
+    if expansion_round > 0 and not expanded_proof_ids:
+        raise ValueError("an expansion round requires an expanded proof")
+    closure_fact_ids = scope.get("closure_fact_ids")
+    if not isinstance(closure_fact_ids, list) or any(
+        not isinstance(fid, str) or not _FACT_ID_RE.fullmatch(fid)
+        for fid in closure_fact_ids
+    ):
+        raise ValueError("scope.closure_fact_ids must be a list of 16-hex fact_ids")
+    if len(closure_fact_ids) != len(set(closure_fact_ids)):
+        raise ValueError("scope.closure_fact_ids contains duplicates")
+    if candidate_fact_id in closure_fact_ids:
+        raise ValueError("scope.candidate_fact_id must not be an ancestor")
     glossary_terms = scope.get("glossary_terms")
     if not isinstance(glossary_terms, list) or any(
         not isinstance(term, str) or not term for term in glossary_terms
@@ -175,22 +208,20 @@ def _validate_fact_context(
     facts = context.get("facts")
     if not isinstance(facts, list):
         raise ValueError("facts must be a list")
-    if len(facts) != len(requested):
-        raise ValueError("facts must contain exactly one direct card per requested fact_id")
-    direct_by_id: Dict[str, Dict[str, Any]] = {}
-    ordered_ids = []
+    records_by_id: Dict[str, Dict[str, Any]] = {}
+    ordered_ids: list[str] = []
     for record in facts:
         if not isinstance(record, dict):
             raise ValueError("each fact record must be an object")
         _require_exact_keys(
             record,
             {"fact_id", "statement", "predecessors", "glossary_introduces"},
-            "each direct premise card",
+            "each fact statement card",
         )
         fact_id = record.get("fact_id")
         if not isinstance(fact_id, str) or not _FACT_ID_RE.fullmatch(fact_id):
             raise ValueError("each fact record needs a 16-hex fact_id")
-        if fact_id in direct_by_id:
+        if fact_id in records_by_id:
             raise ValueError(f"duplicate fact record: {fact_id}")
         if not isinstance(record.get("statement"), str) or not record["statement"].strip():
             raise ValueError(f"fact {fact_id} needs a non-empty statement")
@@ -208,68 +239,59 @@ def _validate_fact_context(
             for symbol, definition in glossary.items()
         ):
             raise ValueError(f"fact {fact_id} glossary_introduces must be string mappings")
-        direct_by_id[fact_id] = record
+        records_by_id[fact_id] = record
         ordered_ids.append(fact_id)
 
-    if ordered_ids != requested:
-        raise ValueError("direct premise cards must match requested ids in caller order")
+    if ordered_ids != closure_fact_ids:
+        raise ValueError("fact statement cards must exactly match closure_fact_ids")
+    if ordered_ids[: len(requested)] != requested:
+        raise ValueError("closure must begin with requested ids in caller order")
 
-    dependency_closure = context.get("dependency_closure")
-    if not isinstance(dependency_closure, dict):
-        raise ValueError("dependency_closure must be an object")
-    _require_exact_keys(
-        dependency_closure, {"count", "digest"}, "dependency_closure"
-    )
-    closure_count = dependency_closure.get("count")
-    closure_digest = dependency_closure.get("digest")
-    if (
-        isinstance(closure_count, bool)
-        or not isinstance(closure_count, int)
-        or closure_count < len(requested)
-    ):
-        raise ValueError("dependency_closure.count must cover every requested fact")
-    if (
-        not isinstance(closure_digest, str)
-        or not re.fullmatch(r"sha256:[0-9a-f]{64}", closure_digest)
-    ):
-        raise ValueError("dependency_closure.digest must be a SHA-256 digest")
-
-    ancestor_definitions = context.get("ancestor_definitions")
-    if not isinstance(ancestor_definitions, list):
-        raise ValueError("ancestor_definitions must be a list")
-    definitions_by_term: Dict[str, str] = {}
-    ordered_definition_terms: list[str] = []
-    for record in ancestor_definitions:
-        if not isinstance(record, dict):
-            raise ValueError("each ancestor definition must be an object")
+    expanded_proofs = context.get("expanded_proofs")
+    if not isinstance(expanded_proofs, list):
+        raise ValueError("expanded_proofs must be a list")
+    proof_ids: list[str] = []
+    proofs_by_id: Dict[str, str] = {}
+    for proof_record in expanded_proofs:
+        if not isinstance(proof_record, dict):
+            raise ValueError("each expanded proof record must be an object")
         _require_exact_keys(
-            record,
-            {"term", "definition", "source_fact_id"},
-            "each ancestor definition",
+            proof_record, {"fact_id", "proof"}, "each expanded proof record"
         )
-        term = record.get("term")
-        definition = record.get("definition")
-        source_fact_id = record.get("source_fact_id")
-        if not isinstance(term, str) or not term:
-            raise ValueError("each ancestor definition needs a non-empty term")
-        if not isinstance(definition, str):
-            raise ValueError(f"ancestor definition {term} must be a string")
-        if term in definitions_by_term:
-            raise ValueError(f"duplicate ancestor definition term: {term}")
-        if (
-            not isinstance(source_fact_id, str)
-            or not _FACT_ID_RE.fullmatch(source_fact_id)
-            or source_fact_id in direct_by_id
-        ):
-            raise ValueError(
-                f"ancestor definition {term} needs a non-direct 16-hex source"
-            )
-        definitions_by_term[term] = definition
-        ordered_definition_terms.append(term)
-    if ordered_definition_terms != ancestor_definition_terms:
+        fact_id = proof_record.get("fact_id")
+        proof_text = proof_record.get("proof")
+        if not isinstance(fact_id, str) or not _FACT_ID_RE.fullmatch(fact_id):
+            raise ValueError("each expanded proof record needs a 16-hex fact_id")
+        if fact_id in proofs_by_id:
+            raise ValueError(f"duplicate expanded proof record: {fact_id}")
+        if not isinstance(proof_text, str) or not proof_text:
+            raise ValueError(f"expanded proof {fact_id} must be a non-empty string")
+        proof_ids.append(fact_id)
+        proofs_by_id[fact_id] = proof_text
+    if proof_ids != expanded_proof_ids:
         raise ValueError(
-            "ancestor definition records must exactly match scope terms in order"
+            "proof-bearing records must exactly match expanded_proof_ids in order"
         )
+    if proof_ids != [fid for fid in closure_fact_ids if fid in set(proof_ids)]:
+        raise ValueError("expanded proof ids must follow closure order")
+    if any(fid not in records_by_id for fid in expanded_proof_ids):
+        raise ValueError("expanded proof ids must belong to the supplied closure")
+
+    reachable: set[str] = set()
+    pending = list(requested)
+    while pending:
+        fact_id = pending.pop()
+        if fact_id in reachable:
+            continue
+        record = records_by_id.get(fact_id)
+        if record is None:
+            raise ValueError(f"closure is missing dependency fact {fact_id}")
+        reachable.add(fact_id)
+        for predecessor in record["predecessors"]:
+            if predecessor not in reachable:
+                pending.append(predecessor)
+    if reachable != set(records_by_id):
+        raise ValueError("facts must be exactly the reachable dependency closure")
 
     glossary = context.get("glossary")
     if not isinstance(glossary, dict) or any(
@@ -280,16 +302,13 @@ def _validate_fact_context(
     if list(glossary) != glossary_terms:
         raise ValueError("glossary keys must exactly match scope.glossary_terms in order")
 
-    direct_terms = {
+    closure_terms = {
         str(term)
-        for card in facts
-        for term in card["glossary_introduces"]
+        for record in facts
+        for term in record["glossary_introduces"]
     }
     candidate_terms = set(glossary_introduces)
-    selected_terms = set(definitions_by_term) | set(glossary)
-    if set(definitions_by_term) & set(glossary):
-        raise ValueError("ancestor and global definition terms must be disjoint")
-    shadowed = selected_terms & (direct_terms | candidate_terms)
+    shadowed = set(glossary) & (closure_terms | candidate_terms)
     if shadowed:
         raise ValueError(
             "selected inherited definitions shadow higher-precedence terms: "
@@ -304,13 +323,8 @@ def _validate_fact_context(
         for record in facts
     )
     expected_characters += sum(
-        len(json.dumps(
-            record,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ))
-        for record in ancestor_definitions
+        len(json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+        for record in expanded_proofs
     )
     expected_characters += sum(
         len(json.dumps(
@@ -331,13 +345,37 @@ def _validate_fact_context(
     ):
         raise ValueError("character_budget must cover every supplied fact record")
 
-    expected_digest = verification_context_digest(
-        scope=scope,
-        facts=facts,
-        ancestor_definitions=ancestor_definitions,
-        dependency_closure=dependency_closure,
-        glossary=glossary,
+    expanded_proof_characters = context.get("expanded_proof_characters")
+    if (
+        isinstance(expanded_proof_characters, bool)
+        or not isinstance(expanded_proof_characters, int)
+        or expanded_proof_characters < 0
+    ):
+        raise ValueError("expanded_proof_characters must be a non-negative integer")
+    expected_proof_characters = sum(
+        len(json.dumps(
+            {"fact_id": fid, "proof": proofs_by_id[fid]},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ))
+        for fid in proof_ids
     )
+    if expanded_proof_characters != expected_proof_characters:
+        raise ValueError("expanded_proof_characters does not match hydrated proofs")
+    expanded_proof_budget = context.get("expanded_proof_character_budget")
+    if expanded_proof_budget is not None and (
+        isinstance(expanded_proof_budget, bool)
+        or not isinstance(expanded_proof_budget, int)
+        or expanded_proof_budget < expanded_proof_characters
+    ):
+        raise ValueError(
+            "expanded_proof_character_budget must cover every hydrated proof"
+        )
+
+    digest_input = dict(context)
+    digest_input.pop("digest", None)
+    expected_digest = verification_context_digest(context=digest_input)
     if context.get("digest") != expected_digest:
         raise ValueError("digest does not match scope and fact records")
 

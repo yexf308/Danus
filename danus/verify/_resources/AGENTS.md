@@ -21,8 +21,11 @@ Given:
 
 produce the verdict (the service returns it to `fact_submit`), with JSON fields:
 
+- `output_schema_version` (exactly `2`)
+- `verification_status` (`"final"` or `"needs_context"`)
 - `verification_report`
 - `verdict` (`"correct"` or `"wrong"`)
+- `needs_expanded_proofs` (a list of `{id, reason}` objects)
 - `repair_hints`
 
 ## Input Contract
@@ -42,15 +45,23 @@ mathematical judging, require its top-level `complete` metadata to be exactly
 gap or critical error and **do not return `verdict: "correct"`**. A cited fact_id
 that is not present in a supplied complete context is likewise an undeclared or
 unavailable premise and prevents a correct verdict.
-`premise_cards` intentionally contains full cards only for declared direct
-predecessors. `ancestor_definitions` contains every inherited fact-local
-definition, and `global_definitions` contains the immutable global glossary after
-precedence filtering. Ancestor statements, predecessor proofs, and the closure
-edge skeleton are machine-validated and intentionally absent from the model
-context. Treat the direct predecessor statements as already-verified premises;
-your job is to check that the candidate cites and applies each one correctly. The
-mutable project glossary is only a discovery index and is never an independent
-uncited premise.
+`fact_statement_closure` contains every transitive ancestor exactly once, with
+its `fact_id`, full statement, direct predecessor edges, and fact-local
+definitions. It never contains a `proof` key. `expanded_proofs` is a separate
+list of whole `{fact_id, proof}` records. In round zero it is exactly empty; in a
+later round it contains only strict ancestors specifically requested by an
+earlier verifier session. `scope.candidate_fact_id`, `scope.expansion_round`,
+`scope.closure_fact_ids`, and `scope.expanded_proof_ids` describe that
+authenticated snapshot.
+
+The candidate proof is always complete. Read every closure statement and edge,
+but do not infer or invent omitted ancestor proofs. Treat direct predecessor
+statements as verified premises and check that the candidate applies them
+correctly. If—and only if—the statement closure is insufficient to assess a
+specific dependency, use the adaptive control response below. Never use semantic
+search, Graphify, project paths, or the mutable project glossary to obtain an
+ancestor proof. `global_definitions` contains only selected immutable packaged
+definitions after precedence filtering.
 
 Backward-compatible legacy requests without a fact-context block must be
 self-contained: the HTTP service rejects such a request if its proof cites an
@@ -128,6 +139,29 @@ When a statement or subproof cites a theorem/lemma/definition from an external p
 9. Keep each reference-check finding in context for the report.
 
 
+### Step 3.5: Request exact ancestor proofs only when necessary
+
+If the complete statement closure still leaves a specific dependency impossible
+to assess, request only the minimum strict-ancestor proofs needed:
+
+1. Choose ids only from `scope.closure_fact_ids` and never the current candidate.
+2. Never request an id already in `scope.expanded_proof_ids`; every round must
+   make progress.
+3. Give each unique id a concrete non-empty reason. Do not request proofs by
+   semantic similarity and do not invoke discovery/search to hydrate them.
+4. Emit a control response with `verification_status="needs_context"`,
+   `verdict="wrong"`, at least one `needs_expanded_proofs` entry, empty
+   `critical_errors`, empty `gaps`, and `repair_hints=""`.
+5. Stop. The gateway authenticates and hydrates those exact canonical fact files,
+   then starts a fresh verifier session. This control response is not a final
+   mathematical verdict and cannot authorize a fact write.
+
+When the supplied context is sufficient, continue with a final report. If an
+expanded ancestor proof exposes an error in a dependency used by the candidate,
+return a final `wrong` verdict with a finding and repair hints; never publish the
+candidate merely because the ancestor statement looked plausible.
+
+
 ### Step 4: Build verification report
 
 Aggregate every error and gap across the full markdown proof.
@@ -149,6 +183,8 @@ Do not drop any finding.
 
 Verdict rule is strict:
 
+- A mathematical verdict uses `verification_status="final"` and
+  `needs_expanded_proofs=[]`.
 - Return `"correct"` if and only if both `critical_errors` and `gaps` are empty.
 - Otherwise return `"wrong"`.
 
@@ -169,6 +205,8 @@ The final message (which the CLI persists) must be:
 
 ```json
 {
+  "output_schema_version": 2,
+  "verification_status": "final",
   "verification_report": {
     "summary": "string",
     "critical_errors": [
@@ -179,6 +217,7 @@ The final message (which the CLI persists) must be:
     ]
   },
   "verdict": "correct",
+  "needs_expanded_proofs": [],
   "repair_hints": ""
 }
 ```
@@ -197,6 +236,10 @@ If any error or gap exists, `verdict` must be `"wrong"` and `repair_hints` must 
 7. Every declared direct predecessor id must be cited literally in the candidate
    proof, and every cited internal id must be declared; the service also checks
    this equality before you run.
+8. Round-zero context contains the full statement/edge/definition closure and no
+   ancestor proof. Only `expanded_proofs` may carry a requested ancestor proof.
+9. `needs_context` is a non-final control response and always uses `verdict=wrong`,
+   non-empty unique requests, empty findings, and empty repair hints.
 
 ## Hard Prohibitions to enforce
 

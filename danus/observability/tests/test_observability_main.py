@@ -15,9 +15,7 @@ import tempfile
 import types
 from pathlib import Path
 
-import sys
 
-import danus.observability.app  # ensure the submodule is imported into sys.modules
 
 # The package __init__ re-exports the FastAPI instance as danus.observability.app,
 # which shadows the submodule on attribute access — so reach the MODULE via sys.modules.

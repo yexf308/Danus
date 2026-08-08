@@ -45,40 +45,38 @@ _FACTS = [{
         "glossary_introduces": {},
     }]
 _SCOPE = {
+    "candidate_fact_id": "cccccccccccccccc",
     "requested_fact_ids": ["aaaaaaaaaaaaaaaa"],
     "predecessor_depth": None,
-    "proof_mode": "none",
+    "proof_mode": "adaptive",
     "include_project_glossary": False,
     "projection": VERIFICATION_CONTEXT_PROJECTION,
-    "ancestor_definition_terms": [],
+    "expansion_round": 0,
+    "closure_fact_ids": ["aaaaaaaaaaaaaaaa"],
+    "expanded_proof_ids": [],
     "glossary_terms": [],
 }
-_CLOSURE = {"count": 1, "digest": "sha256:" + "1" * 64}
 _FACT_CONTEXT = {
     "schema_version": VERIFICATION_CONTEXT_SCHEMA_VERSION,
     "scope": _SCOPE,
     "facts": _FACTS,
-    "ancestor_definitions": [],
-    "dependency_closure": _CLOSURE,
+    "expanded_proofs": [],
     "glossary": {},
-    "digest": verification_context_digest(
-        scope=_SCOPE,
-        facts=_FACTS,
-        ancestor_definitions=[],
-        dependency_closure=_CLOSURE,
-        glossary={},
-    ),
     "complete": True,
     "truncated": False,
     "missing_fact_ids": [],
     "revoked_fact_ids": [],
     "omitted_fact_ids": [],
     "omitted_glossary_terms": [],
+    "omitted_expanded_proof_ids": [],
     "characters_used": sum(len(json.dumps(
         record, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     )) for record in _FACTS),
     "character_budget": 200000,
+    "expanded_proof_characters": 0,
+    "expanded_proof_character_budget": 200000,
 }
+_FACT_CONTEXT["digest"] = verification_context_digest(context=_FACT_CONTEXT)
 
 
 @contextmanager
@@ -113,8 +111,9 @@ from pathlib import Path
 prompt = sys.stdin.read() if sys.argv[-1] == '-' else sys.argv[-1]
 out = Path(sys.argv[sys.argv.index('--output-last-message') + 1])
 out.parent.mkdir(parents=True, exist_ok=True)
-out.write_text(json.dumps({"verification_report": {"summary": "ok", "critical_errors": [], "gaps": []},
-                           "verdict": "correct", "repair_hints": ""}))
+out.write_text(json.dumps({"output_schema_version": 2, "verification_status": "final",
+                           "verification_report": {"summary": "ok", "critical_errors": [], "gaps": []},
+                           "verdict": "correct", "needs_expanded_proofs": [], "repair_hints": ""}))
 print("ok")
 """
 
@@ -127,9 +126,12 @@ sys.stdout.write("UNVERIFIED_STDOUT:" + prompt)
 sys.stderr.write("UNVERIFIED_STDERR:" + prompt)
 out = Path(sys.argv[sys.argv.index('--output-last-message') + 1])
 out.parent.mkdir(parents=True, exist_ok=True)
-out.write_text(json.dumps({"verification_report": {"summary": "ok", "critical_errors": [], "gaps": []},
-                           "verdict": "correct", "repair_hints": ""}))
+out.write_text(json.dumps({"output_schema_version": 2, "verification_status": "final",
+                           "verification_report": {"summary": "ok", "critical_errors": [], "gaps": []},
+                           "verdict": "correct", "needs_expanded_proofs": [], "repair_hints": ""}))
 """
+
+_STUB_TOKENS = _STUB_OK + "\nprint('tokens used\\n12,345')\n"
 
 # stub that exits nonzero and writes nothing
 _STUB_FAIL = "import sys\nsys.stderr.write('boom\\n')\nsys.exit(7)\n"
@@ -164,10 +166,10 @@ from pathlib import Path
 prompt = sys.stdin.read() if sys.argv[-1] == '-' else sys.argv[-1]
 out = Path(sys.argv[sys.argv.index('--output-last-message') + 1])
 out.parent.mkdir(parents=True, exist_ok=True)
-out.write_text(json.dumps({"verification_report": {
+out.write_text(json.dumps({"output_schema_version": 2, "verification_status": "final", "verification_report": {
     "summary": "contradiction", "critical_errors": [],
     "gaps": [{"location": "proof", "issue": "missing step"}]},
-    "verdict": "correct", "repair_hints": ""}))
+    "verdict": "correct", "needs_expanded_proofs": [], "repair_hints": ""}))
 """
 
 # stub that sleeps long enough to trip a 1s timeout
@@ -258,7 +260,9 @@ def test_build_prompt_delimits_json_context_and_requires_completeness():
     block = prompt.split("<<<BEGIN_AUTHORITATIVE_FACT_CONTEXT_JSON>>>\n", 1)[1]
     block = block.split("\n<<<END_AUTHORITATIVE_FACT_CONTEXT_JSON>>>", 1)[0]
     assert json.loads(block) == launcher._prompt_fact_context(injected)
-    assert "dependency_closure" not in block and "scope" not in block
+    assert "dependency_closure" not in block
+    assert json.loads(block)["scope"]["expansion_round"] == 0
+    assert json.loads(block)["expanded_proofs"] == []
     candidate = prompt.split("<<<BEGIN_CANDIDATE_JSON>>>\n", 1)[1]
     candidate = candidate.split("\n<<<END_CANDIDATE_JSON>>>", 1)[0]
     assert json.loads(candidate)["glossary_introduces"] == {"X": "a compact space"}
@@ -352,10 +356,24 @@ def test_run_log_never_persists_codex_streams_or_prompt_data():
         assert "UNVERIFIED_STDERR" not in log
         assert "command:" not in log
         fields = {line.split(": ", 1)[0] for line in log.splitlines()}
-        assert fields == {"started_at_utc", "finished_at_utc", "status", "returncode"}
+        assert fields == {
+            "started_at_utc", "finished_at_utc", "status", "returncode",
+            "model", "effort", "elapsed_seconds", "context_round",
+            "expanded_proof_ids", "verification_status", "verdict",
+        }
         assert "status: completed" in log
         assert "returncode: 0" in log
         assert stat.S_IMODE(log_path.stat().st_mode) == 0o600
+
+
+def test_run_extracts_only_numeric_token_metrics_from_unlinked_stream():
+    with _service(_STUB_TOKENS):
+        out = _run(fact_context=_FACT_CONTEXT)
+        assert out["verification_metrics"]["tokens_used"] == 12345
+        log = (launcher._results_dir("RID") / "log.md").read_text(encoding="utf-8")
+        assert "tokens_used: 12345" in log
+        assert "tokens used" not in log
+        assert _STMT not in log and _PROOF not in log
 
 
 def test_run_rejects_serialized_prompt_over_budget_before_codex():

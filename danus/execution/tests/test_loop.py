@@ -223,7 +223,6 @@ def test_main_max_rounds_cap(tmp: Path):
 
 def test_main_consecutive_failure_cap(tmp: Path):
     wl = _mk_worker(tmp)
-    log = wl.logs / "round_1.log"   # a fact id in a round log flows into status
     with _restore_sigterm(), _env(DANUS_ROUND_BEAT="0", DANUS_MAX_CONSEC_FAILURES="2",
                                   DANUS_MAX_ROUNDS="0"):
         def _fail(w, role, prompt, log_path, ht):

@@ -522,7 +522,8 @@ def test_paper_revise_nonzero_does_not_overwrite():
 
 def test_project_resolution_by_name():
     # DANUS_AGENTS_ROOT + project name; the example project as <root>/proj
-    import shutil, tempfile
+    import shutil
+    import tempfile
     with tempfile.TemporaryDirectory() as root:
         proj = Path(root) / "odd_sum"
         shutil.copytree(EXAMPLE_PROJECT, proj)

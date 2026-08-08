@@ -18,12 +18,16 @@ POST /verify
   request : {"statement": <str, >=1 char>, "proof": <str, >=1 char>,
              "glossary_introduces": <object, optional>,
              "fact_context": <object, optional>}                       # application/json
-  200     : {"verification_report": {"summary": str,
+  200     : {"output_schema_version": 2,
+             "verification_status": "final" | "needs_context",
+             "verification_report": {"summary": str,
                                       "critical_errors": [{"location": str, "issue": str}, ...],
                                       "gaps":            [{"location": str, "issue": str}, ...]},
              "verdict": "correct" | "wrong",
+             "needs_expanded_proofs": [{"id": str, "reason": str}, ...],
              "repair_hints": str,
-             "verification_context_digest": str?} # attested when context supplied;
+             "verification_context_digest": str?,
+             "verification_metrics": object?} # attested/metrics when context/live run supplied;
                                                     # repair_hints="" iff correct
   400     : vacuous/P1/P3/P5 input; incomplete, malformed, or tampered fact_context;
             internal fact_id citation without declared context
@@ -41,15 +45,20 @@ GET /health -> {"status": "ok", "pid": <int>}    # async; never queues behind /v
 ```
 
 **Fail-closed invariants (enforced in production code, with prompt backstops):**
-`verdict == "correct"` ⟺ `critical_errors == []` **and** `gaps == []`.
+For `verification_status="final"`, `verdict == "correct"` ⟺
+`critical_errors == []` **and** `gaps == []`, and expansion requests are empty.
+For `needs_context`, verdict is `wrong`, requests are non-empty/unique with
+non-empty reasons, findings and repair hints are empty, and the response is only
+flow control—never a mathematical verdict or write authorization.
 The raw verifier payload, report, and every finding are exact-shape objects;
 unknown or misplaced fields fail closed rather than being ignored.
-`fact_context` must have the current compact schema: complete direct-premise
-cards, every inherited fact-local definition, immutable global definitions, a
-digest/count commitment to the core-validated transitive closure, consistent
-whole-record character accounting, and a matching context digest. Ancestor
-statements, predecessor proofs, and the closure edge skeleton do not cross into
-the model prompt. Project-wide glossary hydration is disabled at this boundary.
+`fact_context` v3 carries the complete transitive ancestor statement cards
+(`fact_id`, statement, direct edges, fact-local definitions) and keeps all proof
+bytes in a separate `expanded_proofs` list. Round zero requires that list to be
+empty. Later rounds contain only exact strict-ancestor whole proof records. The
+digest binds the entire envelope except itself, including completeness/omission
+accounting, scope, round, statements, edges, definitions, and exact proof bytes.
+Project-wide glossary hydration is disabled at this boundary.
 Internal 16-hex fact ids are scanned in both the
 statement and proof, and their set must exactly equal the declared direct
 predecessor ids. The service checks the compact envelope and digests before Codex
@@ -67,9 +76,11 @@ to the response; the gateway refuses responses without that exact attestation.
   --ignore-user-config --output-schema <schema> -o <verification.json> -`;
   the bounded prompt is delivered over stdin (never process argv), uses an atomic
   run-id, and the CLI captures the schema-constrained last message. Codex stdout
-  and stderr are discarded rather than copied to persistent logs; `log.md` is a
-  mode-`0600` service-written metadata record containing only timestamps, status,
-  and return code. Injects the read-only gateway with the verify service's exact
+  and stderr flow only through an unlinked temporary file; only numeric token
+  usage is extracted. `log.md` is a mode-`0600` service-written metadata record
+  containing timestamps, status, return code, model/effort, elapsed seconds,
+  token count, context round/expanded ids, and final status/verdict—never model
+  text or prompts. Injects the read-only gateway with the verify service's exact
   interpreter as **`<sys.executable> -m danus.gateway`**.
 - `service.py` — FastAPI app (`/verify`, `/health`) and deterministic context
   validation before any verifier process starts.
@@ -99,7 +110,10 @@ system Python without `danus`.
 | `DANUS_CODEX_BIN` | `<repo>/bin/codex` → `which codex` → bare `"codex"` | the codex binary; resolved via the shared `danus.codex` launcher |
 | `DANUS_VERIFY_MODEL` / `DANUS_VERIFY_EFFORT` (fall back to neutral `DANUS_CODEX_MODEL` / `DANUS_CODEX_EFFORT`) | `gpt-5.5` / `xhigh` | codex knobs |
 | `CODEX_TIMEOUT_SECONDS` | `0` lib / **`900`** via `python -m danus.verify` | per-verification codex timeout |
-| `DANUS_VERIFY_CONTEXT_MAX_CHARS` | `200000` | gateway budget for direct fact cards, all inherited definitions, and immutable global definitions; overflow blocks before `/verify` |
+| `DANUS_VERIFY_CONTEXT_MAX_CHARS` | `200000` | gateway whole-record budget for the full statement closure, expanded records, and immutable definitions; overflow blocks before `/verify` |
+| `DANUS_VERIFY_MAX_EXPANSION_ROUNDS` | `2` | maximum successful proof-hydration rounds after statement-only round zero (at most three fresh verifier calls) |
+| `DANUS_VERIFY_MAX_EXPANDED_PROOFS` | `8` | maximum cumulative strict-ancestor proofs hydrated for one submission |
+| `DANUS_VERIFY_MAX_EXPANDED_PROOF_CHARS` | `200000` | maximum canonical JSON characters across whole expanded proof records; records are never sliced |
 | `DANUS_VERIFY_MAX_PROMPT_BYTES` | `200000` | hard limit on the final UTF-8 prompt, including candidate, escaped context, definitions, and envelope; overflow returns HTTP 413 before Codex starts |
 | `DANUS_VERIFY_MAX_REQUEST_BYTES` | `1000000` | hard request-body cap enforced before FastAPI/Pydantic buffers or parses JSON |
 | `DANUS_VERIFY_BODY_TIMEOUT_SECONDS` | `10` | total time allowed to upload a `/verify` request body |
@@ -109,24 +123,25 @@ system Python without `danus`.
 
 ## How `fact_submit` reaches it
 `danus.gateway`'s `fact_submit` first builds complete predecessor context (full
-cards for direct premises, every inherited fact-local definition, immutable
-global definitions, and a digest/count closure commitment; ancestor statements,
-the edge skeleton, and already-verified predecessor proofs are never re-sent),
+statement/edge/fact-local-definition cards for the entire transitive closure,
+immutable selected definitions, and no ancestor proofs),
 then POSTs
 `{statement, proof, glossary_introduces, fact_context}` to `DANUS_VERIFY_URL`
 (e.g. `http://127.0.0.1:8091/verify`). Missing, revoked, incomplete, or
-over-budget context blocks before the service is contacted. After a `correct`
-verdict it writes only if the same context is still current under the graph
-mutation lock, and records the outcome plus context digest to global memory (kind
-`verification`).
+over-budget context blocks before the service is contacted. `needs_context`
+triggers exact canonical hydration by the gateway and a fresh
+session; unknown/non-ancestor/current/repeated/over-budget requests fail closed.
+After a final `correct` verdict it writes only if the final expansion context is
+still current under the graph mutation lock, and records every round plus the
+final digest to global memory (kind `verification`).
 Until this service is up and `DANUS_VERIFY_URL` is set, `fact_submit` returns a
 clear "verify service not wired" error.
 
 Danus deliberately does not slice one candidate proof across hidden verifier
 calls: coverage would become ambiguous. If a candidate reaches the prompt cap,
 factor it into smaller verified facts and cite their ids. The lazy DAG context
-then sends only their direct-premise cards plus required definitions, without
-re-sending ancestor statements or any predecessor proofs.
+still sends the full ancestor statement/edge/definition closure, but no ancestor
+proof unless a verifier requests a specific strict ancestor.
 
 ## Trust assumptions (security)
 
@@ -138,8 +153,8 @@ re-sending ancestor statements or any predecessor proofs.
   readable secrets.
 - Codex stdout/stderr is never persisted because the CLI may echo the stdin
   prompt, including the candidate proof and lazy fact context. Persistent
-  `log.md` files contain only server-generated timestamps, completion status,
-  and return code; diagnostic model text must not be copied into them.
+  `log.md` files contain only server-generated execution/round metrics and final
+  status fields; diagnostic model text must not be copied into them.
 - The CLI output schema deliberately uses only a conservative OpenAI Responses
   Structured Outputs subset: exact object shapes, required fields, primitive
   types, arrays, references, and the verdict enum. Cross-field rules cannot be

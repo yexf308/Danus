@@ -15,7 +15,7 @@ import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 
-from danus.core import FactGraph, GlobalMemory
+from danus.core import FactGraph, GlobalMemory, compute_fact_id
 from danus.gateway import build_app, tools_for
 from danus.gateway import server
 
@@ -55,7 +55,9 @@ def _mock_verify(verdict, repair_hints="", raise_exc=None, capture=None):
         findings = [] if verdict == "correct" else [
             {"location": "proof", "issue": "mock rejection"}
         ]
-        return {"verdict": verdict, "repair_hints": repair_hints,
+        return {"output_schema_version": 2, "verification_status": "final",
+                "verdict": verdict, "needs_expanded_proofs": [],
+                "repair_hints": repair_hints,
                 "verification_context_digest": fact_context["digest"],
                 "verification_report": {
                     "summary": "mock", "critical_errors": [], "gaps": findings,
@@ -66,6 +68,31 @@ def _mock_verify(verdict, repair_hints="", raise_exc=None, capture=None):
         yield
     finally:
         server._verify = orig
+
+
+def _verify_response(
+    context,
+    *,
+    status="final",
+    verdict="correct",
+    requests=None,
+    repair_hints="",
+):
+    findings = []
+    if status == "final" and verdict == "wrong":
+        findings = [{"location": "proof", "issue": "mock rejection"}]
+        repair_hints = repair_hints or "repair the mock gap"
+    return {
+        "output_schema_version": 2,
+        "verification_status": status,
+        "verification_report": {
+            "summary": "mock", "critical_errors": [], "gaps": findings,
+        },
+        "verdict": verdict,
+        "needs_expanded_proofs": list(requests or []),
+        "repair_hints": repair_hints,
+        "verification_context_digest": context["digest"],
+    }
 
 
 def test_role_table():
@@ -194,7 +221,7 @@ def test_fact_submit_verify_error_is_clean():
         assert "service down" in res["error"]
 
 
-def test_fact_submit_sends_direct_cards_and_ancestor_definitions_only():
+def test_fact_submit_sends_full_statement_closure_and_no_ancestor_proofs():
     captured = {}
     with tempfile.TemporaryDirectory() as d, _env(
         DANUS_PROJECT_DIR=d, DANUS_AGENTS_ROOT=None, DANUS_AUTHOR="worker_high",
@@ -218,23 +245,367 @@ def test_fact_submit_sends_direct_cards_and_ancestor_definitions_only():
         )
         assert res["accepted"] is True and res["fact_id"]
         facts = captured["fact_context"]["facts"]
-        assert [item["fact_id"] for item in facts] == [direct]
+        assert [item["fact_id"] for item in facts] == [direct, base]
         assert all("proof" not in item for item in facts)
-        assert "A holds" not in json.dumps(captured["fact_context"])
-        assert captured["fact_context"]["ancestor_definitions"] == [{
-            "term": "A",
-            "definition": "the base assertion",
-            "source_fact_id": base,
-        }]
-        assert captured["fact_context"]["dependency_closure"]["count"] == 2
-        assert captured["fact_context"]["dependency_closure"]["digest"].startswith(
-            "sha256:"
-        )
-        assert captured["fact_context"]["scope"]["proof_mode"] == "none"
+        assert facts[-1]["statement"] == "A holds"
+        assert facts[-1]["glossary_introduces"] == {
+            "A": "the base assertion"
+        }
+        assert captured["fact_context"]["expanded_proofs"] == []
+        assert captured["fact_context"]["scope"]["proof_mode"] == "adaptive"
+        assert captured["fact_context"]["scope"]["expansion_round"] == 0
+        assert captured["fact_context"]["scope"]["closure_fact_ids"] == [
+            direct, base
+        ]
         assert captured["fact_context"]["complete"] is True
         assert captured["glossary_introduces"] == {
             "C_result": "the downstream conclusion"
         }
+
+
+def test_fact_submit_adaptively_hydrates_only_requested_ancestor_proof():
+    contexts = []
+    candidate_proofs = []
+    with tempfile.TemporaryDirectory() as d, _env(
+        DANUS_PROJECT_DIR=d, DANUS_AGENTS_ROOT=None, DANUS_AUTHOR="worker_high",
+        DANUS_VERIFY_URL="http://mock", DANUS_PROBLEM_ID="P",
+    ):
+        fg = FactGraph(Path(d))
+        base = fg.add(
+            problem_id="P", author="w", statement="Base premise",
+            proof="BASE PROOF SECRET BYTES",
+        )
+        left = fg.add(
+            problem_id="P", author="w", statement="Left consequence",
+            proof="LEFT PROOF MUST STAY OMITTED", predecessors=[base],
+        )
+        right = fg.add(
+            problem_id="P", author="w", statement="Right consequence",
+            proof="RIGHT PROOF MUST STAY OMITTED", predecessors=[base],
+        )
+        original = server._verify
+
+        def adaptive(statement, proof, fact_context=None, glossary_introduces=None):
+            contexts.append(fact_context)
+            candidate_proofs.append(proof)
+            if len(contexts) == 1:
+                return _verify_response(
+                    fact_context,
+                    status="needs_context",
+                    verdict="wrong",
+                    requests=[{"id": base, "reason": "inspect the shared lemma"}],
+                )
+            return _verify_response(fact_context)
+
+        server._verify = adaptive
+        try:
+            result = server.fact_submit(
+                statement="Combined consequence",
+                proof=f"Apply {left} and {right}.",
+                predecessors=[left, right],
+            )
+        finally:
+            server._verify = original
+
+        assert result["accepted"] is True and result["fact_id"]
+        assert result["adaptive_rounds"] == 1
+        assert result["verification_calls"] == 2
+        assert result["expanded_proof_ids"] == [base]
+        assert len(contexts) == 2
+        assert candidate_proofs == [
+            f"Apply {left} and {right}.",
+            f"Apply {left} and {right}.",
+        ]
+        first, second = contexts
+        assert first["expanded_proofs"] == []
+        assert all("proof" not in record for record in first["facts"])
+        first_serialized = json.dumps(first)
+        assert "BASE PROOF SECRET BYTES" not in first_serialized
+        assert "LEFT PROOF MUST STAY OMITTED" not in first_serialized
+        assert "RIGHT PROOF MUST STAY OMITTED" not in first_serialized
+        assert second["expanded_proofs"] == [
+            {"fact_id": base, "proof": "BASE PROOF SECRET BYTES"}
+        ]
+        assert second["scope"]["expansion_round"] == 1
+        assert second["digest"] != first["digest"]
+        trace = GlobalMemory(Path(d)).read("verification")[-1]
+        assert [entry["round"] for entry in trace["verification_rounds"]] == [0, 1]
+        assert trace["verification_rounds"][0]["needs_expanded_proofs"] == [
+            {"id": base, "reason": "inspect the shared lemma"}
+        ]
+
+
+def test_fact_submit_rejects_unknown_nonancestor_current_and_duplicate_requests():
+    cases = ("unknown", "non-ancestor", "current", "duplicate")
+    for case in cases:
+        with tempfile.TemporaryDirectory() as d, _env(
+            DANUS_PROJECT_DIR=d, DANUS_AGENTS_ROOT=None, DANUS_AUTHOR="w",
+            DANUS_VERIFY_URL="http://mock", DANUS_PROBLEM_ID="P",
+        ):
+            fg = FactGraph(Path(d))
+            ancestor = fg.add(
+                problem_id="P", author="w", statement="Ancestor", proof="proof A"
+            )
+            nonancestor = fg.add(
+                problem_id="P", author="w", statement="Unrelated", proof="proof U"
+            )
+            statement = "Candidate"
+            proof = f"Use {ancestor}."
+            candidate = compute_fact_id(
+                problem_id="P",
+                predecessors=[ancestor],
+                glossary_introduces={},
+                statement=statement,
+                proof=proof,
+            )
+            request_id = {
+                "unknown": "0000000000000000",
+                "non-ancestor": nonancestor,
+                "current": candidate,
+                "duplicate": ancestor,
+            }[case]
+            requests = [{"id": request_id, "reason": "need it"}]
+            if case == "duplicate":
+                requests.append({"id": request_id, "reason": "need it twice"})
+            original = server._verify
+            server._verify = lambda statement, proof, fact_context=None, glossary_introduces=None, req=requests: _verify_response(
+                fact_context,
+                status="needs_context",
+                verdict="wrong",
+                requests=req,
+            )
+            try:
+                result = server.fact_submit(
+                    statement=statement, proof=proof, predecessors=[ancestor]
+                )
+            finally:
+                server._verify = original
+            assert result["accepted"] is False and result["verdict"] == "error"
+            assert not fg.exists(candidate)
+            if case == "duplicate":
+                assert "duplicate expansion request" in result["error"]
+            else:
+                assert case in result["error"]
+
+
+def test_fact_submit_rejects_needs_context_plus_correct_and_repeated_request():
+    with tempfile.TemporaryDirectory() as d, _env(
+        DANUS_PROJECT_DIR=d, DANUS_AGENTS_ROOT=None, DANUS_AUTHOR="w",
+        DANUS_VERIFY_URL="http://mock", DANUS_PROBLEM_ID="P",
+    ):
+        fg = FactGraph(Path(d))
+        ancestor = fg.add(
+            problem_id="P", author="w", statement="Ancestor", proof="proof A"
+        )
+        original = server._verify
+        server._verify = lambda statement, proof, fact_context=None, glossary_introduces=None: _verify_response(
+            fact_context,
+            status="needs_context",
+            verdict="correct",
+            requests=[{"id": ancestor, "reason": "need it"}],
+        )
+        try:
+            invalid = server.fact_submit(
+                statement="Candidate one", proof=f"Use {ancestor}.",
+                predecessors=[ancestor],
+            )
+        finally:
+            server._verify = original
+        assert invalid["accepted"] is False and invalid["verdict"] == "error"
+        assert "needs_context" in invalid["error"]
+
+        calls = 0
+
+        def repeat(statement, proof, fact_context=None, glossary_introduces=None):
+            nonlocal calls
+            calls += 1
+            return _verify_response(
+                fact_context,
+                status="needs_context",
+                verdict="wrong",
+                requests=[{"id": ancestor, "reason": "still need it"}],
+            )
+
+        server._verify = repeat
+        try:
+            repeated = server.fact_submit(
+                statement="Candidate two", proof=f"Use {ancestor}.",
+                predecessors=[ancestor],
+            )
+        finally:
+            server._verify = original
+        assert calls == 2
+        assert repeated["accepted"] is False and repeated["verdict"] == "error"
+        assert "already expanded" in repeated["error"]
+
+
+def test_fact_submit_final_wrong_after_expansion_never_writes():
+    with tempfile.TemporaryDirectory() as d, _env(
+        DANUS_PROJECT_DIR=d, DANUS_AGENTS_ROOT=None, DANUS_AUTHOR="w",
+        DANUS_VERIFY_URL="http://mock", DANUS_PROBLEM_ID="P",
+    ):
+        fg = FactGraph(Path(d))
+        ancestor = fg.add(
+            problem_id="P", author="w", statement="Ancestor", proof="flawed proof"
+        )
+        calls = 0
+        original = server._verify
+
+        def reject_after_expansion(
+            statement, proof, fact_context=None, glossary_introduces=None
+        ):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return _verify_response(
+                    fact_context,
+                    status="needs_context",
+                    verdict="wrong",
+                    requests=[{"id": ancestor, "reason": "audit dependency"}],
+                )
+            return _verify_response(
+                fact_context,
+                status="final",
+                verdict="wrong",
+                repair_hints="replace the flawed ancestor dependency",
+            )
+
+        server._verify = reject_after_expansion
+        try:
+            result = server.fact_submit(
+                statement="Candidate", proof=f"Use {ancestor}.",
+                predecessors=[ancestor],
+            )
+        finally:
+            server._verify = original
+        assert calls == 2
+        assert result["accepted"] is False and result["verdict"] == "wrong"
+        assert result["expanded_proof_ids"] == [ancestor]
+        assert fg.list() == [ancestor]
+
+
+def test_fact_submit_expansion_proof_and_round_budgets_fail_closed():
+    with tempfile.TemporaryDirectory() as d, _env(
+        DANUS_PROJECT_DIR=d, DANUS_AGENTS_ROOT=None, DANUS_AUTHOR="w",
+        DANUS_VERIFY_URL="http://mock", DANUS_PROBLEM_ID="P",
+        DANUS_VERIFY_MAX_EXPANDED_PROOF_CHARS="1",
+    ):
+        fg = FactGraph(Path(d))
+        ancestor = fg.add(
+            problem_id="P", author="w", statement="Ancestor",
+            proof="whole proof record exceeds one character",
+        )
+        calls = 0
+        original = server._verify
+
+        def request(statement, proof, fact_context=None, glossary_introduces=None):
+            nonlocal calls
+            calls += 1
+            return _verify_response(
+                fact_context,
+                status="needs_context",
+                verdict="wrong",
+                requests=[{"id": ancestor, "reason": "inspect proof"}],
+            )
+
+        server._verify = request
+        try:
+            result = server.fact_submit(
+                statement="Candidate", proof=f"Use {ancestor}.",
+                predecessors=[ancestor],
+            )
+        finally:
+            server._verify = original
+        assert calls == 1
+        assert result["accepted"] is False and result["verdict"] == "error"
+        assert "omitted expanded proof" in result["error"]
+
+    with tempfile.TemporaryDirectory() as d, _env(
+        DANUS_PROJECT_DIR=d, DANUS_AGENTS_ROOT=None, DANUS_AUTHOR="w",
+        DANUS_VERIFY_URL="http://mock", DANUS_PROBLEM_ID="P",
+        DANUS_VERIFY_MAX_EXPANSION_ROUNDS="0",
+    ):
+        fg = FactGraph(Path(d))
+        ancestor = fg.add(
+            problem_id="P", author="w", statement="Ancestor", proof="proof A"
+        )
+        original = server._verify
+        server._verify = lambda statement, proof, fact_context=None, glossary_introduces=None: _verify_response(
+            fact_context,
+            status="needs_context",
+            verdict="wrong",
+            requests=[{"id": ancestor, "reason": "inspect proof"}],
+        )
+        try:
+            result = server.fact_submit(
+                statement="Candidate", proof=f"Use {ancestor}.",
+                predecessors=[ancestor],
+            )
+        finally:
+            server._verify = original
+        assert result["accepted"] is False and result["verdict"] == "error"
+        assert "maximum expansion rounds (0) exceeded" in result["error"]
+
+
+def test_fact_submit_expanded_proof_count_budget_fails_before_hydration():
+    contexts = []
+    with tempfile.TemporaryDirectory() as d, _env(
+        DANUS_PROJECT_DIR=d, DANUS_AGENTS_ROOT=None, DANUS_AUTHOR="w",
+        DANUS_VERIFY_URL="http://mock", DANUS_PROBLEM_ID="P",
+        DANUS_VERIFY_MAX_EXPANDED_PROOFS="1",
+    ):
+        fg = FactGraph(Path(d))
+        left = fg.add(
+            problem_id="P", author="w", statement="Left ancestor",
+            proof="LEFT PROOF MUST NOT BE HYDRATED",
+        )
+        right = fg.add(
+            problem_id="P", author="w", statement="Right ancestor",
+            proof="RIGHT PROOF MUST NOT BE HYDRATED",
+        )
+        statement = "Candidate"
+        proof = f"Combine {left} and {right}."
+        candidate = compute_fact_id(
+            problem_id="P",
+            predecessors=[left, right],
+            glossary_introduces={},
+            statement=statement,
+            proof=proof,
+        )
+        original = server._verify
+
+        def request_both(
+            statement, proof, fact_context=None, glossary_introduces=None
+        ):
+            contexts.append(fact_context)
+            return _verify_response(
+                fact_context,
+                status="needs_context",
+                verdict="wrong",
+                requests=[
+                    {"id": left, "reason": "inspect the left proof"},
+                    {"id": right, "reason": "inspect the right proof"},
+                ],
+            )
+
+        server._verify = request_both
+        try:
+            result = server.fact_submit(
+                statement=statement,
+                proof=proof,
+                predecessors=[left, right],
+            )
+        finally:
+            server._verify = original
+
+        assert len(contexts) == 1
+        assert contexts[0]["expanded_proofs"] == []
+        assert result["accepted"] is False and result["verdict"] == "error"
+        assert "maximum expanded proofs (1) exceeded" in result["error"]
+        assert result["verification_calls"] == 1
+        assert result["adaptive_rounds"] == 0
+        assert result["expanded_proof_ids"] == []
+        assert not fg.exists(candidate)
 
 
 def test_fact_submit_lazily_snapshots_project_glossary():
@@ -301,7 +672,10 @@ def test_fact_submit_rechecks_project_glossary_after_verification():
                 glossary_introduces={"Q_X": "a newly available project object"},
             )
             return {
+                "output_schema_version": 2,
+                "verification_status": "final",
                 "verdict": "correct",
+                "needs_expanded_proofs": [],
                 "repair_hints": "",
                 "verification_context_digest": fact_context["digest"],
                 "verification_report": {
@@ -418,9 +792,19 @@ def test_fact_submit_nondict_verify_body_is_clean():
 
 def test_fact_submit_invalid_or_inconsistent_verdict_never_writes():
     invalid_payloads = [
-        {"verdict": "maybe", "verification_report": {}, "repair_hints": ""},
         {
+            "output_schema_version": 2,
+            "verification_status": "final",
+            "verdict": "maybe",
+            "needs_expanded_proofs": [],
+            "verification_report": {},
+            "repair_hints": "",
+        },
+        {
+            "output_schema_version": 2,
+            "verification_status": "final",
             "verdict": "correct",
+            "needs_expanded_proofs": [],
             "verification_report": {
                 "summary": "has gap", "critical_errors": [],
                 "gaps": [{"location": "proof", "issue": "missing step"}],
@@ -456,7 +840,10 @@ def test_fact_submit_rejects_old_service_without_context_attestation():
     ):
         original = server._verify
         server._verify = lambda statement, proof, fact_context=None, glossary_introduces=None: {
+            "output_schema_version": 2,
+            "verification_status": "final",
             "verdict": "correct",
+            "needs_expanded_proofs": [],
             "repair_hints": "",
             "verification_report": {
                 "summary": "legacy response", "critical_errors": [], "gaps": [],
@@ -488,7 +875,10 @@ def test_fact_submit_rechecks_context_after_verification_before_write():
         ):
             FactGraph(Path(d)).revoke(predecessor, reason="race test")
             return {
+                "output_schema_version": 2,
+                "verification_status": "final",
                 "verdict": "correct",
+                "needs_expanded_proofs": [],
                 "repair_hints": "",
                 "verification_context_digest": fact_context["digest"],
                 "verification_report": {
@@ -677,7 +1067,7 @@ def main() -> None:
     print("  [ok] fact_submit reject -> writes nothing, still traces")
     test_fact_submit_verify_error_is_clean()
     print("  [ok] fact_submit verify-error -> clean error, no verdict")
-    test_fact_submit_sends_direct_cards_and_ancestor_definitions_only()
+    test_fact_submit_sends_full_statement_closure_and_no_ancestor_proofs()
     print("  [ok] fact_submit sends statement/definition-only predecessor closure")
     test_fact_submit_blocks_missing_and_revoked_before_verify()
     print("  [ok] fact_submit blocks missing/revoked context before verifier")

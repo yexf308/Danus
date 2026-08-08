@@ -204,7 +204,8 @@ def test_leak_findings_catches_machinery_terms():
 
 
 def test_project_resolution_by_name():
-    import shutil, tempfile
+    import shutil
+    import tempfile
     with tempfile.TemporaryDirectory() as root:
         proj = Path(root) / "odd_sum"
         shutil.copytree(EXAMPLE_PROJECT, proj)

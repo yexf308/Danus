@@ -195,9 +195,9 @@ def test_workflow_n_papers_one_theorem_each_no_collision():
         assemble.write_target_fact_ids(pdir, ["fact_odd_sum_main"])           # default
         _scaffold_paper_workspace(pdir, "thmB", [second])                    # non-default
 
-        with _fake_codex(stdout="%%%A%%%\n" + _CLEAN_TEX) as ca:
+        with _fake_codex(stdout="%%%A%%%\n" + _CLEAN_TEX):
             outA = server.paper_write()
-        with _fake_codex(stdout="%%%B%%%\n" + _CLEAN_TEX) as cb:
+        with _fake_codex(stdout="%%%B%%%\n" + _CLEAN_TEX):
             outB = server.paper_write(paper_id="thmB")
 
         assert outA["status"] == "ok" and outB["status"] == "ok"
@@ -252,11 +252,13 @@ def test_finalize_paper_records_per_paper_targets():
         second = _add_second_theorem(pdir)
         # default paper -> legacy <project>/TARGET.md
         rA = cli.do_finalize(project, ["fact_odd_sum_main"])
-        assert rA["target_file"] == str(pdir / "TARGET.md")
+        assert Path(rA["target_file"]).resolve() == (pdir / "TARGET.md").resolve()
         assert (pdir / "TARGET.md").is_file()
         # non-default paper -> <project>/papers/thmB/TARGET.md
         rB = cli.do_finalize(project, [second], paper_id="thmB")
-        assert rB["target_file"] == str(pdir / "papers" / "thmB" / "TARGET.md")
+        assert Path(rB["target_file"]).resolve() == (
+            pdir / "papers" / "thmB" / "TARGET.md"
+        ).resolve()
         assert (pdir / "papers" / "thmB" / "TARGET.md").is_file()
         # the two targets are independent.
         assert assemble.target_fact_ids(pdir) == ["fact_odd_sum_main"]

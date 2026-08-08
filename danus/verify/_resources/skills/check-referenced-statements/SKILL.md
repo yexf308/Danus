@@ -29,7 +29,7 @@ For each cited external theorem/lemma/definition:
 9. If still not found, emit a critical error:
    - location: where the citation is used,
    - issue: referenced theorem appears non-existent or incorrectly cited.
-10. When a step cites an internal `fact_id` (16 hex characters) rather than an external paper, apply the verifier contract's P3-supplement **chain check** (`agents/contracts/verifier.md`): read the cited statement and definitions from the supplied authoritative fact context and, if its statement carries an unproven conditional premise, record the inherited defect as a `critical_error`. A cited id unavailable from supplied complete context also prevents a correct verdict. Legacy context-free requests cannot cite internal ids. Read and apply the wording from the contract; do not fork it here.
+10. When a step cites an internal `fact_id` (16 hex characters) rather than an external paper, apply the verifier contract's P3-supplement **chain check** (`agents/contracts/verifier.md`): read the cited statement, direct edges, and fact-local definitions from `fact_statement_closure`. Never infer an ancestor proof from its statement. If a specific strict-ancestor proof is indispensable, request that exact id through the contract's `needs_context` control response; never hydrate it via search. When the proof is present in `expanded_proofs`, check the whole record. A cited id unavailable from supplied complete context prevents a final correct verdict. Legacy context-free requests cannot cite internal ids. Read and apply the wording from the contract; do not fork it here.
 11. Keep each reference check in context for the synthesis step (you persist nothing —
    the verifier is stateless).
 

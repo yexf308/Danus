@@ -88,11 +88,13 @@ Danus/
    citations without breaking the DAG.
 5. Lazy context is fail-closed: discovery is statement-only; explicit hydration
    carries scope/completeness/digest metadata and only referenced immutable global
-   definitions. Verification sends full cards only for direct predecessors, all
-   inherited definitions, and a digest/count commitment to a core-validated full
-   closure; ancestor statements/proofs and its edge skeleton do not enter the model
-   prompt. The service attests the context digest, and the gateway atomically
-   rechecks the same snapshot before writing under the graph mutation lock.
+   definitions. Verification round zero sends the complete transitive ancestor
+   statement/edge/fact-local-definition closure and no ancestor proof. A bounded
+   `needs_context` response can request exact strict-ancestor proofs; the gateway
+   alone authenticates and hydrates whole canonical records, then starts a fresh
+   session. The service attests every round digest, and the gateway atomically
+   rebuilds the final expansion snapshot before writing under the graph mutation
+   lock.
 6. Autonomy and resumability. Workers run detached; a "round" continues from
    persisted memory rather than adding one increment, so no single crash loses
    verified work.
@@ -131,7 +133,7 @@ Danus/
 |---|---|---|
 | MCP tool set + role gating | 7 tools; `roles.py` `ROLE_TOOLS` (worker/main get lazy `fact_context`; main has NO `fact_submit`; verifier read-only) | `danus.gateway` ↔ worker/main/verifier agents |
 | MCP launch | `python -m danus.gateway` + `DANUS_ROLE` env | `danus.verify` launcher · worker `.codex/config.toml` · `.mcp.json` (main) → `danus.gateway` |
-| verify HTTP | `POST /verify {statement,proof,glossary_introduces?,fact_context?}` → `{verification_report,verdict,repair_hints,verification_context_digest?}`; supplied context must be complete and the digest is server-attested; verdict ⟺ no critical_errors & no gaps | `danus.gateway.fact_submit` ↔ `danus.verify` |
+| verify HTTP | `POST /verify {statement,proof,glossary_introduces?,fact_context?}` → `{output_schema_version,verification_status,verification_report,verdict,needs_expanded_proofs,repair_hints,verification_context_digest?,verification_metrics?}`; supplied context must be complete and digest-attested; only `final/correct` with zero findings can authorize the locked write | `danus.gateway.fact_submit` ↔ `danus.verify` |
 | fact id inputs | `problem_id + sorted(predecessors) + sorted(glossary) + normalized(statement,proof)`; **external_refs EXCLUDED** | `danus.core` ↔ everyone (write-paper reads `external_refs`) |
 | global-memory kinds | the 11 `GLOBAL_KINDS` (incl. `master_guidance`/`elaboration`/`verification`) | `danus.core` ↔ agents · strategy · consult |
 | consult JSON envelope | `{transport,reply,usage,cost_usd,…}` | `danus.strategy` CLI ↔ consult skill |

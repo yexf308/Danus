@@ -387,7 +387,9 @@ class ClaudeCodeTransport(Transport):
 
         # The JSON result object is the last JSON line on stdout; tolerate noise.
         parsed = None
-        for ln in reversed([l for l in (proc.stdout or "").splitlines() if l.strip()]):
+        for ln in reversed(
+            [line for line in (proc.stdout or "").splitlines() if line.strip()]
+        ):
             try:
                 parsed = json.loads(ln)
                 break

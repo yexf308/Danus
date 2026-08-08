@@ -27,13 +27,15 @@ explicit `DANUS_ROLE=all`.
 ## The write-gate (`fact_submit`, in `server.py`)
 
 The single path a fact enters truth: (1) build complete lazy context for every
-declared predecessor: full cards for direct premises, every inherited fact-local
-definition, immutable global definitions, and a digest/count commitment to the
-core-validated transitive closure (never predecessor proofs, ancestor statements,
-the closure edge skeleton, or implicit project-glossary entries); (2) call the
-verify service (`DANUS_VERIFY_URL`) and require its server-side context-digest
-attestation; (3) after a `correct` verdict, recheck that exact snapshot and add
-under the graph mutation lock; (4) durably attempt to trace the verdict to global memory,
+declared predecessor: the complete transitive ancestor statement/edge/fact-local
+definition closure, selected immutable definitions, and no ancestor proof; (2)
+call the verify service (`DANUS_VERIFY_URL`) and require its server-side
+context-digest attestation; (3) on `needs_context`, authenticate every requested
+id as a strict ancestor, hydrate only those whole proofs from canonical fact
+files, and repeat in a fresh session within the configured round/count/record
+budgets; (4) after a final `correct` verdict, rebuild that exact expansion
+snapshot and add under the graph mutation lock; (5) durably attempt to trace every
+round and the final outcome to global memory,
 returning an explicit `trace_error` without hiding a written fact id. Missing,
 revoked, incomplete, or over-budget context blocks before verification. A
 `correct` verdict is necessary but not sufficient for a write: a stale locked
@@ -45,6 +47,12 @@ revoke, so a concurrent change becomes either an accept-but-write-failed retry o
 a cascade that includes the new fact—never stale truth.
 The verify service also requires the literal internal ids cited by the proof to
 match the declared direct predecessor set exactly.
+
+The adaptive defaults are two expansion rounds, eight total expanded proofs,
+and 200000 canonical proof-record characters. Unknown, non-ancestor, current,
+duplicate, already-expanded, missing, revoked, or no-progress requests fail
+closed as protocol errors. Graphify or other discovery indexes never participate
+in closure completeness, proof hydration, digest construction, or verdicts.
 
 `fact_search` remains full-text BM25 with a statement-only result payload.
 `fact_context` reads explicit ids and is statement/relations-only by default;
