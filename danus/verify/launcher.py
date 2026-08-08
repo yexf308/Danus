@@ -23,7 +23,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import shlex
 import subprocess
 import sys
 import tempfile
@@ -241,6 +240,24 @@ def _verification_path(run_id: str) -> Optional[Path]:
     return None
 
 
+def _write_run_log(
+    path: Path,
+    *,
+    started_at: str,
+    status: str,
+    returncode: object,
+    finished_at: Optional[str] = None,
+) -> None:
+    """Persist only service-owned execution metadata, never Codex output."""
+    lines = [f"started_at_utc: {started_at}"]
+    if finished_at is not None:
+        lines.append(f"finished_at_utc: {finished_at}")
+    lines.extend((f"status: {status}", f"returncode: {returncode}"))
+    with path.open("w", encoding="utf-8") as handle:
+        os.fchmod(handle.fileno(), 0o600)
+        handle.write("\n".join(lines) + "\n")
+
+
 def _prompt_json(value: object) -> str:
     """Compact JSON for prompt data, escaping delimiter metacharacters too."""
     return json.dumps(
@@ -375,23 +392,54 @@ def run_codex_verification(
 
     started_at = datetime.now(timezone.utc).isoformat()
     try:
-        with log_path.open("w", encoding="utf-8") as log_handle:
-            log_handle.write(f"started_at_utc: {started_at}\n")
-            log_handle.write(f"command: {shlex.join(cmd)}\n\n")
-            log_handle.flush()
-            completed = subprocess.run(
-                cmd, cwd=_agent_home(), env=env,
-                input=prompt, stdout=log_handle, stderr=subprocess.STDOUT,
-                text=True, timeout=_timeout(), check=False,
-            )
+        _write_run_log(
+            log_path,
+            started_at=started_at,
+            status="running",
+            returncode="unavailable",
+        )
+    except OSError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"could not create sanitized verifier run log at {log_path}: {exc}",
+        ) from exc
+
+    try:
+        completed = subprocess.run(
+            cmd, cwd=_agent_home(), env=env,
+            input=prompt, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            text=True, timeout=_timeout(), check=False,
+        )
     except subprocess.TimeoutExpired as exc:
+        _write_run_log(
+            log_path,
+            started_at=started_at,
+            finished_at=datetime.now(timezone.utc).isoformat(),
+            status="timed_out",
+            returncode="unavailable",
+        )
         raise HTTPException(status_code=504,
                             detail=f"codex exec timed out after {exc.timeout}s. See log at {log_path}") from exc
     except OSError as exc:
+        _write_run_log(
+            log_path,
+            started_at=started_at,
+            finished_at=datetime.now(timezone.utc).isoformat(),
+            status="start_failed",
+            returncode="unavailable",
+        )
         raise HTTPException(
             status_code=500,
             detail=f"could not start codex exec: {exc}. See log at {log_path}",
         ) from exc
+
+    _write_run_log(
+        log_path,
+        started_at=started_at,
+        finished_at=datetime.now(timezone.utc).isoformat(),
+        status="completed",
+        returncode=completed.returncode,
+    )
 
     if completed.returncode != 0:
         raise HTTPException(status_code=500,

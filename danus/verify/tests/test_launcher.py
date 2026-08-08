@@ -12,7 +12,7 @@ Covers:
   * _allocate_run_id: unique-dir retry on collision (FileExistsError branch).
   * _verification_path: found (each filename) and None-when-absent.
   * run_codex_verification: success readback, 504 timeout, 500 nonzero-exit,
-    500 missing-output, 500 bad-json, 500 non-dict-json.
+    500 missing-output, 500 bad-json, 500 non-dict-json, and sanitized run logs.
 
 Runs standalone (``python -m danus.verify.tests.test_launcher``) and under pytest.
 """
@@ -116,6 +116,19 @@ out.parent.mkdir(parents=True, exist_ok=True)
 out.write_text(json.dumps({"verification_report": {"summary": "ok", "critical_errors": [], "gaps": []},
                            "verdict": "correct", "repair_hints": ""}))
 print("ok")
+"""
+
+# stub that imitates a chatty Codex CLI echoing sensitive stdin on both streams
+_STUB_ECHOES_PROMPT = """\
+import sys, json
+from pathlib import Path
+prompt = sys.stdin.read() if sys.argv[-1] == '-' else sys.argv[-1]
+sys.stdout.write("UNVERIFIED_STDOUT:" + prompt)
+sys.stderr.write("UNVERIFIED_STDERR:" + prompt)
+out = Path(sys.argv[sys.argv.index('--output-last-message') + 1])
+out.parent.mkdir(parents=True, exist_ok=True)
+out.write_text(json.dumps({"verification_report": {"summary": "ok", "critical_errors": [], "gaps": []},
+                           "verdict": "correct", "repair_hints": ""}))
 """
 
 # stub that exits nonzero and writes nothing
@@ -325,6 +338,26 @@ def test_run_success_reads_back_payload():
         assert out["verification_report"]["critical_errors"] == []
 
 
+def test_run_log_never_persists_codex_streams_or_prompt_data():
+    with _service(_STUB_ECHOES_PROMPT):
+        out = _run(fact_context=_FACT_CONTEXT)
+        assert out["verdict"] == "correct"
+
+        log_path = launcher._results_dir("RID") / "log.md"
+        log = log_path.read_text(encoding="utf-8")
+        assert _STMT not in log
+        assert _PROOF not in log
+        assert "A holds" not in log
+        assert "UNVERIFIED_STDOUT" not in log
+        assert "UNVERIFIED_STDERR" not in log
+        assert "command:" not in log
+        fields = {line.split(": ", 1)[0] for line in log.splitlines()}
+        assert fields == {"started_at_utc", "finished_at_utc", "status", "returncode"}
+        assert "status: completed" in log
+        assert "returncode: 0" in log
+        assert stat.S_IMODE(log_path.stat().st_mode) == 0o600
+
+
 def test_run_rejects_serialized_prompt_over_budget_before_codex():
     with _service(_STUB_OK), _env(DANUS_VERIFY_MAX_PROMPT_BYTES="100"):
         try:
@@ -351,6 +384,9 @@ def test_run_nonzero_exit_500():
             assert False, "expected 500"
         except HTTPException as e:
             assert e.status_code == 500 and "exit code 7" in e.detail
+        log = (launcher._results_dir("RID") / "log.md").read_text(encoding="utf-8")
+        assert "boom" not in log
+        assert "status: completed" in log and "returncode: 7" in log
 
 
 def test_run_missing_output_500():

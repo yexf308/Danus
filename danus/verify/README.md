@@ -66,9 +66,11 @@ to the response; the gateway refuses responses without that exact attestation.
   -c <danus MCP, role=verifier> --sandbox read-only --ephemeral
   --ignore-user-config --output-schema <schema> -o <verification.json> -`;
   the bounded prompt is delivered over stdin (never process argv), uses an atomic
-  run-id, and the CLI captures the schema-constrained last message. Injects the
-  read-only gateway with the verify service's exact interpreter as
-  **`<sys.executable> -m danus.gateway`**.
+  run-id, and the CLI captures the schema-constrained last message. Codex stdout
+  and stderr are discarded rather than copied to persistent logs; `log.md` is a
+  mode-`0600` service-written metadata record containing only timestamps, status,
+  and return code. Injects the read-only gateway with the verify service's exact
+  interpreter as **`<sys.executable> -m danus.gateway`**.
 - `service.py` — FastAPI app (`/verify`, `/health`) and deterministic context
   validation before any verifier process starts.
 
@@ -93,7 +95,7 @@ system Python without `danus`.
 | `VERIFY_HOST` / `VERIFY_PORT` (or `PORT`) | `127.0.0.1` / `8091` | bind addr (`python -m danus.verify`) |
 | `DANUS_STATE_DIR` | `$XDG_STATE_HOME/danus`, else `~/.local/state/danus` | writable verifier state root when the two paths below are unset |
 | `VERIFY_AGENT_HOME` | `<state>/verify/agent-<resource-digest>` | writable codex `-C` home; packaged AGENTS.md + skills are materialized here, with resource-versioned defaults |
-| `VERIFIER_RESULTS_DIR` | `<state>/verify/runs` | per-verification run dirs (`log.md` + CLI-captured `verification.json`) |
+| `VERIFIER_RESULTS_DIR` | `<state>/verify/runs` | per-verification run dirs (sanitized metadata-only `log.md` + CLI-captured `verification.json`) |
 | `DANUS_CODEX_BIN` | `<repo>/bin/codex` → `which codex` → bare `"codex"` | the codex binary; resolved via the shared `danus.codex` launcher |
 | `DANUS_VERIFY_MODEL` / `DANUS_VERIFY_EFFORT` (fall back to neutral `DANUS_CODEX_MODEL` / `DANUS_CODEX_EFFORT`) | `gpt-5.5` / `xhigh` | codex knobs |
 | `CODEX_TIMEOUT_SECONDS` | `0` lib / **`900`** via `python -m danus.verify` | per-verification codex timeout |
@@ -134,6 +136,10 @@ re-sending ancestor statements or any predecessor proofs.
   a host confidentiality boundary: for adversarial proof text, still run this
   service in a dedicated container or low-privilege account with no unrelated
   readable secrets.
+- Codex stdout/stderr is never persisted because the CLI may echo the stdin
+  prompt, including the candidate proof and lazy fact context. Persistent
+  `log.md` files contain only server-generated timestamps, completion status,
+  and return code; diagnostic model text must not be copied into them.
 - The CLI output schema deliberately uses only a conservative OpenAI Responses
   Structured Outputs subset: exact object shapes, required fields, primitive
   types, arrays, references, and the verdict enum. Cross-field rules cannot be
