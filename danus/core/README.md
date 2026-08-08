@@ -45,26 +45,35 @@ gm.append("master_guidance", claim="...", evidence="GPT-5.5-pro: ...", author="m
 gm.set_status(gid, "verified", fact_id="<id>")   # agent-driven status note
 gm.read("plan"); gm.search("query", kinds=["dead_end"])
 
-# fact graph (shared; root = the project dir) — verified truth
+# fact graph low-level API (shared; production writes go through gateway fact_submit)
 fg = FactGraph(project_dir)
 fid = fg.add(problem_id="KMMP", author="KMMP_high", statement="...", proof="...",
              predecessors=["<id>"], glossary_introduces={"K_F": "canonical class of F"})
 fg.undefined_symbols(statement="...", proof="...", predecessors=["<id>"])  # coverage check
+fg.search("query")                        # statement-only ranked summaries
+fg.context([fid], predecessor_depth=None, proof_mode="selected", max_chars=200000)
 fg.get_raw(fid); fg.list(); fg.predecessors(fid); fg.glossary(); fg.descendants(fid)
 fg.revoke(fid, reason="...")     # cascades to dependents
 ```
 
-**The promotion flow is prose, not a function.** When a verifiable global-memory
-finding passes the verifier, the agent (per its prompt) calls `fg.add(...)` to
-write the fact and `gm.set_status(id, "verified", fact_id)` to back-link. The
-library does not bundle that into a `promote()` — the decision and the verify
-call are the agent's.
+**There is no second promotion path.** Agents call the gateway's `fact_submit`;
+it validates lazy context, invokes the verifier, atomically rechecks the graph,
+and only then calls this low-level `fg.add(...)`. The core library deliberately
+does not expose a separate `promote()` shortcut.
 
 ## Invariants the library enforces (mechanical only)
 
 - Verifiable global-memory kinds require non-empty `evidence`.
 - `fact_id` is content-addressed; identical content ⇒ identical id (dedup).
-- `FactGraph.add` refuses a revoked predecessor; `revoke` cascades to descendants.
+- `FactGraph.add` refuses unknown or revoked predecessors; `revoke` cascades to
+  descendants.
+- Project glossary terms cannot redefine global notation or change meaning while
+  active. The project glossary is discovery-only: verifier context never treats
+  it as an implicit premise. To inherit a project definition, declare its source
+  fact as a predecessor; source revocation then cascades normally. Revoke rebuilds
+  the discovery glossary from remaining active facts.
+- `FactGraph.context` reports an explicit scope, completeness state, and digest;
+  budgets omit whole records rather than returning partial facts.
 - Append-only everywhere; status is an appended note folded at read.
 
 Enforced by **prose**, not code: "global memory is awareness, never a correctness

@@ -7,7 +7,8 @@ POST /verify + GET /health contract and every error status mapping. The
 mocked so no server ever binds.
 
 HTTP contract under test:
-  POST /verify {statement, proof} -> 200 {verification_report, verdict, repair_hints}
+  POST /verify {statement, proof, glossary_introduces?, fact_context?}
+    -> 200 {verification_report, verdict, repair_hints}
   * 400 on a vacuous / precheck-failing input (before any codex run)
   * 422 on a schema-invalid body (missing/empty field — pydantic)
   * 504 on codex timeout, 500 on exit / missing-output / bad-json (launcher raises)
@@ -18,13 +19,21 @@ Runs standalone (``python -m danus.verify.tests.test_service``) and under pytest
 
 from __future__ import annotations
 
+import asyncio
+import json
 import sys
+import threading
 import types
 from contextlib import contextmanager
 
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
+from danus.core import (
+    VERIFICATION_CONTEXT_PROJECTION,
+    VERIFICATION_CONTEXT_SCHEMA_VERSION,
+    verification_context_digest,
+)
 from danus.verify import service
 
 _STMT = "For every integer n, n + 0 equals n."
@@ -38,6 +47,74 @@ _CANNED_OK = {
     "verdict": "correct",
     "repair_hints": "",
 }
+
+def _make_context(
+    facts=None,
+    ancestor_definitions=None,
+    glossary=None,
+    *,
+    closure_count=None,
+):
+    facts = list(facts or [])
+    ancestor_definitions = list(ancestor_definitions or [])
+    glossary = dict(glossary or {})
+    requested = [record["fact_id"] for record in facts]
+    scope = {
+        "requested_fact_ids": requested,
+        "predecessor_depth": None,
+        "proof_mode": "none",
+        "include_project_glossary": False,
+        "projection": VERIFICATION_CONTEXT_PROJECTION,
+        "ancestor_definition_terms": [
+            record["term"] for record in ancestor_definitions
+        ],
+        "glossary_terms": list(glossary),
+    }
+    closure = {
+        "count": len(requested) if closure_count is None else closure_count,
+        "digest": "sha256:" + "1" * 64,
+    }
+    characters_used = sum(
+        len(json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+        for record in facts + ancestor_definitions
+    )
+    characters_used += sum(
+        len(json.dumps(
+            {"term": term, "definition": definition},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ))
+        for term, definition in glossary.items()
+    )
+    context = {
+        "schema_version": VERIFICATION_CONTEXT_SCHEMA_VERSION,
+        "scope": scope,
+        "facts": facts,
+        "ancestor_definitions": ancestor_definitions,
+        "dependency_closure": closure,
+        "glossary": glossary,
+        "complete": True,
+        "truncated": False,
+        "missing_fact_ids": [],
+        "revoked_fact_ids": [],
+        "omitted_fact_ids": [],
+        "omitted_glossary_terms": [],
+        "characters_used": characters_used,
+        "character_budget": 200000,
+    }
+    context["digest"] = verification_context_digest(
+        scope=scope,
+        facts=facts,
+        ancestor_definitions=ancestor_definitions,
+        dependency_closure=closure,
+        glossary=glossary,
+    )
+    return context
+
+
+_FACT_CONTEXT = _make_context()
+_SCOPE = _FACT_CONTEXT["scope"]
 
 
 @contextmanager
@@ -93,10 +170,219 @@ def test_verify_accept_contract():
 
 def test_verify_reject_verdict_still_200():
     # a "wrong" verdict is a normal 200 response (the verdict is the payload).
-    canned = dict(_CANNED_OK, verdict="wrong", repair_hints="fix the gap")
+    canned = {
+        "verification_report": {
+            "summary": "gap",
+            "critical_errors": [],
+            "gaps": [{"location": "proof", "issue": "missing step"}],
+        },
+        "verdict": "wrong",
+        "repair_hints": "fix the gap",
+    }
     with _fake_run(lambda run_id, statement, proof: canned):
         resp = _client().post("/verify", json={"statement": _STMT, "proof": _PROOF})
     assert resp.status_code == 200 and resp.json()["verdict"] == "wrong"
+
+
+def test_verify_forwards_optional_fact_context():
+    def fake(
+        run_id, statement, proof, fact_context=None, glossary_introduces=None
+    ):
+        assert run_id == "RID-fake"
+        assert fact_context == _FACT_CONTEXT
+        assert glossary_introduces == {"X": "a compact space"}
+        return _CANNED_OK
+
+    with _fake_run(fake):
+        resp = _client().post(
+            "/verify",
+            json={
+                "statement": _STMT,
+                "proof": _PROOF,
+                "fact_context": _FACT_CONTEXT,
+                "glossary_introduces": {"X": "a compact space"},
+            },
+        )
+    assert resp.status_code == 200 and resp.json()["verdict"] == "correct"
+    assert resp.json()["verification_context_digest"] == _FACT_CONTEXT["digest"]
+
+
+def test_verify_rejects_incomplete_or_tampered_context_before_codex():
+    cases = []
+    incomplete = dict(_FACT_CONTEXT, complete=False)
+    cases.append(incomplete)
+    truncated = dict(_FACT_CONTEXT, truncated=True)
+    cases.append(truncated)
+    tampered = dict(_FACT_CONTEXT, digest="sha256:" + "0" * 64)
+    cases.append(tampered)
+    omitted_glossary = dict(
+        _FACT_CONTEXT, omitted_glossary_terms=["Q_X"], complete=False, truncated=True
+    )
+    cases.append(omitted_glossary)
+    inconsistent_glossary = dict(_FACT_CONTEXT, glossary={"Q_X": "changed"})
+    cases.append(inconsistent_glossary)
+    project_glossary_scope = dict(_SCOPE, include_project_glossary=True)
+    cases.append(
+        dict(
+            _FACT_CONTEXT,
+            scope=project_glossary_scope,
+            digest=verification_context_digest(
+                scope=project_glossary_scope,
+                facts=[],
+                ancestor_definitions=[],
+                dependency_closure=_FACT_CONTEXT["dependency_closure"],
+                glossary={},
+            ),
+        )
+    )
+    malformed = dict(_FACT_CONTEXT)
+    malformed.pop("scope")
+    cases.append(malformed)
+
+    with _fake_run(_must_not_run):
+        for fact_context in cases:
+            resp = _client().post(
+                "/verify",
+                json={"statement": _STMT, "proof": _PROOF, "fact_context": fact_context},
+            )
+            assert resp.status_code == 400 and "invalid fact_context" in resp.json()["detail"]
+
+
+def test_verify_requires_context_for_cited_internal_fact():
+    proof = _PROOF + " Apply verified fact aaaaaaaaaaaaaaaa to finish."
+    with _fake_run(_must_not_run):
+        resp = _client().post("/verify", json={"statement": _STMT, "proof": proof})
+    assert resp.status_code == 400 and "fact_context is required" in resp.json()["detail"]
+
+
+def test_verify_requires_context_for_internal_fact_id_in_statement():
+    statement = _STMT + " This is the consequence recorded as bbbbbbbbbbbbbbbb."
+    with _fake_run(_must_not_run):
+        resp = _client().post("/verify", json={"statement": statement, "proof": _PROOF})
+    assert resp.status_code == 400 and "fact_context is required" in resp.json()["detail"]
+
+
+def test_verify_requires_declared_and_cited_predecessors_to_match():
+    fact_id = "aaaaaaaaaaaaaaaa"
+    facts = [{
+        "fact_id": fact_id,
+        "statement": "A holds",
+        "predecessors": [],
+        "glossary_introduces": {},
+    }]
+    context = _make_context(facts)
+    with _fake_run(_must_not_run):
+        resp = _client().post(
+            "/verify",
+            json={"statement": _STMT, "proof": _PROOF, "fact_context": context},
+        )
+    assert resp.status_code == 400 and "declared but not cited" in resp.json()["detail"]
+
+
+def test_verify_matches_declared_predecessors_across_statement_and_proof():
+    first = "aaaaaaaaaaaaaaaa"
+    second = "bbbbbbbbbbbbbbbb"
+    facts = [
+        {
+            "fact_id": fact_id,
+            "statement": f"Premise {index} holds",
+            "predecessors": [],
+            "glossary_introduces": {},
+        }
+        for index, fact_id in enumerate((first, second), start=1)
+    ]
+    context = _make_context(facts)
+    statement = _STMT + f" Assume the direct predecessor {first}."
+    proof = _PROOF + f" Apply the other direct predecessor {second}."
+
+    def fake(run_id, statement, proof, fact_context=None, glossary_introduces=None):
+        assert fact_context == context
+        return _CANNED_OK
+
+    with _fake_run(fake):
+        resp = _client().post(
+            "/verify",
+            json={"statement": statement, "proof": proof, "fact_context": context},
+        )
+    assert resp.status_code == 200
+
+
+def test_verify_rejects_undeclared_fact_id_in_statement_with_context():
+    statement = _STMT + " This also invokes cccccccccccccccc."
+    with _fake_run(_must_not_run):
+        resp = _client().post(
+            "/verify",
+            json={
+                "statement": statement,
+                "proof": _PROOF,
+                "fact_context": _FACT_CONTEXT,
+            },
+        )
+    assert resp.status_code == 400 and "undeclared" in resp.json()["detail"]
+
+
+# --------------------------------------------------------------------------- #
+# /verify — pre-parse ingress controls                                        #
+# --------------------------------------------------------------------------- #
+
+async def _raw_asgi_post(*, receive):
+    messages = []
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/verify",
+        "raw_path": b"/verify",
+        "query_string": b"",
+        "headers": [(b"content-type", b"application/json")],
+        "client": ("127.0.0.1", 43210),
+        "server": ("127.0.0.1", 8091),
+    }
+
+    async def send(message):
+        messages.append(message)
+
+    await service.app(scope, receive, send)
+    starts = [message for message in messages if message["type"] == "http.response.start"]
+    assert len(starts) == 1
+    return starts[0]["status"]
+
+
+def test_verify_rejects_chunked_oversized_body_before_pydantic(monkeypatch):
+    monkeypatch.setattr(service, "VERIFY_MAX_REQUEST_BYTES", 8)
+    delivered = False
+
+    async def receive():
+        nonlocal delivered
+        if delivered:
+            return {"type": "http.disconnect"}
+        delivered = True
+        return {"type": "http.request", "body": b"123456789", "more_body": False}
+
+    assert asyncio.run(_raw_asgi_post(receive=receive)) == 413
+
+
+def test_verify_times_out_slow_body_before_pydantic(monkeypatch):
+    monkeypatch.setattr(service, "VERIFY_BODY_TIMEOUT_SECONDS", 0.01)
+
+    async def receive():
+        await asyncio.sleep(0.05)
+        return {"type": "http.request", "body": b"{}", "more_body": False}
+
+    assert asyncio.run(_raw_asgi_post(receive=receive)) == 408
+
+
+def test_verify_rejects_when_preparse_admission_is_full(monkeypatch):
+    slots = threading.BoundedSemaphore(1)
+    assert slots.acquire(blocking=False)
+    monkeypatch.setattr(service, "_ADMISSION_SLOTS", slots)
+    try:
+        resp = _client().post("/verify", json={"statement": _STMT, "proof": _PROOF})
+    finally:
+        slots.release()
+    assert resp.status_code == 429 and "busy" in resp.json()["detail"]
 
 
 # --------------------------------------------------------------------------- #

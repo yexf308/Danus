@@ -9,9 +9,11 @@ Runs standalone (``python -m danus.authoring.tests.test_driver``) and under pyte
 
 from __future__ import annotations
 
+import json
 import os
 import stat
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -89,6 +91,13 @@ def test_neutral_default_model_and_effort():
         assert driver.default_effort() == driver.DEFAULT_EFFORT == "xhigh"
 
 
+def test_gateway_uses_the_running_interpreter():
+    config = driver._gateway_config_arg("verifier")
+    assert f'command={json.dumps(sys.executable)}' in config
+    assert 'args=["-m","danus.gateway"]' in config
+    assert 'env={DANUS_ROLE="verifier"}' in config
+
+
 def test_resolve_bin_bare_name_resolved_via_which():
     # codex.py resolve_bin: a bare (non-absolute) DANUS_CODEX_BIN name is resolved
     # to its absolute path via PATH (shutil.which). We put a fake 'mycodex' on PATH.
@@ -146,6 +155,8 @@ def main() -> None:
     print("  [ok] missing codex binary -> FileNotFoundError")
     test_neutral_default_model_and_effort()
     print("  [ok] neutral DANUS_CODEX_MODEL / DANUS_CODEX_EFFORT defaults")
+    test_gateway_uses_the_running_interpreter()
+    print("  [ok] gateway MCP uses the running Python interpreter")
     test_resolve_bin_bare_name_resolved_via_which()
     print("  [ok] resolve_bin: bare name resolved via PATH (shutil.which)")
     test_resolve_bin_bare_name_not_on_path_falls_back_to_raw()

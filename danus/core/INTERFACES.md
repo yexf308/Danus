@@ -13,17 +13,20 @@ as an interface **only** when the LLM can't do it reliably itself:
 1. **deterministic computation** the model can't be trusted to do by hand —
    a content-addressed `fact_id` (SHA-256), BM25 ranking;
 2. **multi-file integrity** — cascade revoke (find descendants, move, log);
-3. **a load-bearing gate** — a fact may exist only if the verifier accepted it.
+3. **a load-bearing gate** — a fact may exist only if the verifier accepted it;
+4. **bounded, integrity-checked hydration** — large fact graphs need explicit-id
+   context with proof opt-in, completeness metadata, and stable digests.
 
 Everything else is the agent writing/reading files per a format the **prompt**
-specifies.
+specifies; fact retrieval is the deliberate exception because uncontrolled reads
+inflate context and bypass completeness checks.
 
 ### Why the surface stays minimal
 
 The interface surface is small on purpose. Writes that need a guaranteed
-envelope, deterministic hashing, or BM25 — `memory_append`-style writes plus
-`memory_search` and init — are wrapped; **reads are direct** (the agent reads
-files). At the extreme, a files-direct deployment wraps **nothing**: the agent
+envelope, deterministic hashing, BM25, or bounded fact hydration are wrapped.
+Local/global-memory reads stay direct; fact reads use `fact_search` and
+`fact_context`. At the extreme, a files-direct deployment wraps **nothing**: the agent
 reads/searches/writes `{run_dir}/memory/<channel>.md` directly, and the only
 scripts are an arXiv-search API helper and a LaTeX compiler — neither a
 data-structure interface. A heavy design would sprawl into dozens of MCP tools
@@ -40,8 +43,9 @@ it reads/writes/greps:
 - **local memory** — append a rough note, read it back, grep it. It's private and
   rough; no schema to enforce.
 - **global memory — read** a `<kind>.jsonl` (it's readable), and grep it.
-- **fact graph — read** a fact (`facts/<id>.md` is readable markdown), `list`
-  (`ls facts/`), read a fact's `predecessors` (one frontmatter line).
+- **fact graph — local debugging** may still inspect readable markdown files;
+  agent retrieval uses full-text `fact_search` with statement-only results, followed by explicit-id
+  `fact_context` so proofs are hydrated only on request.
 - **"has this been found / is it a duplicate?"** — grep / read global memory and
   the fact graph and judge. (No `check_fact_novelty` tool.)
 - **branch / status reflection in one's own head** — a note. (No `branch_update`
@@ -50,15 +54,16 @@ it reads/writes/greps:
 ## The interfaces we DO need
 
 Minimal set. Form = **MCP** — one stdio MCP server (`danus/gateway/`, a thin
-wrapper over `danus/core/`) exposing the 4 data-structure tools **+
+wrapper over `danus/core/`) exposing 6 data-structure tools **+
 `search_arxiv_theorems`** (one external integration — Matlas arXiv theorem search,
 returning *verbatim* statements; `danus/integrations/matlas.py`, not a
 data-structure interface but the LLM still can't do it itself). codex
 consumes MCP natively; `DANUS_ROLE`
 selects the per-agent tool subset (worker:
-`gm_add`/`gm_search`/`fact_submit`/`fact_search`/`search_arxiv_theorems`; main:
-`gm_add`/`gm_search`/`fact_search`/`fact_revoke`/`search_arxiv_theorems`; verifier:
-`search_arxiv_theorems` only — stateless, reads the fact graph as files).
+`gm_add`/`gm_search`/`fact_submit`/`fact_search`/`fact_context`/`search_arxiv_theorems`; main:
+`gm_add`/`gm_search`/`fact_search`/`fact_context`/`fact_revoke`/`search_arxiv_theorems`; verifier:
+`search_arxiv_theorems` only — stateless, with required fact context supplied in
+the request).
 Install: `danus/gateway/INSTALL.md`.
 
 ### fact graph (the strict one — id determinism + the verified gate)
@@ -67,13 +72,20 @@ Install: `danus/gateway/INSTALL.md`.
   verified gate lives **inside** submit — the invariant
   is enforced by code, not prose). It:
   1. computes the content-addressed `fact_id` (a deterministic hash);
-  2. runs the **glossary-coverage check** — flags any symbol used in the body but
-     not defined in this fact's glossary ∪ a predecessor's ∪ the project glossary
-     (keeps the graph readable; advisory + verifier backstop);
-  3. **calls the verifier**, and writes the node **iff accepted**, also merging
-     the fact's introduced symbols into the project glossary; on reject it returns
-     the verifier's repair hints (and any undefined symbols) and writes no fact.
-  4. **either way, logs the verification outcome** to global memory (kind
+  2. runs the advisory **glossary-coverage check** plus a hard provenance gate:
+     every reused project term must have a direct active predecessor that
+     introduced the same definition, and project entries cannot redefine global
+     notation;
+  3. lazily constructs compact verification context from declared predecessors:
+     full direct-premise cards, every inherited definition, immutable global
+     definitions, and a digest/count commitment to the validated transitive
+     closure (no ancestor statements, predecessor proofs, or edge skeleton),
+     blocking any missing, revoked, incomplete, or over-budget context;
+  4. **calls the verifier**; after acceptance it rechecks the exact context and
+     adds under the graph mutation lock, also merging the fact's introduced
+     symbols into the project glossary. A stale snapshot returns `write_error`;
+     on reject it returns repair hints (and any undefined symbols) and writes no fact.
+  5. **either way, logs the verification outcome** to global memory (kind
      `verification`: verdict + `fact_id` on accept / `repair_hints` on reject), so
      the verifier's feedback is not lost and siblings learn from rejections. The
      verifier itself stays stateless — `fact_submit` (the worker's tool) does this
@@ -83,10 +95,11 @@ Install: `danus/gateway/INSTALL.md`.
     `{accepted: false, verdict: "error"}` (verify service down — retry) ·
     `{accepted: true, fact_id: null, write_error}` (verified but a predecessor was revoked)
   - **Guarantee:** once a verdict exists (accept / reject / accept-but-write-failed)
-    the outcome is **always** logged (step 4) before returning — a verdict is never
+    the outcome is **always** logged (step 5) before returning — a verdict is never
     stored by nobody. The verifier is stateless; `fact_submit` (the worker's tool)
     is what persists, so the write must not be skippable by a later failure (it
-    runs after the fact write, with the fact write wrapped). A verify-service error
+    runs after the fact write, with the fact write wrapped). A pre-verification
+    context error or verify-service error
     yields no verdict, so nothing is stored and the worker retries.
   - the worker's verify-and-repair loop is just: submit → fix from hints → submit …
 - **`fact_search <query> [--limit N]`** — BM25 over the verified fact bodies
@@ -96,8 +109,17 @@ Install: `danus/gateway/INSTALL.md`.
   computation the LLM can't do by reading, and it serves both **novelty** ("does a
   fact like this already exist? — don't re-prove it") and **citation lookup**
   ("which verified facts bear on my subgoal?"). Returns `{fact_id, score,
-  statement}`; the agent reads the full proof from the fact file on a hit. This is
-  the read view over verified facts (novelty + citation lookup).
+  statement}`; the agent calls `fact_context` for an explicit hit when it needs
+  relations or proof text. This is the read view over verified facts (novelty +
+  citation lookup).
+- **`fact_context <fact_ids> ...`** — deterministic lazy hydration for explicit
+  ids. Statements/edges/fact-local definitions plus only referenced
+  project/global definitions are the interactive default; proofs are opt-in. The
+  verification write-gate disables project-glossary hydration, so mathematical
+  definitions there come only from declared fact cards, the candidate, or the
+  immutable global glossary. The response
+  carries a versioned scope, digest, and fail-closed completeness/budget metadata;
+  `complete` means complete for that declared scope.
 - **`danus fact revoke <fact_id> --reason ...`** — cascade revoke (walk
   descendants, move to `_revoked/`, log). Multi-file integrity ⇒ code. Low
   frequency (operator / main agent).
@@ -126,8 +148,8 @@ facts enter only via `fact submit`, and the read view is the on-demand
 `fact_search` index, never an appended board) · `submit_blueprint_candidate`
 (folded into `fact submit`) · the `swarm_*`, `ask_human`, `read_directives`,
 `consult_*`, `shell_run` tools (out of scope here — control / human / consult /
-runtime). (Reading and novelty judgment over verified facts are covered by the
-single derived read view `fact_search` above.)
+runtime). (Verified-fact discovery and hydration are covered by `fact_search`
+and `fact_context` above.)
 
 ## Summary — the whole interface surface
 
@@ -135,14 +157,16 @@ single derived read view `fact_search` above.)
 MCP tools (danus/gateway/server.py):
   fact_submit   # glossary-coverage check + verify + write a fact (the gate); returns fact_id or repair hints
   fact_search   # BM25 read view over verified facts (derived index, on demand) — novelty + citation lookup
+  fact_context  # explicit-id lazy statements/edges/proofs + completeness metadata and digest
   fact_revoke   # cascade revoke
   gm_add        # schema-enforced write of a finding (kind / evidence rule / optional glossary)
   gm_search     # BM25 over global memory
 ```
 
-Five data-structure tools (+ `search_arxiv_theorems`). Everything else — local
+Six data-structure tools (+ `search_arxiv_theorems`). Everything else — local
 memory, novelty *judgment* — is the agent reading/writing files, guided by prose.
 The server is a thin wrapper: `fact_submit` = `FactGraph.undefined_symbols` + the
-verify call + `FactGraph.add`; `fact_search` = BM25 over the fact files (the
-derived index, rebuilt per call — no persisted board to drift). `fact_submit`
+verify call + a post-verification context recheck + `FactGraph.add`; `fact_search`
+= BM25 over the fact files (the derived index, rebuilt per call — no persisted
+board to drift); `fact_context` = reachable-file hydration only. `fact_submit`
 needs the verify-service URL (`DANUS_VERIFY_URL`); the others work without it.

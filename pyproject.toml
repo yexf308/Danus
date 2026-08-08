@@ -45,3 +45,12 @@ include = ["danus*"]
 
 [tool.setuptools.package-data]
 "danus.core" = ["*.json"]
+"danus.verify" = ["*.json"]
+"danus.verify._resources" = [
+    "AGENTS.md",
+    "skills/*/SKILL.md",
+    "skills/*/agents/*.yaml",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

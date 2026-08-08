@@ -33,8 +33,9 @@ verifier) decides; and a result only *exists* once that authority has accepted i
   run detached and resume from persisted memory, so no single crash loses verified
   work.
 - **The verifier.** A **cold-start** `codex` judge, started fresh for each check,
-  that is the **sole authority on correctness**. A result becomes a fact **if and
-  only if** the verifier returns a `correct` verdict. It is an LLM, not a formal
+  that is the **sole authority on mathematical correctness**. A `correct` verdict
+  authorizes the gateway to recheck the exact context and add under the graph
+  mutation lock; a stale snapshot is not written. It is an LLM, not a formal
   proof assistant — see `security-and-trust.md`.
 - **The strategy consult.** The main agent's high-intelligence step: it distills
   the project's state (an *elaboration*) and consults a strong reasoning model,
@@ -59,7 +60,8 @@ the verifier accepts becomes a **fact**. Crucially:
   claim — is awareness only. A proof may build **only** on facts (by citing their
   ids), never on unverified findings.
 - **There is no promotion shortcut.** Nothing "promotes" a claim to a fact except a
-  worker submitting it and the verifier accepting it.
+  worker submitting it, the verifier accepting it, and the gateway completing its
+  locked context check and add.
 
 ## The fact graph
 
@@ -120,8 +122,8 @@ initialize ─▶ new project ─▶ strategy loop ⇄ worker swarm ─▶ verif
   problem, its own memory and fact graph.
 - **strategy ⇄ workers** — the loop above; workers prove, submit, and the fact
   graph grows.
-- **verify** — every submission passes through the verifier; a fact is written only
-  on `correct`.
+- **verify** — every submission passes through the verifier; after `correct`, the
+  gateway still performs the locked context-CAS/add before a fact is written.
 - **human-summary** — a private PDF progress report rendered from the verified
   results; run it at **any time** during the run (it is not gated on finalize).
 - **finalize** — *you* decide a verified fact is the answer (`danus finalize`).
@@ -136,7 +138,7 @@ initialize ─▶ new project ─▶ strategy loop ⇄ worker swarm ─▶ verif
 ## Why you can trust the shape
 
 Every guarantee above — one correctness boundary, permission by construction, the
-verifier as the sole write-gate, resumable workers, the judgment calls staying with
+verifier plus gateway as the guarded write path, resumable workers, the judgment calls staying with
 you — is enforced in code, not by prompt convention. For exactly what you are
 trusting (and what to double-check), read `security-and-trust.md`; the full
 engineering invariant list is `../ARCHITECTURE.md` §3.

@@ -16,59 +16,7 @@ structural contract, not any mathematical judgement.
 
 import pytest
 
-
-def validate_verification_output(payload):
-    """Return the payload if it satisfies the final JSON contract, else raise.
-
-    Rules (the strict verdict rule, in schema form):
-      - `verdict` is exactly "correct" or "wrong".
-      - every entry of `critical_errors` / `gaps` has both `location` and `issue`.
-      - `verdict == "correct"` iff both lists are empty.
-      - `repair_hints` is non-empty iff `verdict == "wrong"` ("" when "correct").
-    """
-    if not isinstance(payload, dict):
-        raise ValueError("payload must be a dict")
-
-    report = payload.get("verification_report")
-    if not isinstance(report, dict):
-        raise ValueError("verification_report must be a dict")
-    if not isinstance(report.get("summary"), str):
-        raise ValueError("verification_report.summary must be a string")
-
-    for key in ("critical_errors", "gaps"):
-        findings = report.get(key)
-        if not isinstance(findings, list):
-            raise ValueError(f"verification_report.{key} must be a list")
-        for finding in findings:
-            if not isinstance(finding, dict):
-                raise ValueError(f"each {key} entry must be a dict")
-            if not finding.get("location") or not isinstance(finding["location"], str):
-                raise ValueError(f"each {key} entry needs a non-empty string location")
-            if not finding.get("issue") or not isinstance(finding["issue"], str):
-                raise ValueError(f"each {key} entry needs a non-empty string issue")
-
-    verdict = payload.get("verdict")
-    if verdict not in ("correct", "wrong"):
-        raise ValueError('verdict must be "correct" or "wrong"')
-
-    repair_hints = payload.get("repair_hints")
-    if not isinstance(repair_hints, str):
-        raise ValueError("repair_hints must be a string")
-
-    clean = not report["critical_errors"] and not report["gaps"]
-    # Strict verdict rule: correct iff zero critical_errors AND zero gaps.
-    if clean and verdict != "correct":
-        raise ValueError("no findings but verdict is not correct")
-    if not clean and verdict != "wrong":
-        raise ValueError("findings present but verdict is not wrong")
-
-    # repair_hints non-empty iff wrong.
-    if verdict == "correct" and repair_hints != "":
-        raise ValueError('verdict "correct" requires empty repair_hints')
-    if verdict == "wrong" and not repair_hints.strip():
-        raise ValueError('verdict "wrong" requires non-empty repair_hints')
-
-    return payload
+from danus.core import validate_verification_output
 
 
 def test_accept_clean_proof():
@@ -156,6 +104,39 @@ def test_reject_on_gap_alone():
             "verification_report": {
                 "summary": "x",
                 "critical_errors": [{"location": "L1"}],
+                "gaps": [],
+            },
+            "verdict": "wrong",
+            "repair_hints": "fix it",
+        },
+        # misplaced findings cannot hide behind an otherwise-clean report
+        {
+            "verification_report": {
+                "summary": "x",
+                "critical_errors": [],
+                "gaps": [],
+            },
+            "errors": [{"location": "L1", "issue": "bad"}],
+            "verdict": "correct",
+            "repair_hints": "",
+        },
+        {
+            "verification_report": {
+                "summary": "x",
+                "critical_errors": [],
+                "gaps": [],
+                "errors": [{"location": "L1", "issue": "bad"}],
+            },
+            "verdict": "correct",
+            "repair_hints": "",
+        },
+        # findings themselves are exact-shape objects
+        {
+            "verification_report": {
+                "summary": "x",
+                "critical_errors": [
+                    {"location": "L1", "issue": "bad", "severity": "critical"}
+                ],
                 "gaps": [],
             },
             "verdict": "wrong",

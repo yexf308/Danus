@@ -1,6 +1,6 @@
 ---
 name: verify-proof
-description: Verify a result and, on acceptance, write it as a fact — via the fact_submit tool. Use for the full target theorem AND for every sharply-delimited intermediate result, lemma, construction, or formula you intend to build on. The verifier is the sole authority on mathematical correctness.
+description: Verify a result and, on acceptance, attempt its locked fact-graph write via fact_submit. Use for the full target theorem AND for every sharply-delimited intermediate result, lemma, construction, or formula you intend to build on. The verifier is the sole authority on mathematical correctness.
 ---
 
 # Verify Proof
@@ -11,8 +11,9 @@ proof assistant, it is the strongest correctness check in the system. No LLM
 consultation, panel, or self-critique substitutes for it.
 
 **You verify and write a fact through one tool: `fact_submit`.** It runs the
-glossary-coverage check, calls the verifier, and writes the fact to the fact graph
-**iff the verifier accepts** — there is no other way a fact enters the graph.
+glossary-coverage check, calls the verifier, and, after acceptance, attempts a
+locked context-CAS/add. A stale context returns `write_error` without a write;
+there is no other way a fact enters the graph.
 
 ## When to submit
 
@@ -42,25 +43,29 @@ pipeline); here, only mechanical correctness matters.
 
 Concretely, before you submit:
 
-- **Self-contained.** A reader using only this fact + its declared predecessors +
-  the project glossary can decide whether the math is correct. No appeal to chart
+- **Self-contained.** A reader using only this fact + its declared predecessors
+  can decide whether the math is correct. The project glossary helps discover a
+  definition source but is not itself an uncited premise. No appeal to chart
   positions, parse status, project history, or "as we know".
 - **Define every symbol.** Each symbol used in the statement/proof is defined: in
-  this fact's `glossary_introduces`, in a cited predecessor's glossary, in the
-  project glossary, or in the **global glossary** of universal notation (Z, Q, R,
+  this fact's `glossary_introduces`, in a cited predecessor's glossary, or in the
+  **global glossary** of universal notation (Z, Q, R,
   C, floor/ceil, gcd/lcm, intervals, Greek parameter names). Don't redefine
   universal notation — `glossary_introduces` is for project-specific symbols only.
-  Reuse the project's existing symbol for the same object. `fact_submit` returns
-  `undefined_symbols` if you missed one.
+  Reuse the project's existing symbol for the same object and cite a direct
+  active fact that introduced its exact project definition. The project glossary
+  is discovery-only and is not sent as an implicit verifier premise;
+  `undefined_symbols` is an advisory coverage warning, not a correctness gate.
 - **Cite every dependency by `fact_id`** — never "by the result above", never the
   problem statement as a math source.
 - **Every quantifier explicit; every introduced parameter (epsilon, k, …) carries
   an explicit range.**
 - **No handwave** ("obviously", "easy to see", "routine", "analogously",
   "by some classical argument") and **no chart-position references** ("as above").
-- **Avoid duplicates.** `gm_search` the fact graph / global memory (or read
-  `fact_graph/facts/`) for an existing fact with the same statement; if one
-  exists, cite its `fact_id` instead of re-proving it.
+- **Avoid duplicates.** Use `fact_search` for full-text discovery with statement-only results and
+  `fact_context` for explicit relevant ids; search global memory with `gm_search`.
+  If a verified fact already has the needed statement, cite its `fact_id` instead
+  of re-proving it.
 
 ## Submit and repair
 
@@ -90,5 +95,7 @@ for ideas and directions, never for correctness.
 ## Tools
 
 - `fact_submit` (the only path to verify a result and write a fact)
-- `gm_search` (check for an existing fact before submitting; read others' verification outcomes)
-- the fact graph is read directly (`fact_graph/facts/`, `glossary.json`)
+- `fact_search` (full-text discovery returning statement summaries before proving)
+- `fact_context` (explicit-id statements/definitions/edges; proofs only when
+  intentionally requested for inspection)
+- `gm_search` (read others' findings and verification outcomes)

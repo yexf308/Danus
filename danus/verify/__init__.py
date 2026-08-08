@@ -1,4 +1,4 @@
-"""danus.verify — the cold-start proof-verifier HTTP service (the sole write-gate).
+"""danus.verify — the cold-start mathematical authority behind the write-gate.
 
 ``service.app`` is the FastAPI app (POST /verify, GET /health). Run as
 ``python -m danus.verify`` (or ``uvicorn danus.verify.service:app``).

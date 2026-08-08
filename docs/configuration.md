@@ -78,6 +78,11 @@ defaults apply everywhere; per-service overrides win.
 | `VERIFY_PORT` | `8091` | verify service (`127.0.0.1`) |
 | `DASHBOARD_PORT` | `8099` | read-only dashboard (`127.0.0.1`) |
 | `DANUS_VERIFY_URL` | `http://127.0.0.1:8091/verify` | where `fact_submit` posts |
+| `DANUS_VERIFY_CONTEXT_MAX_CHARS` | `200000` | maximum complete predecessor-card plus selected-glossary context; overflow blocks submission before verification |
+| `DANUS_VERIFY_MAX_PROMPT_BYTES` | `200000` | maximum final UTF-8 verifier prompt (candidate + escaped context + envelope); overflow returns 413 before Codex starts |
+| `DANUS_VERIFY_MAX_REQUEST_BYTES` | `1000000` | maximum `/verify` request-body bytes, enforced before JSON model parsing |
+| `DANUS_VERIFY_BODY_TIMEOUT_SECONDS` | `10` | total request-body upload deadline before HTTP 408 |
+| `DANUS_VERIFY_MAX_CONCURRENT_REQUESTS` | `1` | pre-parse verifier admission slots; excess requests get HTTP 429 |
 | `VERIFY_HOST` | `127.0.0.1` | verify bind host (keep loopback — see security doc) |
 
 ## Runtime data locations (gitignored, under `runtime/`)
@@ -86,6 +91,8 @@ defaults apply everywhere; per-service overrides win.
 |---|---|---|
 | `DANUS_RUNTIME` | `<repo>/runtime` | the whole self-contained runtime |
 | `DANUS_AGENTS_ROOT` | `runtime/projects` | where `danus new` puts projects |
+| `DANUS_STATE_DIR` | `$XDG_STATE_HOME/danus`, else `~/.local/state/danus` outside repo wrappers | writable packaged-verifier resources and default run state |
+| `VERIFY_AGENT_HOME` | `<DANUS_STATE_DIR>/verify/agent-<resource-digest>` | materialized packaged verifier contract and skills |
 | `VERIFIER_RESULTS_DIR` | `runtime/verify-runs` | per-verification run logs |
 | `DANUS_PY` | `runtime/venv/bin/python` (else system `python3`) | the engine's Python |
 

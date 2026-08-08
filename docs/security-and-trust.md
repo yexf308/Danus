@@ -15,9 +15,11 @@ Consequences you must internalize:
 
 - A `correct` verdict is a **strong LLM judgment**, not a machine-checked proof. It
   is far better than an unchecked draft, but it can be wrong.
-- The verdict rule (`correct` ⟺ no critical errors **and** no gaps) is produced by
-  the verifier agent and returned **verbatim**; the service does **not** re-derive
-  it. Trust flows from the verifier prompt + skills being correct.
+- The mathematical findings are produced by the verifier agent. Production code
+  then enforces the structural rule (`correct` ⟺ no critical errors **and** no
+  gaps), rejects malformed/self-contradictory output, and requires a server-side
+  context-digest attestation. These checks cannot prove the mathematics; trust
+  still ultimately flows from the verifier's reasoning.
 - For a **high-stakes** result (a headline theorem you intend to publish or act on),
   **have a qualified human review it.** The write-paper pipeline re-checks the whole
   paper as written through a dedicated paper-math verifier, which raises confidence —
@@ -39,8 +41,8 @@ The role table (`danus/gateway/roles.py`):
 
 | role | tools it can see |
 |---|---|
-| **worker** | `gm_add`, `gm_search`, `fact_submit`, `fact_search`, `search_arxiv_theorems` |
-| **main** (the orchestrator) | `gm_add`, `gm_search`, `fact_search`, `fact_revoke`, `search_arxiv_theorems` — **no `fact_submit`** |
+| **worker** | `gm_add`, `gm_search`, `fact_submit`, `fact_search`, `fact_context`, `search_arxiv_theorems` |
+| **main** (the orchestrator) | `gm_add`, `gm_search`, `fact_search`, `fact_context`, `fact_revoke`, `search_arxiv_theorems` — **no `fact_submit`** |
 | **verifier** | `search_arxiv_theorems` **only** (read-only) |
 
 Load-bearing separations:
@@ -58,28 +60,41 @@ Load-bearing separations:
 The single path a fact enters truth is a worker's `fact_submit`, which is a
 state machine, not a suggestion:
 
-1. call the verify service with the statement + proof;
-2. **write the fact iff the verdict is `correct`** — the gate is this one code path;
-3. **always** trace the verdict to global memory (accept, reject, or write-failed),
-   so the verifier can stay stateless and no verdict is lost.
+1. lazily load full cards for the declared direct predecessors, every inherited
+   fact-local definition, immutable global definitions, and a digest/count
+   commitment to the core-validated transitive closure (never predecessor proofs,
+   ancestor statements, the closure edge skeleton, or implicit project-glossary
+   entries), and block missing, revoked, incomplete, or over-budget context;
+2. call the verify service with the statement, proof, and complete authoritative
+   fact context; both context and returned verdict are checked by deterministic
+   schemas, not only prompts, and the service must attest the context digest;
+3. after verification, rebuild the context snapshot under the graph's
+   cross-process mutation lock;
+4. only after a `correct` verdict and unchanged locked snapshot, attempt the fact
+   add; revoke uses the same lock, closing add/revoke races, while storage errors
+   remain explicit accept-but-write-failed outcomes;
+5. durably attempt to trace an actual verdict to global memory (accept, reject,
+   or write-failed). A trace I/O failure is returned explicitly as `trace_error`
+   without hiding an already-written fact id.
 
 If the verify service is unreachable, `fact_submit` returns a clean error and
 writes nothing — nothing is silently accepted.
 
-## 4. The verifier runs with the sandbox bypassed — trust its home and isolate the host
+## 4. The verifier is read-only and ephemeral — still isolate readable secrets
 
-The worker and verifier `codex` sessions are launched with
-`--dangerously-bypass-approvals-and-sandbox`. This is required for autonomous
-operation, and it means Danus's host-level safety rests on two assumptions you must
-uphold:
+The verifier uses a read-only shell sandbox, an ephemeral session, no user
+config/rules, stdin prompt transport, and a schema-constrained CLI output file.
+Worker execution remains separately configured and may be more permissive. Danus's
+host-level safety still rests on two assumptions you must uphold:
 
 - **The agent home is trusted.** The verifier runs inside a fixed `AGENT_HOME`
   (its contract + skills). Treat that directory — and the worker/verifier prompts and
   skills — as **trusted code**: a malicious or tampered prompt/skill could act with
   the privileges of the process.
-- **The host is isolated / disposable.** Run Danus on a host you are willing to let
-  autonomous agents operate on (a dedicated VM/container/pod), not your workstation
-  with access to unrelated data.
+- **The host is isolated / disposable.** A read-only Codex sandbox prevents model
+  writes, not reads of every host path. Run adversarial verification and autonomous
+  workers on a dedicated VM/container/pod or low-privilege account without unrelated
+  readable secrets, not a workstation holding sensitive data.
 
 ## 5. Network exposure: loopback by default
 

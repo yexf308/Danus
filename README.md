@@ -10,8 +10,9 @@
 
 Danus orchestrates mathematical reasoning agents with fact-graph memory. A main
 agent (Claude Code) steers a swarm of autonomous codex workers that prove; a
-cold-start verifier is the sole authority on correctness: a result becomes real
-only once it passes. Verified results accumulate in a content-addressed fact
+cold-start verifier is the sole authority on correctness. A `correct` verdict is
+necessary, and the gateway then atomically rechecks the verified context and adds
+the fact; a stale or unavailable snapshot returns a write error instead. Verified results accumulate in a content-addressed fact
 graph — the system's only source of truth — and a strategy loop (a strong
 reasoning model) decomposes the problem and steers the swarm. When you have the
 answer, Danus renders it into a human report or a publishable LaTeX paper.
@@ -35,6 +36,16 @@ global planning and coordination, the workers carry out the detailed proof
 search, the verifier is the sole authority on correctness, and the fact graph
 holds every verified result and is the system's only source of truth.
 
+For large graphs, agents do not inject the graph wholesale. They discover facts
+through full-text search that returns statement-only summaries, then hydrate only
+explicit ids. Verification carries full cards only for direct predecessors, all
+inherited fact-local and immutable global definitions, and a digest/count
+commitment to the machine-checked full dependency closure. Ancestor statements,
+proofs, and the edge skeleton stay out of the model prompt, and the verifier never
+reads project fact files directly.
+The mutable project glossary is a discovery index only; it is never injected as
+an implicit verifier premise.
+
 Each kind of agent carries out its role through its own skills and its own
 role-gated set of tools, so the separation is enforced by construction, not by
 prompts: the main agent has no `fact_submit` (the agent that steers the search
@@ -49,9 +60,10 @@ Every claim enters truth through one cycle:
 
 A worker typically focuses on one claim at a time — a lemma, a counterexample, a
 toy example — rather than an entire proof. It repeatedly submits the claim with a
-supporting proof and revises it under the verifier's feedback until it passes, at
-which point the claim enters the fact graph as a fact, with the facts its proof
-depends on as its incoming edges. The verifier is stateless: a fresh instance
+supporting proof and revises it under the verifier's feedback until it passes. The
+gateway then rechecks the exact context under the graph lock and, if still current,
+adds the claim as a fact with the facts its proof depends on as incoming edges.
+The verifier is stateless: a fresh instance
 judges each submission and retains nothing afterwards. Because each worker draws
 on only the facts it needs for its current claim and submits one fact at a time,
 the working context stays small even as the proof grows to many pages — and many
@@ -73,7 +85,7 @@ bounds.
 danus/                 the engine (installable Python package)
   core/                truth layer: content-addressed fact graph + typed memory + schema
   gateway/             role-gated MCP server — the only door to the truth stores
-  verify/              cold-start proof-verifier HTTP service (the sole write-gate)
+  verify/              cold-start mathematical authority behind the write-gate
   execution/           worker swarm: the autonomous per-worker round loop + scaffolding
   orchestration/       the `danus` CLI verbs (list/new/assign/start/status/stop)
   strategy/            consult gateway (elaboration → strong model → master_guidance)
@@ -136,7 +148,8 @@ transport (paid), `claude_api` (the Anthropic API, per-token), or `claude_code`
   is truth; global memory is awareness.
 - Permission is enforced by the MCP role table (main cannot `fact_submit`; the
   verifier is read-only).
-- Content-addressed, cascade-revocable facts; the verifier is the sole write-gate.
+- Content-addressed, cascade-revocable facts; a correct verdict plus the gateway's
+  locked context-CAS/add is the sole write path.
 - The finished paper is itself re-verified as written (a dedicated paper-math
   verifier reads the whole document) before delivery, on top of the per-fact
   verification.

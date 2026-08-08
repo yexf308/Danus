@@ -9,6 +9,7 @@ Runs standalone (``python -m danus.gateway.tests.test_gateway``) and under pytes
 
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 from contextlib import contextmanager
@@ -39,15 +40,26 @@ def _env(**kv):
 
 
 @contextmanager
-def _mock_verify(verdict, repair_hints="", raise_exc=None):
+def _mock_verify(verdict, repair_hints="", raise_exc=None, capture=None):
     """Replace server._verify with a stub; restore after."""
     orig = server._verify
 
-    def fake(statement, proof):
+    def fake(statement, proof, fact_context=None, glossary_introduces=None):
+        if capture is not None:
+            capture.update({
+                "statement": statement, "proof": proof, "fact_context": fact_context,
+                "glossary_introduces": glossary_introduces,
+            })
         if raise_exc is not None:
             raise raise_exc
+        findings = [] if verdict == "correct" else [
+            {"location": "proof", "issue": "mock rejection"}
+        ]
         return {"verdict": verdict, "repair_hints": repair_hints,
-                "verification_report": {"summary": "mock"}}
+                "verification_context_digest": fact_context["digest"],
+                "verification_report": {
+                    "summary": "mock", "critical_errors": [], "gaps": findings,
+                }}
 
     server._verify = fake
     try:
@@ -60,13 +72,17 @@ def test_role_table():
     # main can never fabricate a fact
     assert "fact_submit" not in tools_for("main")
     assert "fact_revoke" in tools_for("main")
+    assert "fact_context" in tools_for("main")
     # verifier is read-only: literature lookup ONLY
     assert tools_for("verifier") == ["search_arxiv_theorems"]
     # worker is the only role that can submit a fact
     assert "fact_submit" in tools_for("worker")
-    # all three get the read view + literature grounding
+    # all three get literature grounding; worker/main get lazy fact context.
     for r in ("worker", "main", "verifier"):
         assert "search_arxiv_theorems" in tools_for(r)
+    for r in ("worker", "main"):
+        assert "fact_context" in tools_for(r)
+    assert "fact_context" not in tools_for("verifier")
     # unknown / misconfigured role fails CLOSED to the read-only verifier set
     assert tools_for("nope") == tools_for("verifier")
     assert "fact_submit" not in tools_for("nope") and "gm_add" not in tools_for("nope")
@@ -87,13 +103,38 @@ def test_gm_and_fact_search_over_temp_project():
         assert server.fact_search("anything")["results"] == []
 
 
+def test_fact_context_gateway_defaults_to_summary_only():
+    with tempfile.TemporaryDirectory() as d, _env(
+        DANUS_PROJECT_DIR=d, DANUS_AGENTS_ROOT=None, DANUS_AUTHOR="tester"
+    ):
+        fg = FactGraph(Path(d))
+        base = fg.add(problem_id="P", author="w", statement="Base", proof="proof base")
+        child = fg.add(problem_id="P", author="w", statement="Child", proof="proof child",
+                       predecessors=[base])
+        out = server.fact_context([child])
+        assert out["facts"] == [{
+            "fact_id": child, "statement": "Child", "predecessors": [base],
+            "glossary_introduces": {},
+        }]
+        selected = server.fact_context(
+            [child], predecessor_depth=None, proof_mode="selected"
+        )
+        assert selected["facts"][0]["proof"] == "proof child"
+        assert "proof" not in selected["facts"][1]
+
+
 def test_fact_submit_accept_writes_fact_and_traces():
+    captured = {}
     with tempfile.TemporaryDirectory() as d, _env(
         DANUS_PROJECT_DIR=d, DANUS_AGENTS_ROOT=None, DANUS_AUTHOR="worker_high",
         DANUS_VERIFY_URL="http://mock", DANUS_PROBLEM_ID="P",
-    ), _mock_verify("correct"):
+    ), _mock_verify("correct", capture=captured):
         res = server.fact_submit(statement="S(n)=n^2", proof="induction; QED")
         assert res["accepted"] is True and res["fact_id"]
+        # An empty predecessor list still sends an explicit complete empty context.
+        assert captured["fact_context"]["facts"] == []
+        assert captured["fact_context"]["complete"] is True
+        assert captured["fact_context"]["truncated"] is False
         # the fact really landed in the graph
         fg = FactGraph(Path(d))
         assert fg.exists(res["fact_id"])
@@ -117,6 +158,32 @@ def test_fact_submit_reject_writes_nothing_but_traces():
         assert gm.read("verification")[-1]["verdict"] == "wrong"  # but traced
 
 
+def test_fact_submit_returns_written_fact_when_trace_append_fails():
+    original_append = GlobalMemory.append
+
+    def fail_trace(self, *args, **kwargs):
+        raise OSError("injected verification trace failure")
+
+    GlobalMemory.append = fail_trace
+    try:
+        with tempfile.TemporaryDirectory() as d, _env(
+            DANUS_PROJECT_DIR=d,
+            DANUS_AGENTS_ROOT=None,
+            DANUS_AUTHOR="worker_high",
+            DANUS_VERIFY_URL="http://mock",
+            DANUS_PROBLEM_ID="P",
+        ), _mock_verify("correct"):
+            result = server.fact_submit(
+                statement="A durable accepted statement",
+                proof="A complete durable proof for this accepted statement.",
+            )
+            assert result["accepted"] is True and result["fact_id"]
+            assert "injected verification trace failure" in result["trace_error"]
+            assert FactGraph(Path(d)).exists(result["fact_id"])
+    finally:
+        GlobalMemory.append = original_append
+
+
 def test_fact_submit_verify_error_is_clean():
     with tempfile.TemporaryDirectory() as d, _env(
         DANUS_PROJECT_DIR=d, DANUS_AGENTS_ROOT=None, DANUS_AUTHOR="w",
@@ -127,19 +194,190 @@ def test_fact_submit_verify_error_is_clean():
         assert "service down" in res["error"]
 
 
-def test_fact_submit_accept_but_write_failed_still_traces():
-    # a revoked predecessor makes FactGraph.add raise; the verdict is still traced
+def test_fact_submit_sends_direct_cards_and_ancestor_definitions_only():
+    captured = {}
     with tempfile.TemporaryDirectory() as d, _env(
         DANUS_PROJECT_DIR=d, DANUS_AGENTS_ROOT=None, DANUS_AUTHOR="worker_high",
         DANUS_VERIFY_URL="http://mock", DANUS_PROBLEM_ID="P",
-    ), _mock_verify("correct"):
+    ), _mock_verify("correct", capture=captured):
         fg = FactGraph(Path(d))
-        base = fg.add(problem_id="P", author="w", statement="A holds", proof="pf A")
-        fg.revoke(base, reason="A was wrong")
-        res = server.fact_submit(statement="B from A", proof="uses A", predecessors=[base])
-        assert res["accepted"] is True and res["fact_id"] is None and res["write_error"]
-        # verdict:correct is STILL traced even though the write failed
-        assert GlobalMemory(Path(d)).read("verification")[-1]["verdict"] == "correct"
+        base = fg.add(
+            problem_id="P",
+            author="w",
+            statement="A holds",
+            proof="pf A",
+            glossary_introduces={"A": "the base assertion"},
+        )
+        direct = fg.add(problem_id="P", author="w", statement="B from A", proof="pf B",
+                        predecessors=[base])
+        res = server.fact_submit(
+            statement="C from B",
+            proof=f"uses verified fact {direct}",
+            predecessors=[direct],
+            glossary_introduces={"C_result": "the downstream conclusion"},
+        )
+        assert res["accepted"] is True and res["fact_id"]
+        facts = captured["fact_context"]["facts"]
+        assert [item["fact_id"] for item in facts] == [direct]
+        assert all("proof" not in item for item in facts)
+        assert "A holds" not in json.dumps(captured["fact_context"])
+        assert captured["fact_context"]["ancestor_definitions"] == [{
+            "term": "A",
+            "definition": "the base assertion",
+            "source_fact_id": base,
+        }]
+        assert captured["fact_context"]["dependency_closure"]["count"] == 2
+        assert captured["fact_context"]["dependency_closure"]["digest"].startswith(
+            "sha256:"
+        )
+        assert captured["fact_context"]["scope"]["proof_mode"] == "none"
+        assert captured["fact_context"]["complete"] is True
+        assert captured["glossary_introduces"] == {
+            "C_result": "the downstream conclusion"
+        }
+
+
+def test_fact_submit_lazily_snapshots_project_glossary():
+    captured = {}
+    with tempfile.TemporaryDirectory() as d, _env(
+        DANUS_PROJECT_DIR=d, DANUS_AGENTS_ROOT=None, DANUS_AUTHOR="worker_high",
+        DANUS_VERIFY_URL="http://mock", DANUS_PROBLEM_ID="P",
+    ), _mock_verify("correct", capture=captured):
+        fg = FactGraph(Path(d))
+        source = fg.add(
+            problem_id="P",
+            author="w",
+            statement="Definition source",
+            proof="definition proof",
+            glossary_introduces={"Q_X": "a distinguished project object"},
+        )
+        result = server.fact_submit(
+            statement="Q_X has the required property",
+            proof="By the defining property of Q_X, the conclusion follows.",
+            predecessors=[source],
+        )
+        assert result["accepted"] is True
+        context = captured["fact_context"]
+        assert [fact["fact_id"] for fact in context["facts"]] == [source]
+        assert context["facts"][0]["glossary_introduces"] == {
+            "Q_X": "a distinguished project object"
+        }
+        assert "Q_X" not in context["glossary"]
+        assert context["omitted_glossary_terms"] == []
+
+
+def test_fact_submit_never_sends_implicit_project_glossary_to_verifier():
+    captured = {}
+    with tempfile.TemporaryDirectory() as d, _env(
+        DANUS_PROJECT_DIR=d, DANUS_AGENTS_ROOT=None, DANUS_AUTHOR="worker_high",
+        DANUS_VERIFY_URL="http://mock", DANUS_PROBLEM_ID="P",
+    ), _mock_verify("correct", capture=captured):
+        FactGraph(Path(d)).add(
+            problem_id="P", author="w", statement="Definition source",
+            proof="definition proof", glossary_introduces={"Q_Y": "a project object"},
+        )
+        result = server.fact_submit(
+            statement="Q_Y has the required property",
+            proof="Use the definition of Q_Y.",
+        )
+        assert result["accepted"] is True
+        assert captured["fact_context"]["facts"] == []
+        assert "Q_Y" not in captured["fact_context"]["glossary"]
+        assert captured["fact_context"]["scope"]["include_project_glossary"] is False
+
+
+def test_fact_submit_rechecks_project_glossary_after_verification():
+    with tempfile.TemporaryDirectory() as d, _env(
+        DANUS_PROJECT_DIR=d, DANUS_AGENTS_ROOT=None, DANUS_AUTHOR="w",
+        DANUS_VERIFY_URL="http://mock", DANUS_PROBLEM_ID="P",
+    ):
+        original = server._verify
+
+        def change_glossary_during_verify(
+            statement, proof, fact_context=None, glossary_introduces=None
+        ):
+            FactGraph(Path(d)).add(
+                problem_id="P", author="other", statement="New definition", proof="proof",
+                glossary_introduces={"Q_X": "a newly available project object"},
+            )
+            return {
+                "verdict": "correct",
+                "repair_hints": "",
+                "verification_context_digest": fact_context["digest"],
+                "verification_report": {
+                    "summary": "mock", "critical_errors": [], "gaps": [],
+                },
+            }
+
+        server._verify = change_glossary_during_verify
+        try:
+            result = server.fact_submit(
+                statement="Q_X has the required property",
+                proof="Use the defining property of Q_X.",
+            )
+        finally:
+            server._verify = original
+        assert result["accepted"] is True and result["fact_id"] is not None
+        assert "write_error" not in result
+
+
+def test_fact_submit_blocks_missing_and_revoked_before_verify():
+    calls = {"count": 0}
+
+    def must_not_verify(statement, proof, fact_context=None, glossary_introduces=None):
+        calls["count"] += 1
+        raise AssertionError("verifier must not be called")
+
+    with tempfile.TemporaryDirectory() as d, _env(
+        DANUS_PROJECT_DIR=d, DANUS_AGENTS_ROOT=None, DANUS_AUTHOR="worker_high",
+        DANUS_VERIFY_URL="http://mock", DANUS_PROBLEM_ID="P",
+    ):
+        fg = FactGraph(Path(d))
+        revoked = fg.add(problem_id="P", author="w", statement="A", proof="pf A")
+        fg.revoke(revoked, reason="wrong")
+        removed = fg.add(problem_id="P", author="w", statement="Removed", proof="pf")
+        dangling = fg.add(problem_id="P", author="w", statement="Dangling",
+                          proof="uses missing", predecessors=[removed])
+        (fg.facts_dir / f"{removed}.md").unlink()
+        original = server._verify
+        server._verify = must_not_verify
+        try:
+            missing = server.fact_submit("B", "proof B", predecessors=[dangling])
+            blocked = server.fact_submit("C", "proof C", predecessors=[revoked])
+        finally:
+            server._verify = original
+        assert missing["accepted"] is False and missing["verdict"] == "error"
+        assert f"missing predecessor fact_ids: {removed}" in missing["error"]
+        assert blocked["accepted"] is False and blocked["verdict"] == "error"
+        assert f"revoked predecessor fact_ids: {revoked}" in blocked["error"]
+        assert calls["count"] == 0
+        assert fg.list() == [dangling]
+        assert GlobalMemory(Path(d)).read("verification") == []
+
+
+def test_fact_submit_blocks_budget_omission_before_verify():
+    calls = {"count": 0}
+
+    def must_not_verify(statement, proof, fact_context=None, glossary_introduces=None):
+        calls["count"] += 1
+        raise AssertionError("verifier must not be called")
+
+    with tempfile.TemporaryDirectory() as d, _env(
+        DANUS_PROJECT_DIR=d, DANUS_AGENTS_ROOT=None, DANUS_AUTHOR="worker_high",
+        DANUS_VERIFY_URL="http://mock", DANUS_PROBLEM_ID="P",
+        DANUS_VERIFY_CONTEXT_MAX_CHARS="1",
+    ):
+        fg = FactGraph(Path(d))
+        base = fg.add(problem_id="P", author="w", statement="A", proof="full proof A")
+        original = server._verify
+        server._verify = must_not_verify
+        try:
+            res = server.fact_submit("B", "proof B", predecessors=[base])
+        finally:
+            server._verify = original
+        assert res["accepted"] is False and res["verdict"] == "error"
+        assert "exceeds character budget 1" in res["error"] and base in res["error"]
+        assert calls["count"] == 0 and fg.list() == [base]
 
 
 def test_fact_submit_glossary_check_never_blocks():
@@ -168,7 +406,7 @@ def test_fact_submit_nondict_verify_body_is_clean():
         DANUS_VERIFY_URL="http://mock", DANUS_PROBLEM_ID="P",
     ):
         orig = server._verify
-        server._verify = lambda statement, proof: ["not", "a", "dict"]
+        server._verify = lambda statement, proof, fact_context=None, glossary_introduces=None: ["not", "a", "dict"]
         try:
             res = server.fact_submit(statement="s", proof="p")
             assert res["accepted"] is False and res["verdict"] == "error"
@@ -176,6 +414,104 @@ def test_fact_submit_nondict_verify_body_is_clean():
             assert FactGraph(Path(d)).list() == []  # nothing written
         finally:
             server._verify = orig
+
+
+def test_fact_submit_invalid_or_inconsistent_verdict_never_writes():
+    invalid_payloads = [
+        {"verdict": "maybe", "verification_report": {}, "repair_hints": ""},
+        {
+            "verdict": "correct",
+            "verification_report": {
+                "summary": "has gap", "critical_errors": [],
+                "gaps": [{"location": "proof", "issue": "missing step"}],
+            },
+            "repair_hints": "",
+        },
+    ]
+    with tempfile.TemporaryDirectory() as d, _env(
+        DANUS_PROJECT_DIR=d, DANUS_AGENTS_ROOT=None, DANUS_AUTHOR="w",
+        DANUS_VERIFY_URL="http://mock", DANUS_PROBLEM_ID="P",
+    ):
+        original = server._verify
+        try:
+            for payload in invalid_payloads:
+                server._verify = lambda statement, proof, fact_context=None, glossary_introduces=None, p=payload: {
+                    **p,
+                    "verification_context_digest": fact_context["digest"],
+                }
+                result = server.fact_submit(statement="s", proof="a complete proof")
+                assert result["accepted"] is False and result["verdict"] == "error"
+                assert "invalid verdict payload" in result["error"]
+        finally:
+            server._verify = original
+        assert FactGraph(Path(d)).list() == []
+        assert GlobalMemory(Path(d)).read("verification") == []
+
+
+def test_fact_submit_rejects_old_service_without_context_attestation():
+    """A rolling upgrade must not let an old service silently drop context."""
+    with tempfile.TemporaryDirectory() as d, _env(
+        DANUS_PROJECT_DIR=d, DANUS_AGENTS_ROOT=None, DANUS_AUTHOR="w",
+        DANUS_VERIFY_URL="http://mock", DANUS_PROBLEM_ID="P",
+    ):
+        original = server._verify
+        server._verify = lambda statement, proof, fact_context=None, glossary_introduces=None: {
+            "verdict": "correct",
+            "repair_hints": "",
+            "verification_report": {
+                "summary": "legacy response", "critical_errors": [], "gaps": [],
+            },
+        }
+        try:
+            result = server.fact_submit(statement="s", proof="a complete proof")
+        finally:
+            server._verify = original
+        assert result["accepted"] is False and result["verdict"] == "error"
+        assert "did not attest" in result["error"]
+        assert FactGraph(Path(d)).list() == []
+        assert GlobalMemory(Path(d)).read("verification") == []
+
+
+def test_fact_submit_rechecks_context_after_verification_before_write():
+    with tempfile.TemporaryDirectory() as d, _env(
+        DANUS_PROJECT_DIR=d, DANUS_AGENTS_ROOT=None, DANUS_AUTHOR="w",
+        DANUS_VERIFY_URL="http://mock", DANUS_PROBLEM_ID="P",
+    ):
+        fg = FactGraph(Path(d))
+        predecessor = fg.add(
+            problem_id="P", author="w", statement="A holds", proof="proof A"
+        )
+        original = server._verify
+
+        def revoke_during_verify(
+            statement, proof, fact_context=None, glossary_introduces=None
+        ):
+            FactGraph(Path(d)).revoke(predecessor, reason="race test")
+            return {
+                "verdict": "correct",
+                "repair_hints": "",
+                "verification_context_digest": fact_context["digest"],
+                "verification_report": {
+                    "summary": "mock", "critical_errors": [], "gaps": [],
+                },
+            }
+
+        server._verify = revoke_during_verify
+        try:
+            result = server.fact_submit(
+                statement="B follows",
+                proof=f"use verified fact {predecessor}",
+                predecessors=[predecessor],
+            )
+        finally:
+            server._verify = original
+
+        assert result["accepted"] is True and result["fact_id"] is None
+        assert "verification_context_changed" in result["write_error"]
+        assert FactGraph(Path(d)).list() == []
+        trace = GlobalMemory(Path(d)).read("verification")[-1]
+        assert trace["verdict"] == "correct" and trace["write_error"]
+        assert trace["verification_context_digest"].startswith("sha256:")
 
 
 def test_role_env_default_and_build_app():
@@ -231,9 +567,17 @@ def test_verify_http_roundtrip_and_errors():
                 assert "DANUS_VERIFY_URL" in str(e)
         # a real POST round-trip; the body is the JSON we sent
         with _env(DANUS_VERIFY_URL=url, DANUS_VERIFY_TIMEOUT="5"):
-            out = server._verify("S(n)=n^2", "induction")
+            fact_context = {
+                "facts": [], "complete": True, "truncated": False,
+                "missing_fact_ids": [], "revoked_fact_ids": [],
+                "omitted_fact_ids": [], "characters_used": 0,
+                "character_budget": 200000,
+            }
+            out = server._verify("S(n)=n^2", "induction", fact_context=fact_context)
             assert out["verdict"] == "correct"
-        assert '"statement": "S(n)=n^2"' in captured["body"]
+        sent = json.loads(captured["body"])
+        assert sent["statement"] == "S(n)=n^2"
+        assert sent["fact_context"] == fact_context
         assert captured["ctype"] == "application/json"
         # a garbage timeout falls back to the default (no crash)
         with _env(DANUS_VERIFY_URL=url, DANUS_VERIFY_TIMEOUT="not-an-int"):
@@ -325,14 +669,20 @@ def main() -> None:
     print("  [ok] python -m danus.gateway builds app + calls run()")
     test_gm_and_fact_search_over_temp_project()
     print("  [ok] gm_add / gm_search / fact_search over a temp project")
+    test_fact_context_gateway_defaults_to_summary_only()
+    print("  [ok] fact_context default summary + explicit selected proof")
     test_fact_submit_accept_writes_fact_and_traces()
     print("  [ok] fact_submit accept -> writes fact + verification trace")
     test_fact_submit_reject_writes_nothing_but_traces()
     print("  [ok] fact_submit reject -> writes nothing, still traces")
     test_fact_submit_verify_error_is_clean()
     print("  [ok] fact_submit verify-error -> clean error, no verdict")
-    test_fact_submit_accept_but_write_failed_still_traces()
-    print("  [ok] fact_submit accept-but-write-failed -> fact_id None + write_error, still traces correct")
+    test_fact_submit_sends_direct_cards_and_ancestor_definitions_only()
+    print("  [ok] fact_submit sends statement/definition-only predecessor closure")
+    test_fact_submit_blocks_missing_and_revoked_before_verify()
+    print("  [ok] fact_submit blocks missing/revoked context before verifier")
+    test_fact_submit_blocks_budget_omission_before_verify()
+    print("  [ok] fact_submit blocks omitted context before verifier")
     test_fact_submit_glossary_check_never_blocks()
     print("  [ok] fact_submit glossary heuristic never blocks submission")
     test_fact_submit_nondict_verify_body_is_clean()

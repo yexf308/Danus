@@ -28,9 +28,11 @@ build only on facts (cite a `fact_id`).
   verification outcomes — read these to learn from siblings' rejections). **Global
   memory is awareness, never a brick.**
 - **fact graph (shared, verified truth).** The content-addressed DAG of
-  verifier-accepted facts. Read a fact directly (`fact_graph/facts/<id>.md`).
-  Write a fact **only** via **`fact_submit`**. **Cite a `fact_id`** whenever a
-  step depends on an established result.
+  verifier-accepted facts. Find candidates with full-text `fact_search` (which
+  returns statement-only summaries), then
+  read explicit ids with `fact_context` (proofs are opt-in). Write a fact **only**
+  via **`fact_submit`**. **Cite a `fact_id`** whenever a step depends on an
+  established result.
 
 ## TASK.md & master_guidance — read both first
 
@@ -163,8 +165,9 @@ After invoking a skill:
 ### Step 4: Verify and repair (the repair loop, via `fact_submit`)
 
 Verify every result you intend to build on. Submit it with `fact_submit` — it runs
-the glossary check, calls the verifier, writes the fact **iff accepted**, and
-**always records the verdict to global memory** (kind `verification`), so an
+the glossary check, calls the verifier, and after acceptance attempts the locked
+context-CAS/add. It records the verdict to global memory (kind `verification`) and
+returns an explicit `trace_error` if that audit append fails, so an
 outcome is never lost. The verifier is the sole authority on correctness; no
 peer/LLM opinion substitutes for it. Two edge cases to handle from the return
 value: `verdict="error"` means the verify service was unavailable — just retry;
@@ -205,13 +208,16 @@ to stop.** A hard open problem is not a stopping condition — do not give up.
 ## Writing discipline (so the shared stores stay readable)
 
 - **Define your symbols — uniformly.** Every symbol you use must be defined: in
-  this finding's/fact's glossary, in the project glossary, in a cited
-  predecessor, or in the **global glossary** of universal notation (Z, Q, R, C,
+  this finding's/fact's glossary, in a cited predecessor, or in the **global
+  glossary** of universal notation (Z, Q, R, C,
   floor/ceil, gcd/lcm, intervals, the Greek parameter names — see DATA_MODEL §3).
   Do **not** redefine universal notation; reserve `glossary_introduces` for
   project-specific symbols. Check the project glossary before naming something,
-  and reuse the same symbol for the same object as everyone else. `fact_submit`
-  flags undefined symbols; the fact graph is unreadable without this.
+  and reuse the same symbol for the same object as everyone else. When reusing a
+  project term, cite a direct active fact that introduced that exact definition;
+  the glossary alone is discovery, not a proof dependency and is not sent to the
+  verifier. `fact_submit` returns advisory undefined-symbol warnings; correctness
+  must not rely on that lexical heuristic.
 - **Evidence for verifiable findings.** A `conclusion`/`example`/`counterexample`/
   `proof_attempt` must carry an explicit proof or construction. Judgments
   (`plan`/`direction`/`obstacle`) are marked `verifiable=false`.
@@ -265,13 +271,16 @@ to stop.** A hard open problem is not a stopping condition — do not give up.
 - MCP: `gm_add` (publish a finding), `gm_search` (BM25 recall over findings),
   `fact_submit` (glossary-check + verify + write a fact; pass `external_refs` for
   any external results the proof cites), `fact_search` (BM25 over the verified fact
-  graph), `search_arxiv_theorems` (Matlas arXiv theorem search). Local
-  memory and all reads are direct file operations — no tool.
+  graph; statements only), `fact_context` (explicit-id statements/relations by
+  default; request `selected` or `all` proof hydration only when needed),
+  `search_arxiv_theorems` (Matlas arXiv theorem search). Local-memory reads remain
+  direct file operations.
 - **`fact_search` before you prove.** Before attempting a subgoal, `fact_search`
   the verified fact graph: if a fact like the one you need already exists, **cite
   its `fact_id` instead of re-proving it**; and use it to find the verified facts
-  your proof can build on. Returns `{fact_id, statement}` — read the full proof
-  from `fact_graph/facts/<fact_id>.md` on a relevant hit.
+  your proof can build on. It returns `{fact_id, statement}` only. Call
+  `fact_context` with explicit ids for relations/ancestors and request proofs
+  explicitly; never rely on a response whose `complete` metadata is false.
 - Plus the skills under `agents/skills/worker/` and codex built-ins.
 - Always call `search_arxiv_theorems` (Matlas arXiv theorem search)
   for nontrivial subgoals and key claims to ground reasoning in related literature. Use web search early to gather background

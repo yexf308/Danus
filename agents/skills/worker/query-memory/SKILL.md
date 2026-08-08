@@ -18,10 +18,9 @@ look, in the three-memory model:
    You can also read the `global_memory/<kind>.jsonl` files directly.
 3. **Fact graph** (verified truth): `fact_search(query)` (BM25 over the verified
    facts) to find results you can cite or that show your subgoal is already
-   proved — it returns `{fact_id, statement}`; read the full proof from
-   `fact_graph/facts/<fact_id>.md` on a relevant hit, and `fact_graph/glossary.json`
-   to reuse the project's symbol definitions. A proof may build **only** on facts
-   (cite a `fact_id`).
+   proved — it returns `{fact_id, statement}` only. Use `fact_context` with
+   explicit ids for relations or ancestors and explicitly select proof hydration
+   on a relevant hit. A proof may build **only** on facts (cite a `fact_id`).
 
 ## Procedure
 
@@ -55,5 +54,7 @@ re-publish others' findings; just use them.
 
 - `gm_search` (recall shared findings; BM25 over global memory)
 - `fact_search` (recall verified facts; BM25 over the fact graph — novelty + citation lookup)
-- local memory is read directly (no tool — read/grep the files); read a fact's full
-  proof from its `fact_graph/facts/<fact_id>.md` once `fact_search` surfaces it
+- `fact_context` (lazy explicit-id relations/ancestors; proofs only when requested;
+  require `complete=true` **and** check `scope.predecessor_depth`; pass `null` when
+  your use requires the full ancestor closure)
+- local memory is read directly (no tool — read/grep the files)

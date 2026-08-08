@@ -42,14 +42,15 @@ Notes:
 The gateway is **role-gated**: what a caller can see depends on `DANUS_ROLE`. The
 main agent runs as `role=main`.
 
-**The six tools** (a trailing `?` marks an optional argument):
+**The seven tools** (a trailing `?` marks an optional argument):
 
 | tool | args | what it does |
 |---|---|---|
 | `gm_add` | `kind, claim, evidence, verifiable?, glossary?, links?, project?` | publish a finding to shared global memory |
 | `gm_search` | `query, kinds?, limit_per_kind?, project?` | search global-memory findings |
-| `fact_submit` | `statement, proof, predecessors?, glossary_introduces?, intuition?, source_id?, external_refs?` | **the write-gate** — verify, then write the fact iff `correct`, always trace the verdict |
-| `fact_search` | `query, limit?, project?` | search the verified fact graph |
+| `fact_submit` | `statement, proof, predecessors?, glossary_introduces?, intuition?, source_id?, external_refs?` | **the write-gate** — after `correct`, recheck the exact context and add under the graph lock; stale context returns `write_error`; audit-trace failures never hide a written fact id |
+| `fact_search` | `query, limit?, project?` | full-text BM25 discovery whose result payload contains statement summaries only |
+| `fact_context` | `fact_ids, predecessor_depth?, proof_mode?, max_chars?, project?` | lazy explicit-id context; statements/relations by default, proofs opt-in, with completeness metadata |
 | `fact_revoke` | `fact_id, reason, project?` | cascade-revoke a fact + its dependents |
 | `search_arxiv_theorems` | `query, num_results?` | semantic search over arXiv theorem statements |
 
@@ -57,8 +58,8 @@ main agent runs as `role=main`.
 
 | role | tools |
 |---|---|
-| **worker** | `gm_add`, `gm_search`, `fact_submit`, `fact_search`, `search_arxiv_theorems` |
-| **main** | `gm_add`, `gm_search`, `fact_search`, `fact_revoke`, `search_arxiv_theorems` (**no `fact_submit`**) |
+| **worker** | `gm_add`, `gm_search`, `fact_submit`, `fact_search`, `fact_context`, `search_arxiv_theorems` |
+| **main** | `gm_add`, `gm_search`, `fact_search`, `fact_context`, `fact_revoke`, `search_arxiv_theorems` (**no `fact_submit`**) |
 | **verifier** (the fact-checking verifier behind `fact_submit`) | `search_arxiv_theorems` only (read-only) |
 
 The main agent thus **cannot write a fact** and **cannot** even see `fact_submit`;

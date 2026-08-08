@@ -7,11 +7,13 @@ logic scattered across the server.
 Invariants (load-bearing — see ARCHITECTURE.md §3):
   - ``main`` has NO ``fact_submit``: the orchestrator does no math and can never
     fabricate a fact.
-  - ``verifier`` is read-only: only ``search_arxiv_theorems`` (it reads the fact
-    graph as files, writes nothing).
+  - ``verifier`` is read-only: only ``search_arxiv_theorems``; required fact
+    context is supplied in its request, and it writes nothing.
   - ``worker`` is the only role that can ``fact_submit`` (verifier-gated write).
 All three roles get ``search_arxiv_theorems`` (literature grounding); ``worker``
-and ``main`` additionally get ``fact_search`` (read view over verified facts).
+and ``main`` additionally get ``fact_search`` and explicit ``fact_context`` read
+views. The verifier receives its required context in the verification request, so
+it does not need project-addressable graph access.
 """
 
 from __future__ import annotations
@@ -25,13 +27,20 @@ ALL_TOOLS: Tuple[str, ...] = (
     "gm_search",
     "fact_submit",
     "fact_search",
+    "fact_context",
     "fact_revoke",
     "search_arxiv_theorems",
 )
 
 ROLE_TOOLS: Dict[str, Tuple[str, ...]] = {
-    "worker": ("gm_add", "gm_search", "fact_submit", "fact_search", "search_arxiv_theorems"),
-    "main": ("gm_add", "gm_search", "fact_search", "fact_revoke", "search_arxiv_theorems"),
+    "worker": (
+        "gm_add", "gm_search", "fact_submit", "fact_search", "fact_context",
+        "search_arxiv_theorems",
+    ),
+    "main": (
+        "gm_add", "gm_search", "fact_search", "fact_context", "fact_revoke",
+        "search_arxiv_theorems",
+    ),
     "verifier": ("search_arxiv_theorems",),
     "all": ALL_TOOLS,
 }

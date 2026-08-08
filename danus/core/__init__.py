@@ -14,7 +14,19 @@ the agent prompts, not code here. See the repo ARCHITECTURE.md.
 from __future__ import annotations
 
 from . import bm25, glossary
-from .factgraph import FactGraph, parse_frontmatter, serialize_fact, statement_of
+from .factgraph import (
+    FACT_CONTEXT_SCHEMA_VERSION,
+    VERIFICATION_CONTEXT_PROJECTION,
+    VERIFICATION_CONTEXT_SCHEMA_VERSION,
+    FactGraph,
+    dependency_closure_digest,
+    fact_context_digest,
+    parse_frontmatter,
+    serialize_fact,
+    select_referenced_definitions,
+    statement_of,
+    verification_context_digest,
+)
 from .global_memory import GlobalMemory
 from .local_memory import DEFAULT_CHANNELS, LocalMemory
 from .schema import (
@@ -25,9 +37,17 @@ from .schema import (
     clean_external_refs,
     compute_fact_id,
 )
+from .verification import validate_verification_output
 
 __all__ = [
     "FactGraph",
+    "FACT_CONTEXT_SCHEMA_VERSION",
+    "VERIFICATION_CONTEXT_SCHEMA_VERSION",
+    "VERIFICATION_CONTEXT_PROJECTION",
+    "fact_context_digest",
+    "verification_context_digest",
+    "dependency_closure_digest",
+    "select_referenced_definitions",
     "GlobalMemory",
     "LocalMemory",
     "DEFAULT_CHANNELS",
@@ -40,6 +60,7 @@ __all__ = [
     "serialize_fact",
     "parse_frontmatter",
     "statement_of",
+    "validate_verification_output",
     "bm25",
     "glossary",
 ]

@@ -64,8 +64,9 @@ tools — never by hand:
   `gm_add` (kind `master_guidance` / `elaboration`, see below) with
   `project=<name>`.
 - **fact graph** (shared verified truth, the only correctness source): read facts
-  for oversight (`fact_search project=<name>`); revoke a wrong one with
-  `fact_revoke` (cascades, `project=<name>`).
+  for oversight (`fact_search project=<name>` returns statements only; use
+  `fact_context` on explicit ids for relations or opt-in proofs); revoke a wrong
+  one with `fact_revoke` (cascades, `project=<name>`).
 - worker **local memory** is private to each worker — you do not read it.
 
 ## Strategy & dispatch: consult a top-tier model → master_guidance → assign workers
@@ -194,10 +195,11 @@ State only what you have **verified**. This is a hard rule, not a tone preferenc
 
 - **MCP tools (your subset):** `gm_add` (write `master_guidance` / `elaboration`),
   `gm_search` (read findings), `fact_search` (BM25 over the verified fact graph —
-  for oversight and to ground an elaboration), `fact_revoke` (cascade revoke a
-  wrong fact), `search_arxiv_theorems` (Matlas arXiv theorem search —
+  statement-only, for discovery), `fact_context` (lazy explicit-id context;
+  statements/relations by default and proofs only when explicitly requested),
+  `fact_revoke` (cascade revoke a wrong fact), `search_arxiv_theorems` (Matlas arXiv theorem search —
   verbatim statements; sharpen decomposition before a consult, and check whether a
-  result already exists). **The first four take a `project=<name>` argument that
+  result already exists). **The first five take a `project=<name>` argument that
   selects which project's memory/fact graph to touch — always pass it; there is no
   default project.** (`search_arxiv_theorems` is project-agnostic.) You have **NO
   `fact_submit`** — only workers submit facts, and only the verifier gates them.

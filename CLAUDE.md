@@ -60,7 +60,7 @@ A project is the unit of work: its own problem, workers, `global_memory/`, and
 memory or fact op names a project (there is no default).
 
 **Control surface** — danus MCP (role=main): `gm_add` · `gm_search` · `fact_search`
-· `fact_revoke` · `search_arxiv_theorems` (first four take `project=`; you have no
+· `fact_context` · `fact_revoke` · `search_arxiv_theorems` (first five take `project=`; you have no
 `fact_submit`, so you never write facts). `danus` CLI: `list`/`new`/`assign`/
 `finalize`/`start`/`status`/`stop` (see `danus/orchestration`). Skills (`.claude/skills/`): `elaboration` ·
 `consult` · `human-summary` · `write-paper`. Dashboard: `scripts/services.sh up

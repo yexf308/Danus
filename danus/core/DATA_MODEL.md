@@ -135,7 +135,7 @@ this one's).
 | `direction` | false | worker | "worth exploring X" — an unverifiable judgment |
 | `obstacle` | false | worker | "X seems to block this route" — an unverifiable judgment |
 | `master_guidance` | false | **main agent (via GPT-5.5-pro)** | the periodic high-intelligence strategic steer: critical decomposition, direction judgment, core thinking. Authoritative — workers heed it (but it is still not a correctness source). |
-| `verification` | false | the worker's `fact_submit` (auto) | a trace of a verification outcome: the verdict, plus `fact_id` (on accept) or `repair_hints` (on reject). Logged automatically by `fact_submit` so the verifier's feedback is not lost — the verifier itself stays stateless. Siblings read these to learn from rejections. |
+| `verification` | false | the worker's `fact_submit` (auto) | a trace of a verification outcome: the verdict, plus `fact_id` (on accept) or `repair_hints` (on reject). `fact_submit` attempts a durable append; a failure is returned as `trace_error` without hiding a written fact id. Siblings read successful traces to learn from rejections. |
 | `elaboration` | false | **main agent** | the periodic, high-signal-to-noise progress synthesis the main agent writes before consulting GPT-5.5-pro: mathematical verdict, closed/obsolete routes, interface contracts, dangerous heuristics, missing bridge lemmas (§2.4). It is the *input* prepared for the pro consult; `master_guidance` is pro's *reply*. Same cadence. |
 
 Process-only categories (`branch_states`, `events`) stay in
@@ -168,8 +168,9 @@ the latest event for that `id`):
 
 A worker is **encouraged to keep pushing** `verifiable=true` entries through the
 verifier: send to verify, on `wrong` revise the evidence, re-verify, until
-correct — then it is promoted to a fact (§3, §4). The verify-and-repair loop
-operates per-claim on the shared store.
+correct — then the gateway attempts its locked context-CAS/add (§3, §4). A
+stale snapshot is not promoted. The verify-and-repair loop operates per-claim on
+the shared store.
 
 ### 2.3 master_guidance — the strategic channel
 
@@ -226,10 +227,10 @@ see_also, or drafts/ on the node.
 
 **Storage.** `<project_dir>/fact_graph/facts/<fact_id>.md` — one readable
 markdown file per fact (file name = the bare-hex id) + `revocation_log.jsonl` +
-`_revoked/<ts>/`. No `glossary.json`, no `drafts/` (rejected claims stay in
-global memory as `refuted`).
+flat `_revoked/<fact_id>.md` archive + `glossary.json`. There is no `drafts/`
+(rejected claims stay in global memory as `refuted`).
 
-**Fact node — 6 frontmatter fields + markdown body:**
+**Fact node — 7 frontmatter fields + markdown body:**
 
 ```yaml
 ---
@@ -237,15 +238,15 @@ fact_id: 0056a49384644046          # content-addressed (bare hex)
 problem_id: KMMP
 author: KMMP_pro3                  # which worker produced it
 predecessors: [7b6dd3df2e88fff5]   # bare-hex ids this depends on (the DAG)
-glossary_introduces:               # symbols this fact defines (kept — see below)
-  X: a complex manifold
-  K_F: the canonical class of the foliation F
+has_intuition: true                 # makes the optional body boundary unambiguous
+glossary_introduces: {"X": "a complex manifold", "K_F": "the canonical class of the foliation F"}
 external_refs: [{"key": "HL26", "authors": ["Han", "Liu"], "title": "...", "arxiv": "2603.03817", "year": 2026, "cited_for": "Theorem 1.2"}]
 ---
 
 ## statement
 <what was proved — self-contained: every symbol is defined here, in a cited
- predecessor's glossary, in the project glossary, or in the global glossary>
+ predecessor's glossary, or in the global glossary; a reused project term must
+ cite a direct active fact that introduced its definition>
 
 ## proof
 <the argument (markdown)>
@@ -254,21 +255,37 @@ external_refs: [{"key": "HL26", "authors": ["Han", "Liu"], "title": "...", "arxi
 <one-liner>
 ```
 
+New files encode glossary mappings as a JSON flow-object (valid YAML) so arbitrary
+Unicode, colons, and newlines round-trip exactly; legacy YAML block mappings remain
+readable. `## proof` is reserved as the statement/proof boundary, and the optional
+intuition text may not itself contain a standalone `## intuition` heading.
+
 - **`glossary_introduces` is KEPT (essential).** Without it the fact graph
   becomes unreadable — a fact could use a symbol nobody ever defined. Each fact
   records the symbols it introduces (symbol → definition); the project glossary
   `glossary.json` accumulates them. A **glossary-coverage check** (`fact submit`)
   flags any interesting symbol used in the body that is not defined anywhere
   **available**, where availability is the union of four layers (precedence
-  low→high, a higher layer shadows a lower one): **global glossary** →
-  **project glossary** → *cited predecessors'* `glossary_introduces` → *this
-  fact's* `glossary_introduces`. The **global glossary**
+  low→high): **global glossary** → **project glossary index** → *cited
+  predecessors'* `glossary_introduces` → *this fact's*
+  `glossary_introduces`. Project entries may not change a global term's meaning.
+  The project glossary is a discovery/index layer, never an implicit verifier
+  premise. Whenever a new fact inherits a project definition, it cites an active
+  predecessor whose fact-local glossary carries that definition. This makes the
+  semantic dependence an ordinary DAG edge, so revoking the source
+  cascade-revokes declared dependents. The **global glossary**
   (`danus/core/glossary_global.json`, repo-wide, shared by **all** projects) holds
   universal notation — Z, Q, R, C, floor/ceil, gcd/lcm, intervals, the Greek
   parameter names, … — so a fact need not redefine `epsilon` or `Z+` every time;
   only project-specific symbols go in the lower layers. (Heuristic, advisory; the
   verifier is the backstop. The *other* proof-lint rules — handwave,
   chart-position refs — are **prose**, not code.)
+  Project terms are append-only in meaning while active: adding the same term
+  with the same definition is idempotent, while a conflicting redefinition is
+  rejected. Revocation deterministically rebuilds the project glossary from
+  remaining active introducers before moving facts. Because verification never
+  hydrates this mutable index, a stale or differently spelled term cannot silently
+  become authoritative mathematical context.
 - **`external_refs` is structured bibliography for cited external results** (a
   list of `{key, authors, title, arxiv, year, venue, doi, cited_for}` dicts;
   serialized as a one-line JSON flow-array; `[]` / absent for older facts). The
@@ -286,8 +303,9 @@ external_refs: [{"key": "HL26", "authors": ["Han", "Liu"], "title": "...", "arxi
   is deliberately excluded (mutable metadata, above).
 - **DAG:** `predecessors` are the bare-hex fact ids this fact depends on
   (its "depends-on"). References use bare hex everywhere — one convention.
-- **Revocation:** revoking a fact moves it (and every descendant) to `_revoked/`,
-  logs to `revocation_log.jsonl`; `add` refuses any predecessor already revoked.
+- **DAG integrity and revocation:** `add` refuses unknown or revoked predecessors.
+  Revoking a fact moves it (and every descendant) to `_revoked/` and logs to
+  `revocation_log.jsonl`.
 
 **Deliberately not on the node (and where it lives instead):** `status` (a fact in
 `facts/` is verified by definition) · `verifier_outcome` (redundant) ·
@@ -307,9 +325,25 @@ exist? — don't re-prove it") and **citation lookup** ("which verified facts be
 on my subgoal?"). Exposed as the `fact_search` MCP tool (worker + main). It is a
 *read view*; the fact files stay the single source of truth.
 
+**Lazy explicit context (`context`).** `context(fact_ids, predecessor_depth,
+proof_mode, max_chars)` reads only fact files reachable from the caller-ordered
+ids. It returns statements, predecessor edges, fact-local definitions, and only
+the project/global glossary entries whose notation is actually referenced;
+`selected` hydrates proofs for requested roots and `all` hydrates every included
+proof. Bounded depth or full closure is deterministic. Budgets omit whole
+lower-priority records or definitions—never slice them—and the result reports
+`complete`, `truncated`, missing/revoked/omitted ids or terms, and character
+usage/budget. `complete` is relative to the declared scope. A versioned scope plus
+SHA-256 digest binds the requested ids, hydration mode, exact records, and selected
+glossary snapshot. Interactive callers may include the project discovery index;
+the verification write-gate sets `include_project_glossary=false`, leaving only
+declared fact-local definitions and immutable global entries. Exposed as
+`fact_context` to worker and main.
+
 **Operations (code = data-structure I/O only).** `compute_fact_id(...)`,
 `add(problem_id, author, statement, proof, predecessors=[], intuition="",
 external_refs=[]) -> fact_id`, `get_raw(fact_id)`, `list()`, `search(query, limit)`,
+`context(fact_ids, predecessor_depth, proof_mode, max_chars)`,
 `predecessors(fact_id)`, `descendants(fact_id)`, `external_refs(fact_id)`,
 `set_external_refs(fact_id, refs)`, `revoke(fact_id, reason)`.
 
@@ -351,21 +385,20 @@ external_refs=[]) -> fact_id`, `get_raw(fact_id)`, `list()`, `search(query, limi
 5. **Content addressing.** `fact_id` is a pure function of content ⇒ dedup,
    stable references, cascade revocation.
 
-**Promotion (a prose behavior, not a function).** When a `verifiable=true`
-global-memory finding passes the verifier, the agent (per its prompt) writes the
-fact with `FactGraph.add(statement=claim, proof=evidence,
-predecessors=links.predecessors)` and back-links the finding with
-`GlobalMemory.set_status(id, "verified", fact_id)`. There is deliberately **no
-`promote()` function** — the decision to verify and the verify call are the
-agent's; the library only offers the two data-structure writes.
+**Promotion.** A worker submits the finding only through the gateway's
+`fact_submit`, which builds and validates lazy predecessor context, calls the
+verifier, atomically rechecks the context, and then invokes `FactGraph.add` only
+for a valid `correct` verdict. The resulting fact id may back-link the global
+finding. There is deliberately no second `promote()` path that could bypass the
+gate.
 
 ### Code vs prose (the boundary)
 
 | code (this library — touches the fixed JSONL / fact-graph files) | prose (prompts/skills — agent behavior) |
 | --- | --- |
 | local/global memory: append / read / search (BM25) | when to publish local→global; which `kind`/`verifiable` |
-| fact node: serialize/parse, `compute_fact_id`, add/get/list, predecessors/descendants, cascade revoke | when to send to the verifier; the repair loop; when to promote |
-| evidence-required-for-verifiable check; revoked-predecessor refusal | "global memory is awareness, never a brick — cite `fact_id`" |
+| fact node: serialize/parse, `compute_fact_id`, integrity-checked lazy context, atomic add/revoke | proof strategy and repair choices |
+| evidence-required-for-verifiable check; unknown/revoked-predecessor refusal | "global memory is awareness, never a brick — cite `fact_id`" |
 | | "facts must be self-contained; no handwave / chart-position refs" |
 
 Keep it that way: do not add orchestration code. If something is a *decision*, it

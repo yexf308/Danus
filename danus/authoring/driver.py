@@ -21,12 +21,11 @@ Two exec tails share this one driver (see ``run_codex``):
 
 - the **offline default** (writer / auditor / reviser) — ``--sandbox read-only``,
   no MCP, no web; the empty cwd + embedded prompt are the whole world;
-- the **networked variant** (the reference verifier) — mirrors
-  ``danus.verify.launcher``: ``--dangerously-bypass-approvals-and-sandbox`` with
-  the danus gateway injected via ``-c`` at ``DANUS_ROLE=verifier`` (the read-only
-  ``search_arxiv_theorems`` role — no new gateway role) plus codex's built-in
-  ``web_search``. The empty cwd is kept, so codex still cannot read/write the
-  project tree; its only outward reach is the gateway's read-only tool + web.
+- the **networked variant** (the reference verifier) — reuses the same minimally
+  privileged Danus gateway injection at ``DANUS_ROLE=verifier`` plus Codex web
+  search. Unlike the fact verifier's newer read-only/schema-captured path, this
+  legacy renderer variant still uses the sandbox bypass and therefore requires
+  the documented isolated host.
 
 
 Config (env, read at CALL time — never import time; resolved via the shared
@@ -41,7 +40,9 @@ Config (env, read at CALL time — never import time; resolved via the shared
 
 from __future__ import annotations
 
+import json
 import subprocess
+import sys
 import tempfile
 
 from danus import codex
@@ -54,13 +55,18 @@ DEFAULT_TIMEOUT = 7200
 def _gateway_config_arg(gateway_role: str) -> str:
     """The ``-c`` MCP-injection string that mounts the danus gateway into codex,
     mirroring ``danus.verify.launcher._mcp_config_arg`` exactly: it runs the
-    installed package (``python3 -m danus.gateway``) with the given ``DANUS_ROLE``,
+    installed package (``<sys.executable> -m danus.gateway``) with the given ``DANUS_ROLE``,
     independent of CODEX_HOME. Reuse ``DANUS_ROLE=verifier`` for minimum privilege —
     that gateway role exposes ONLY ``search_arxiv_theorems`` (read-only). We do NOT
     define a new gateway role for the paper verifier."""
+    command = json.dumps(sys.executable)
+    role = json.dumps(gateway_role)
     return (
-        'mcp_servers.danus={command="python3",args=["-m","danus.gateway"],'
-        f'env={{DANUS_ROLE="{gateway_role}"}}}}'
+        "mcp_servers.danus={command="
+        + command
+        + ',args=["-m","danus.gateway"],env={DANUS_ROLE='
+        + role
+        + "}}"
     )
 
 
@@ -100,9 +106,9 @@ def run_codex(
       empty cwd and a fully-embedded prompt, so it reads nothing and reaches
       nothing. This is what the writer / auditor / reviser use.
 
-    - **Networked (``networked=True``)** — the reference-verifier path, mirroring
-      ``danus.verify.launcher.build_codex_command``: replace the read-only sandbox
-      with ``--dangerously-bypass-approvals-and-sandbox`` (net-capable), inject the
+    - **Networked (``networked=True``)** — the reference-verifier path: replace
+      the read-only sandbox with ``--dangerously-bypass-approvals-and-sandbox``
+      (net-capable), inject the
       danus gateway via ``-c`` at ``DANUS_ROLE=<gateway_role>`` (default
       ``verifier`` — exposes ONLY ``search_arxiv_theorems``, minimum privilege; no
       new gateway role is created), and enable codex's built-in ``web_search``

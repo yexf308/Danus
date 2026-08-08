@@ -20,10 +20,10 @@ operator → ① orchestration (main agent + danus CLI)   — conducts, never do
    gm_* │         │ fact_submit
         ▼         ▼
    ⑤ truth      ④ verification (cold-start codex judge; correct ⟺ no critical_errors AND no gaps)
-   (fact graph + memory)   — a fact exists iff the verifier accepted it
+   (fact graph + memory)   — correct verdict + locked context CAS/add
         ▲
         │ every read/write goes through …
-   ⑥ gateway (role-gated MCP: 6 tools; main has NO fact_submit; verifier read-only)
+   ⑥ gateway (role-gated MCP: 7 tools; main has NO fact_submit; verifier read-only)
 
 cross-cutting: ⑦ observability (dashboard · theorem-search · human-summary · initialize)
                ⑧ ops/runtime (bootstrap · services · doctor · config)
@@ -43,7 +43,7 @@ Danus/
 ├─ config/                      env templates (BYO key; only *.env.example committed)
 ├─ danus/                       THE ENGINE (installable Python package)
 │  ├─ core/                     ⑤ truth: schema · factgraph · global/local memory · bm25 · glossary
-│  ├─ gateway/                  ⑥ role-gated MCP: 6 tools · role table (roles.py)
+│  ├─ gateway/                  ⑥ role-gated MCP: 7 tools · role table (roles.py)
 │  ├─ verify/                   ④ verification HTTP service · prechecks · cold-start codex launcher
 │  ├─ execution/                ③ worker swarm: round loop · project/worker lifecycle + layout
 │  ├─ strategy/                 ② consult gateway (gpt_pro|claude_api|claude_code|off transport)
@@ -78,16 +78,25 @@ Danus/
 2. Permission is enforced by which tools a role can even see (the gateway role
    table), not by prompt convention. `main` cannot `fact_submit`; `verifier` is
    read-only.
-3. The verifier is the sole write-gate. A fact exists only if a `correct` verdict
-   came back; the gate lives in the `fact_submit` code path, not in prose.
+3. The verifier is the sole mathematical authority, but `correct` is necessary,
+   not by itself sufficient for a write. `fact_submit` also rechecks the exact
+   context and adds under the graph mutation lock; stale context returns an
+   accept-but-write-failed result.
 4. Content-addressed, cascade-revocable fact graph. `fact_id` hashes content
    (problem_id + predecessors + glossary_introduces + statement + proof);
    `external_refs` is deliberately excluded so the paper pipeline can rewrite
    citations without breaking the DAG.
-5. Autonomy and resumability. Workers run detached; a "round" continues from
+5. Lazy context is fail-closed: discovery is statement-only; explicit hydration
+   carries scope/completeness/digest metadata and only referenced immutable global
+   definitions. Verification sends full cards only for direct predecessors, all
+   inherited definitions, and a digest/count commitment to a core-validated full
+   closure; ancestor statements/proofs and its edge skeleton do not enter the model
+   prompt. The service attests the context digest, and the gateway atomically
+   rechecks the same snapshot before writing under the graph mutation lock.
+6. Autonomy and resumability. Workers run detached; a "round" continues from
    persisted memory rather than adding one increment, so no single crash loses
    verified work.
-6. The strategy consult is the brain. Between rounds the main agent consults a
+7. The strategy consult is the brain. Between rounds the main agent consults a
    top-tier reasoning model (gpt-5.5-pro over the `gpt_pro` transport, or
    claude-fable-5 over the `claude_api` / `claude_code` transports) to set direction;
    its reply becomes the swarm's `master_guidance`. Transport is `gpt_pro` (default),
@@ -120,9 +129,9 @@ Danus/
 
 | contract | pinned shape | ends |
 |---|---|---|
-| MCP tool set + role gating | 6 tools; `roles.py` `ROLE_TOOLS` (main has NO `fact_submit`; verifier read-only) | `danus.gateway` ↔ worker/main/verifier agents |
+| MCP tool set + role gating | 7 tools; `roles.py` `ROLE_TOOLS` (worker/main get lazy `fact_context`; main has NO `fact_submit`; verifier read-only) | `danus.gateway` ↔ worker/main/verifier agents |
 | MCP launch | `python -m danus.gateway` + `DANUS_ROLE` env | `danus.verify` launcher · worker `.codex/config.toml` · `.mcp.json` (main) → `danus.gateway` |
-| verify HTTP | `POST /verify {statement,proof}` → `{verification_report,verdict,repair_hints}`; verdict ⟺ no critical_errors & no gaps | `danus.gateway.fact_submit` ↔ `danus.verify` |
+| verify HTTP | `POST /verify {statement,proof,glossary_introduces?,fact_context?}` → `{verification_report,verdict,repair_hints,verification_context_digest?}`; supplied context must be complete and the digest is server-attested; verdict ⟺ no critical_errors & no gaps | `danus.gateway.fact_submit` ↔ `danus.verify` |
 | fact id inputs | `problem_id + sorted(predecessors) + sorted(glossary) + normalized(statement,proof)`; **external_refs EXCLUDED** | `danus.core` ↔ everyone (write-paper reads `external_refs`) |
 | global-memory kinds | the 11 `GLOBAL_KINDS` (incl. `master_guidance`/`elaboration`/`verification`) | `danus.core` ↔ agents · strategy · consult |
 | consult JSON envelope | `{transport,reply,usage,cost_usd,…}` | `danus.strategy` CLI ↔ consult skill |
