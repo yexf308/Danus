@@ -98,7 +98,7 @@ is an independent `xhigh` default and intentionally does not inherit
 | `DANUS_RUNTIME` | `<repo>/runtime` | the whole self-contained runtime |
 | `DANUS_AGENTS_ROOT` | `runtime/projects` | where `danus new` puts projects |
 | `DANUS_STATE_DIR` | `$XDG_STATE_HOME/danus`, else `~/.local/state/danus` outside repo wrappers | writable packaged-verifier resources and default run state |
-| `VERIFY_AGENT_HOME` | `<DANUS_STATE_DIR>/verify/agent-<resource-digest>` | materialized packaged verifier contract and skills |
+| `VERIFY_AGENT_HOME` | `<DANUS_STATE_DIR>/verify` | optional base for digest-keyed materialized verifier bundles (contract, skills/YAML, CLI schema) |
 | `VERIFIER_RESULTS_DIR` | `runtime/verify-runs` | per-verification run logs |
 | `DANUS_PY` | `runtime/venv/bin/python` (else system `python3`) | the engine's Python |
 
@@ -110,6 +110,7 @@ is an independent `xhigh` default and intentionally does not inherit
 | `DANUS_MAX_ROUNDS` | `0` (unlimited) | round backstop |
 | `DANUS_MAX_CONSEC_FAILURES` | `5` | bail after N consecutive failed rounds |
 | `DANUS_ROUND_BEAT` | `5` | seconds between rounds |
+| `DANUS_WORKER_TRANSPORT` | `exec` | `app-server` enables durable owner same-turn hot-join; local protocol schema is checked before any paid turn |
 
 ## Rendering & misc
 

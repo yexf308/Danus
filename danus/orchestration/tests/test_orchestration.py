@@ -166,17 +166,42 @@ def test_graceful_stop(tmp: Path):
             _kill_project("P")
 
 
-def test_force_stop(tmp: Path):
+def test_force_stop(tmp: Path, monkeypatch):
     fc = _fake_codex(tmp)
     with _project_env(tmp, DANUS_CODEX_BIN=str(fc), DANUS_ROUND_BEAT="0",
                       DANUS_MAX_ROUNDS="0", FAKE_CODEX_SLEEP="30"):
         cli.do_new("P", roles="high:1")
+        wl = L.WorkerLayout(L.worker_dir("P", "high"))
+        external_signals = []
+        real_kill = os.kill
+        real_killpg = os.killpg
+
+        def audited_kill(pid, sig):
+            if sig != 0:
+                external_signals.append(("pid", pid, sig))
+            return real_kill(pid, sig)
+
+        def audited_killpg(pgid, sig):
+            external_signals.append(("pgid", pgid, sig))
+            return real_killpg(pgid, sig)
+
         try:
             cli.do_start("P/high")
             assert _wait_until(lambda: _st("P", "high")["state"] == "running"), "round should run"
-            r = cli.do_stop("P/high", force=True)
-            assert r[0]["result"] == "killed"
-            assert _wait_until(lambda: not _st("P", "high")["alive"], timeout=8), "force kills fast"
+            # The CLI may authenticate liveness with signal 0. It must never
+            # send TERM/KILL to a numeric PID/PGID; only the worker owns
+            # retained child handles and performs cooperative cleanup.
+            with monkeypatch.context() as stop_patch:
+                stop_patch.setattr(os, "kill", audited_kill)
+                stop_patch.setattr(os, "killpg", audited_killpg)
+                r = cli.do_stop("P/high", force=True)
+            assert r[0]["result"] == "stopping (cooperative force)"
+            assert _wait_until(lambda: not _st("P", "high")["alive"], timeout=8), (
+                "worker should promptly honor the durable force request"
+            )
+            assert _st("P", "high")["state"] == "stopped"
+            assert cli._read_pid(wl) is None
+            assert external_signals == []
         finally:
             _kill_project("P")
 

@@ -19,6 +19,7 @@ from .factgraph import (
     VERIFICATION_CONTEXT_PROJECTION,
     VERIFICATION_CONTEXT_SCHEMA_VERSION,
     FactGraph,
+    FactPromotionOutcomeUnknown,
     dependency_closure_digest,
     fact_context_digest,
     parse_frontmatter,
@@ -37,10 +38,14 @@ from .schema import (
     clean_external_refs,
     compute_fact_id,
 )
-from .verification import validate_verification_output
+from .verification import (
+    VERIFICATION_OUTPUT_PROTOCOL_VERSION,
+    validate_verification_output,
+)
 
 __all__ = [
     "FactGraph",
+    "FactPromotionOutcomeUnknown",
     "FACT_CONTEXT_SCHEMA_VERSION",
     "VERIFICATION_CONTEXT_SCHEMA_VERSION",
     "VERIFICATION_CONTEXT_PROJECTION",
@@ -61,6 +66,7 @@ __all__ = [
     "parse_frontmatter",
     "statement_of",
     "validate_verification_output",
+    "VERIFICATION_OUTPUT_PROTOCOL_VERSION",
     "bm25",
     "glossary",
 ]

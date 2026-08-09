@@ -80,8 +80,14 @@ Danus/
    read-only.
 3. The verifier is the sole mathematical authority, but `correct` is necessary,
    not by itself sufficient for a write. `fact_submit` also rechecks the exact
-   context and adds under the graph mutation lock; stale context returns an
-   accept-but-write-failed result.
+   context and adds under the graph mutation lock. The compatibility field
+   `accepted` reports verifier acceptance; only `promoted: true` plus a non-null
+   `fact_id` reports end-to-end publication. Stale context or another write
+   failure preserves `verification_verdict: "correct"` but returns
+   `submission_status: "verified_not_promoted"` and no fact id. If an fsync
+   failure makes both commit and rollback crash outcomes possible, the gateway
+   instead returns `promoted: null` and `submission_status: "promotion_unknown"`;
+   it never misstates that ambiguity as a definitive failed promotion.
 4. Content-addressed, cascade-revocable fact graph. `fact_id` hashes content
    (problem_id + predecessors + glossary_introduces + statement + proof);
    `external_refs` is deliberately excluded so the paper pipeline can rewrite
@@ -133,7 +139,7 @@ Danus/
 |---|---|---|
 | MCP tool set + role gating | 7 tools; `roles.py` `ROLE_TOOLS` (worker/main get lazy `fact_context`; main has NO `fact_submit`; verifier read-only) | `danus.gateway` ↔ worker/main/verifier agents |
 | MCP launch | `python -m danus.gateway` + `DANUS_ROLE` env | `danus.verify` launcher · worker `.codex/config.toml` · `.mcp.json` (main) → `danus.gateway` |
-| verify HTTP | `POST /verify {statement,proof,glossary_introduces?,fact_context?}` → `{output_schema_version,verification_status,verification_report,verdict,needs_expanded_proofs,repair_hints,verification_context_digest?,verification_metrics?}`; supplied context must be complete and digest-attested; only `final/correct` with zero findings can authorize the locked write | `danus.gateway.fact_submit` ↔ `danus.verify` |
+| verify HTTP | `GET /health` attests `{output_protocol_version:3,verifier_bundle_digest}`; `POST /verify {expected_output_protocol_version:3,expected_verifier_bundle_digest,statement,proof,glossary_introduces?,fact_context?}` → schema-v3 `{output_schema_version,verification_status,verification_report,verdict,needs_expanded_proofs,repair_hints,verification_context_digest?,verification_metrics?}`; every final finding carries an exact original candidate `{source,line,exact_line}` anchor, checked independently by launcher and gateway; supplied context must be complete and digest-attested; only `final/correct` with zero findings can authorize the locked write | `danus.gateway.fact_submit` ↔ `danus.verify` |
 | fact id inputs | `problem_id + sorted(predecessors) + sorted(glossary) + normalized(statement,proof)`; **external_refs EXCLUDED** | `danus.core` ↔ everyone (write-paper reads `external_refs`) |
 | global-memory kinds | the 11 `GLOBAL_KINDS` (incl. `master_guidance`/`elaboration`/`verification`) | `danus.core` ↔ agents · strategy · consult |
 | consult JSON envelope | `{transport,reply,usage,cost_usd,…}` | `danus.strategy` CLI ↔ consult skill |

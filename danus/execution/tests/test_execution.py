@@ -14,6 +14,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import tomllib
 from contextlib import contextmanager
 from pathlib import Path
@@ -91,6 +92,27 @@ def test_resolve_and_target():
     assert L.resolve_target("proj") == ("proj", None)
     assert L.resolve_target("proj/high") == ("proj", "high")
     assert L.resolve_target("/proj/high/") == ("proj", "high")
+    assert L.resolve_target("proj-1.2/high_3") == ("proj-1.2", "high_3")
+    for bad in [
+        "",
+        ".",
+        "..",
+        "../high",
+        "proj/.",
+        "proj/..",
+        r"proj\high",
+        "proj//high",
+        "proj/high/extra",
+        "//proj/high/",
+        "/proj/high//",
+        ".proj/high",
+        "proj/-high",
+    ]:
+        try:
+            L.resolve_target(bad)
+            assert False, f"should reject unsafe target {bad!r}"
+        except ValueError:
+            pass
 
 
 # --- do_new scaffolding ---------------------------------------------------- #
@@ -117,7 +139,7 @@ def test_do_new_scaffolds_project(tmp: Path):
                 "mcp_servers": {
                     "danus": {
                         "command": sys.executable,
-                        "args": ["-m", "danus.gateway"],
+                        "args": ["-I", "-B", "-m", "danus.gateway"],
                         "default_tools_approval_mode": "approve",
                         "required": True,
                         "tool_timeout_sec": 3600,
@@ -125,6 +147,8 @@ def test_do_new_scaffolds_project(tmp: Path):
                             "DANUS_PROJECT_DIR": str(pdir),
                             "DANUS_AUTHOR": w,
                             "DANUS_ROLE": "worker",
+                            "DANUS_HOTJOIN_ENABLED": "1",
+                            "DANUS_HOTJOIN_TARGET": w,
                             "DANUS_VERIFY_URL": "http://127.0.0.1:8091/verify",
                         },
                     }
@@ -146,6 +170,20 @@ def test_do_new_refuses_existing(tmp: Path):
             pass
 
 
+def test_do_new_rejects_project_traversal_before_filesystem_mutation(tmp: Path):
+    root = tmp / "projects"
+    outside = tmp / "escaped"
+    with _env(DANUS_AGENTS_ROOT=str(root)):
+        for bad in ("../escaped", "a/b", "/absolute", ".", ".."):
+            try:
+                scaffold.do_new(bad, roles="high:1")
+                assert False, f"should reject unsafe project name {bad!r}"
+            except SystemExit as exc:
+                assert "invalid project name" in str(exc)
+    assert not root.exists()
+    assert not outside.exists()
+
+
 def test_do_new_verify_url_from_env(tmp: Path):
     with _project_env(tmp):
         with _env(DANUS_VERIFY_URL="http://127.0.0.1:9999/verify"):
@@ -158,10 +196,207 @@ def test_do_new_verify_url_from_env(tmp: Path):
 
 def test_parse_last_fact_id(tmp: Path):
     log = tmp / "round.log"
-    log.write_text('noise\nfact_id=0123456789abcdef\nmore\n"fact_id": "fedcba9876543210"\n')
-    assert loop._parse_last_fact_id(log) == "fedcba9876543210"
-    log.write_text("no facts here, and DEADBEEF is not 16 hex lower\n")
+
+    def completed(item: dict) -> str:
+        return json.dumps({"type": "item.completed", "item": item}) + "\n"
+
+    # Context results, fact-file output, agent prose, and a verified-but-not-
+    # promoted submission are all non-publications.
+    log.write_text(
+        completed(
+            {
+                "server": "danus",
+                "tool": "fact_context",
+                "result": {"facts": [{"fact_id": "0123456789abcdef"}]},
+            }
+        )
+        + "fact_id: fedcba9876543210\n"
+        + json.dumps(
+            {
+                "event": "item_completed",
+                "item": {
+                    "type": "agentMessage",
+                    "text": '{"fact_id": "1111111111111111"}',
+                },
+            }
+        )
+        + "\n"
+        + completed(
+            {
+                "server": "danus",
+                "tool": "fact_submit",
+                "result": {
+                    "structuredContent": {
+                        "accepted": True,
+                        "promoted": False,
+                        "submission_status": "verified_not_promoted",
+                        "verification_verdict": "correct",
+                        "fact_id": None,
+                        "untrusted_nested_tool_payload": {
+                            "accepted": True,
+                            "promoted": True,
+                            "submission_status": "promoted",
+                            "verification_verdict": "correct",
+                            "fact_id": "aaaaaaaaaaaaaaaa",
+                        },
+                    }
+                },
+            }
+        )
+        + completed(
+            {
+                "server": "danus",
+                "tool": "fact_submit",
+                "result": {
+                    "structuredContent": {
+                        "accepted": True,
+                        "promoted": None,
+                        "submission_status": "promotion_unknown",
+                        "verification_verdict": "correct",
+                        "fact_id": None,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
     assert loop._parse_last_fact_id(log) is None
+    unknown_summary = loop._fact_submit_summary(
+        {
+            "server": "danus",
+            "tool": "fact_submit",
+            "result": {
+                "structuredContent": {
+                    "accepted": True,
+                    "promoted": None,
+                    "submission_status": "promotion_unknown",
+                    "verification_verdict": "correct",
+                    "fact_id": None,
+                }
+            },
+        }
+    )
+    assert unknown_summary is not None
+    assert unknown_summary["promoted"] is None
+    assert unknown_summary["submission_status"] == "promotion_unknown"
+
+    # A typed current response is a promotion only when its explicit boolean and
+    # valid id agree. A later failed submit does not erase the last promotion.
+    log.write_text(
+        completed(
+            {
+                "server": "danus",
+                "tool": "fact_submit",
+                "result": {
+                    "structuredContent": {
+                        "accepted": True,
+                        "promoted": True,
+                        "submission_status": "promoted",
+                        "verification_verdict": "correct",
+                        "fact_id": "2222222222222222",
+                    }
+                },
+            }
+        )
+        + completed(
+            {
+                "server": "danus",
+                "tool": "fact_submit",
+                "result": {
+                    "structuredContent": {
+                        "accepted": True,
+                        "promoted": False,
+                        "fact_id": None,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert loop._parse_last_fact_id(log) == "2222222222222222"
+
+    # Rolling compatibility: a valid id in an explicitly attributed legacy
+    # fact_submit response is the safe fallback when ``promoted`` is absent.
+    log.write_text(
+        completed(
+            {
+                "server": "danus",
+                "tool": "fact_submit",
+                "result": {
+                    "structuredContent": {
+                        "accepted": True,
+                        "fact_id": "3333333333333333",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert loop._parse_last_fact_id(log) == "3333333333333333"
+
+
+def test_parse_last_fact_id_streams_past_oversize_jsonl_with_bounded_warning(
+    tmp: Path,
+):
+    wl = L.WorkerLayout(tmp / "P" / "workers" / "high")
+    wl.logs.mkdir(parents=True)
+    log = wl.logs / "round_1.log"
+
+    def promoted(fact_id: str) -> bytes:
+        return (
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "server": "danus",
+                        "tool": "fact_submit",
+                        "result": {
+                            "structuredContent": {
+                                "accepted": True,
+                                "promoted": True,
+                                "submission_status": "promoted",
+                                "verification_verdict": "correct",
+                                "fact_id": fact_id,
+                            }
+                        },
+                    },
+                }
+            ).encode()
+            + b"\n"
+        )
+
+    with log.open("wb") as handle:
+        handle.write(promoted("1111111111111111"))
+        # A single read can be over the cap and already newline-terminated; it
+        # is still an oversized event and must never be parsed.
+        handle.write(b"{" + b"x" * loop.MAX_EXEC_LOG_EVENT_BYTES + b"\n")
+        handle.write(promoted("2222222222222222"))
+    assert loop._parse_last_fact_id(log, worker=wl) == "2222222222222222"
+    status = json.loads(wl.status.read_text(encoding="utf-8"))
+    assert "skipped 1 JSONL event" in status["exec_log_parse_warning"]
+
+
+def test_round_log_open_rejects_symlink_hardlink_and_fifo_without_mutation(
+    tmp: Path,
+):
+    logs = tmp / "logs"
+    logs.mkdir()
+    sentinel = tmp / "sentinel"
+    sentinel.write_text("do not truncate\n", encoding="utf-8")
+    nodes = {
+        "symlink.log": lambda path: path.symlink_to(sentinel),
+        "hardlink.log": lambda path: os.link(sentinel, path),
+        "fifo.log": lambda path: os.mkfifo(path),
+    }
+    for name, create in nodes.items():
+        path = logs / name
+        create(path)
+        try:
+            loop._open_round_log(path)
+            raise AssertionError(f"unsafe round log {name} must be rejected")
+        except (OSError, loop.HotJoinError):
+            pass
+        assert sentinel.read_text(encoding="utf-8") == "do not truncate\n"
 
 
 def test_deadline_passed(tmp: Path):
@@ -187,6 +422,36 @@ def test_write_status_atomic_and_stamps(tmp: Path):
     assert st2["round"] == 2 and st2["last_rc"] == 0
 
 
+def test_write_status_does_not_follow_planted_links(tmp: Path):
+    wl = L.WorkerLayout(tmp / "proj" / "workers" / "high")
+    wl.dir.mkdir(parents=True)
+    victim = tmp / "victim.txt"
+    victim.write_text("KEEP", encoding="utf-8")
+    wl.status.symlink_to(victim)
+    legacy_temp = wl.status.with_suffix(wl.status.suffix + ".tmp")
+    legacy_temp.symlink_to(victim)
+
+    loop.write_status(wl, state="running", round=1)
+
+    assert victim.read_text(encoding="utf-8") == "KEEP"
+    assert not wl.status.is_symlink()
+    assert json.loads(wl.status.read_text(encoding="utf-8"))["state"] == "running"
+    assert legacy_temp.is_symlink()
+
+
+def test_open_append_log_rejects_fifo_without_blocking(tmp: Path):
+    log = tmp / "logs" / "loop.log"
+    log.parent.mkdir()
+    os.mkfifo(log)
+    started = time.monotonic()
+    try:
+        scaffold.open_append_log(log)
+        raise AssertionError("FIFO log must be rejected")
+    except OSError:
+        pass
+    assert time.monotonic() - started < 1
+
+
 def test_read_role_defaults_and_overrides(tmp: Path):
     wl = L.WorkerLayout(tmp / "proj" / "workers" / "xhigh")
     wl.dir.mkdir(parents=True)
@@ -204,6 +469,35 @@ def test_read_role_defaults_and_overrides(tmp: Path):
     assert role["MODEL"] == "gpt-x" and role["REASONING_EFFORT"] == "xhigh" and role["ROLE"] == "xhigh"
 
 
+def test_protected_role_ignores_worker_writable_role_projection(tmp: Path):
+    wl = L.WorkerLayout(tmp / "proj" / "workers" / "max")
+    wl.dir.mkdir(parents=True)
+    (wl.project_dir / "project.json").write_text(
+        json.dumps(
+            {
+                "name": "proj",
+                "model": "gpt-5.6-sol",
+                "roles": "max:1",
+                "workers": ["max"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    wl.role.write_text(
+        "MODEL=attacker-model\nREASONING_EFFORT=ultra\nDANUS_AUTHOR=spoofed\n",
+        encoding="utf-8",
+    )
+
+    role = loop._read_role(wl, protected=True)
+
+    assert role == {
+        "MODEL": "gpt-5.6-sol",
+        "REASONING_EFFORT": "max",
+        "ROLE": "max",
+        "DANUS_AUTHOR": "max",
+    }
+
+
 # --- runner ---------------------------------------------------------------- #
 
 _NO_TMP = {test_parse_roles_default_roster, test_parse_roles_rejects_bad_specs,
@@ -214,9 +508,12 @@ def main() -> None:
     for t in [test_parse_roles_default_roster, test_parse_roles_rejects_bad_specs,
               test_worker_layout_paths, test_resolve_and_target,
               test_do_new_scaffolds_project, test_do_new_refuses_existing,
+              test_do_new_rejects_project_traversal_before_filesystem_mutation,
               test_do_new_verify_url_from_env, test_parse_last_fact_id,
               test_deadline_passed, test_write_status_atomic_and_stamps,
-              test_read_role_defaults_and_overrides]:
+              test_write_status_does_not_follow_planted_links,
+              test_read_role_defaults_and_overrides,
+              test_protected_role_ignores_worker_writable_role_projection]:
         if t in _NO_TMP:
             t()
         else:

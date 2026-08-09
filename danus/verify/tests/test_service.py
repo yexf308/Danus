@@ -44,7 +44,7 @@ _PROOF = (
 )
 
 _CANNED_OK = {
-    "output_schema_version": 2,
+    "output_schema_version": 3,
     "verification_status": "final",
     "verification_report": {"summary": "fake accept", "critical_errors": [], "gaps": []},
     "verdict": "correct",
@@ -151,6 +151,16 @@ def _client():
     return TestClient(service.app)
 
 
+def _verify_json(**payload):
+    return {
+        "expected_output_protocol_version": (
+            service.VERIFICATION_OUTPUT_PROTOCOL_VERSION
+        ),
+        "expected_verifier_bundle_digest": service.VERIFIER_BUNDLE_DIGEST,
+        **payload,
+    }
+
+
 # --------------------------------------------------------------------------- #
 # /health                                                                     #
 # --------------------------------------------------------------------------- #
@@ -164,6 +174,59 @@ def test_health_ok():
     # against runtime/run/verify.pid to distinguish OUR verify from a foreign
     # deployment holding the same port on a shared host).
     assert isinstance(body["pid"], int) and body["pid"] > 0
+    assert body["instance_nonce"] == service.VERIFY_INSTANCE_NONCE
+    assert (
+        body["output_protocol_version"]
+        == service.VERIFICATION_OUTPUT_PROTOCOL_VERSION
+        == 3
+    )
+    assert body["verifier_bundle_digest"] == service.VERIFIER_BUNDLE_DIGEST
+
+
+def test_old_gateway_request_fails_before_allocation_or_codex(monkeypatch):
+    calls = {"allocate": 0, "codex": 0}
+
+    def allocate(_statement):
+        calls["allocate"] += 1
+        return "must-not-exist"
+
+    def codex(*_args, **_kwargs):
+        calls["codex"] += 1
+        raise AssertionError("codex must not run")
+
+    monkeypatch.setattr(service, "_allocate_run_id", allocate)
+    monkeypatch.setattr(service, "run_codex_verification", codex)
+    response = _client().post(
+        "/verify", json={"statement": _STMT, "proof": _PROOF}
+    )
+
+    assert response.status_code == 422
+    assert calls == {"allocate": 0, "codex": 0}
+
+
+def test_protocol_or_health_digest_mismatch_fails_before_paid_work(monkeypatch):
+    calls = {"allocate": 0, "codex": 0}
+    monkeypatch.setattr(
+        service,
+        "_allocate_run_id",
+        lambda _statement: calls.__setitem__("allocate", calls["allocate"] + 1),
+    )
+    monkeypatch.setattr(
+        service,
+        "run_codex_verification",
+        lambda *_args, **_kwargs: calls.__setitem__("codex", calls["codex"] + 1),
+    )
+
+    wrong_protocol = _verify_json(statement=_STMT, proof=_PROOF)
+    wrong_protocol["expected_output_protocol_version"] = 2
+    response = _client().post("/verify", json=wrong_protocol)
+    assert response.status_code == 409
+
+    stale_health = _verify_json(statement=_STMT, proof=_PROOF)
+    stale_health["expected_verifier_bundle_digest"] = "0" * 64
+    response = _client().post("/verify", json=stale_health)
+    assert response.status_code == 409
+    assert calls == {"allocate": 0, "codex": 0}
 
 
 # --------------------------------------------------------------------------- #
@@ -176,7 +239,9 @@ def test_verify_accept_contract():
         return _CANNED_OK
 
     with _fake_run(fake):
-        resp = _client().post("/verify", json={"statement": _STMT, "proof": _PROOF})
+        resp = _client().post(
+            "/verify", json=_verify_json(statement=_STMT, proof=_PROOF)
+        )
     assert resp.status_code == 200
     body = resp.json()
     assert body["verdict"] == "correct"
@@ -187,19 +252,29 @@ def test_verify_accept_contract():
 def test_verify_reject_verdict_still_200():
     # a "wrong" verdict is a normal 200 response (the verdict is the payload).
     canned = {
-        "output_schema_version": 2,
+        "output_schema_version": 3,
         "verification_status": "final",
         "verification_report": {
             "summary": "gap",
             "critical_errors": [],
-            "gaps": [{"location": "proof", "issue": "missing step"}],
+            "gaps": [{
+                "location": "proof",
+                "issue": "missing step",
+                "candidate_evidence": {
+                    "source": "proof",
+                    "line": 1,
+                    "exact_line": _PROOF,
+                },
+            }],
         },
         "verdict": "wrong",
         "needs_expanded_proofs": [],
         "repair_hints": "fix the gap",
     }
     with _fake_run(lambda run_id, statement, proof: canned):
-        resp = _client().post("/verify", json={"statement": _STMT, "proof": _PROOF})
+        resp = _client().post(
+            "/verify", json=_verify_json(statement=_STMT, proof=_PROOF)
+        )
     assert resp.status_code == 200 and resp.json()["verdict"] == "wrong"
 
 
@@ -215,12 +290,12 @@ def test_verify_forwards_optional_fact_context():
     with _fake_run(fake):
         resp = _client().post(
             "/verify",
-            json={
-                "statement": _STMT,
-                "proof": _PROOF,
-                "fact_context": _FACT_CONTEXT,
-                "glossary_introduces": {"X": "a compact space"},
-            },
+            json=_verify_json(
+                statement=_STMT,
+                proof=_PROOF,
+                fact_context=_FACT_CONTEXT,
+                glossary_introduces={"X": "a compact space"},
+            ),
         )
     assert resp.status_code == 200 and resp.json()["verdict"] == "correct"
     assert resp.json()["verification_context_digest"] == _FACT_CONTEXT["digest"]
@@ -257,7 +332,9 @@ def test_verify_rejects_incomplete_or_tampered_context_before_codex():
         for fact_context in cases:
             resp = _client().post(
                 "/verify",
-                json={"statement": _STMT, "proof": _PROOF, "fact_context": fact_context},
+                json=_verify_json(
+                    statement=_STMT, proof=_PROOF, fact_context=fact_context
+                ),
             )
             assert resp.status_code == 400 and "invalid fact_context" in resp.json()["detail"]
 
@@ -265,14 +342,18 @@ def test_verify_rejects_incomplete_or_tampered_context_before_codex():
 def test_verify_requires_context_for_cited_internal_fact():
     proof = _PROOF + " Apply verified fact aaaaaaaaaaaaaaaa to finish."
     with _fake_run(_must_not_run):
-        resp = _client().post("/verify", json={"statement": _STMT, "proof": proof})
+        resp = _client().post(
+            "/verify", json=_verify_json(statement=_STMT, proof=proof)
+        )
     assert resp.status_code == 400 and "fact_context is required" in resp.json()["detail"]
 
 
 def test_verify_requires_context_for_internal_fact_id_in_statement():
     statement = _STMT + " This is the consequence recorded as bbbbbbbbbbbbbbbb."
     with _fake_run(_must_not_run):
-        resp = _client().post("/verify", json={"statement": statement, "proof": _PROOF})
+        resp = _client().post(
+            "/verify", json=_verify_json(statement=statement, proof=_PROOF)
+        )
     assert resp.status_code == 400 and "fact_context is required" in resp.json()["detail"]
 
 
@@ -288,7 +369,9 @@ def test_verify_requires_declared_and_cited_predecessors_to_match():
     with _fake_run(_must_not_run):
         resp = _client().post(
             "/verify",
-            json={"statement": _STMT, "proof": _PROOF, "fact_context": context},
+            json=_verify_json(
+                statement=_STMT, proof=_PROOF, fact_context=context
+            ),
         )
     assert resp.status_code == 400 and "declared but not cited" in resp.json()["detail"]
 
@@ -316,7 +399,9 @@ def test_verify_matches_declared_predecessors_across_statement_and_proof():
     with _fake_run(fake):
         resp = _client().post(
             "/verify",
-            json={"statement": statement, "proof": proof, "fact_context": context},
+            json=_verify_json(
+                statement=statement, proof=proof, fact_context=context
+            ),
         )
     assert resp.status_code == 200
 
@@ -353,11 +438,11 @@ def test_verify_accepts_exact_adaptive_expansion_and_rejects_proof_leakage():
     with _fake_run(fake):
         resp = _client().post(
             "/verify",
-            json={
-                "statement": _STMT,
-                "proof": _PROOF + f" Apply {direct}.",
-                "fact_context": context,
-            },
+            json=_verify_json(
+                statement=_STMT,
+                proof=_PROOF + f" Apply {direct}.",
+                fact_context=context,
+            ),
         )
     assert resp.status_code == 200
 
@@ -368,11 +453,11 @@ def test_verify_accepts_exact_adaptive_expansion_and_rejects_proof_leakage():
     with _fake_run(_must_not_run):
         resp = _client().post(
             "/verify",
-            json={
-                "statement": _STMT,
-                "proof": _PROOF + f" Apply {direct}.",
-                "fact_context": leaked,
-            },
+            json=_verify_json(
+                statement=_STMT,
+                proof=_PROOF + f" Apply {direct}.",
+                fact_context=leaked,
+            ),
         )
     assert resp.status_code == 400
     assert "fact statement card" in resp.json()["detail"]
@@ -383,11 +468,11 @@ def test_verify_rejects_undeclared_fact_id_in_statement_with_context():
     with _fake_run(_must_not_run):
         resp = _client().post(
             "/verify",
-            json={
-                "statement": statement,
-                "proof": _PROOF,
-                "fact_context": _FACT_CONTEXT,
-            },
+            json=_verify_json(
+                statement=statement,
+                proof=_PROOF,
+                fact_context=_FACT_CONTEXT,
+            ),
         )
     assert resp.status_code == 400 and "undeclared" in resp.json()["detail"]
 
@@ -450,10 +535,102 @@ def test_verify_rejects_when_preparse_admission_is_full(monkeypatch):
     assert slots.acquire(blocking=False)
     monkeypatch.setattr(service, "_ADMISSION_SLOTS", slots)
     try:
-        resp = _client().post("/verify", json={"statement": _STMT, "proof": _PROOF})
+        resp = _client().post(
+            "/verify", json=_verify_json(statement=_STMT, proof=_PROOF)
+        )
     finally:
         slots.release()
     assert resp.status_code == 429 and "busy" in resp.json()["detail"]
+
+
+def test_paid_lease_survives_asgi_cancellation_until_sync_job_terminal(monkeypatch):
+    """A disconnected caller cannot free capacity while its paid job runs."""
+    paid_slots = threading.BoundedSemaphore(1)
+    entered = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    allocations = []
+
+    def blocked_codex(*_args, **_kwargs):
+        entered.set()
+        assert release.wait(5)
+        finished.set()
+        return _CANNED_OK
+
+    monkeypatch.setattr(service, "_PAID_JOB_SLOTS", paid_slots)
+    monkeypatch.setattr(service, "require_gateway_runtime", lambda: None)
+    monkeypatch.setattr(
+        service,
+        "_allocate_run_id",
+        lambda statement: allocations.append(statement) or f"RID-{len(allocations)}",
+    )
+    monkeypatch.setattr(service, "run_codex_verification", blocked_codex)
+
+    payload = json.dumps(_verify_json(statement=_STMT, proof=_PROOF)).encode()
+
+    async def scenario():
+        delivered = False
+
+        async def receive():
+            nonlocal delivered
+            if delivered:
+                return {"type": "http.disconnect"}
+            delivered = True
+            return {"type": "http.request", "body": payload, "more_body": False}
+
+        messages = []
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/verify",
+            "raw_path": b"/verify",
+            "query_string": b"",
+            "headers": [(b"content-type", b"application/json")],
+            "client": ("127.0.0.1", 44000),
+            "server": ("127.0.0.1", 8091),
+        }
+
+        async def send(message):
+            messages.append(message)
+
+        first = asyncio.create_task(service.app(scope, receive, send))
+        assert await asyncio.to_thread(entered.wait, 2)
+        first.cancel()  # model an ASGI/client cancellation after paid work began
+
+        second = await asyncio.to_thread(
+            lambda: _client().post(
+                "/verify", json=_verify_json(statement=_STMT, proof=_PROOF)
+            )
+        )
+        assert second.status_code == 429
+        assert len(allocations) == 1  # 429 happened before run-dir allocation
+
+        health = await asyncio.to_thread(lambda: _client().get("/health"))
+        assert health.status_code == 200
+        assert not finished.is_set()
+
+        release.set()
+        try:
+            await asyncio.wait_for(first, 2)
+        except asyncio.CancelledError:
+            pass
+        assert await asyncio.to_thread(finished.wait, 2)
+
+        third = await asyncio.to_thread(
+            lambda: _client().post(
+                "/verify", json=_verify_json(statement=_STMT, proof=_PROOF)
+            )
+        )
+        assert third.status_code == 200
+        assert len(allocations) == 2
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        release.set()
 
 
 # --------------------------------------------------------------------------- #
@@ -466,7 +643,9 @@ def _must_not_run(*a, **k):
 
 def test_verify_vacuous_proof_400():
     with _fake_run(_must_not_run):
-        resp = _client().post("/verify", json={"statement": _STMT, "proof": "QED"})
+        resp = _client().post(
+            "/verify", json=_verify_json(statement=_STMT, proof="QED")
+        )
     assert resp.status_code == 400 and "vacuous proof" in resp.json()["detail"]
 
 
@@ -474,7 +653,9 @@ def test_verify_p1_precheck_400():
     bad = ("The result holds as declared in problem.md, which lists it as a verified "
            "building block, so we are done with the argument here.")
     with _fake_run(_must_not_run):
-        resp = _client().post("/verify", json={"statement": _STMT, "proof": bad})
+        resp = _client().post(
+            "/verify", json=_verify_json(statement=_STMT, proof=bad)
+        )
     assert resp.status_code == 400 and "[P1 on proof]" in resp.json()["detail"]
 
 
@@ -495,7 +676,9 @@ def test_gateway_preflight_failure_allocates_nothing_and_starts_no_codex(monkeyp
     monkeypatch.setattr(service, "require_gateway_runtime", fail_preflight)
     monkeypatch.setattr(service, "_allocate_run_id", allocate)
     monkeypatch.setattr(service, "run_codex_verification", codex)
-    resp = _client().post("/verify", json={"statement": _STMT, "proof": _PROOF})
+    resp = _client().post(
+        "/verify", json=_verify_json(statement=_STMT, proof=_PROOF)
+    )
 
     assert resp.status_code == 500
     assert calls == {"allocate": 0, "codex": 0}
@@ -522,7 +705,9 @@ def test_second_preflight_failure_returns_500_without_result_or_codex(
     )
     monkeypatch.setenv("VERIFIER_RESULTS_DIR", str(results_root))
 
-    resp = _client().post("/verify", json={"statement": _STMT, "proof": _PROOF})
+    resp = _client().post(
+        "/verify", json=_verify_json(statement=_STMT, proof=_PROOF)
+    )
 
     assert resp.status_code == 500
     assert "runtime broke after admission" in resp.json()["detail"]
@@ -544,25 +729,33 @@ def _raiser(status, detail):
 
 def test_verify_timeout_504():
     with _fake_run(_raiser(504, "codex exec timed out after 900s")):
-        resp = _client().post("/verify", json={"statement": _STMT, "proof": _PROOF})
+        resp = _client().post(
+            "/verify", json=_verify_json(statement=_STMT, proof=_PROOF)
+        )
     assert resp.status_code == 504 and "timed out" in resp.json()["detail"]
 
 
 def test_verify_exit_500():
     with _fake_run(_raiser(500, "codex exec failed with exit code 7")):
-        resp = _client().post("/verify", json={"statement": _STMT, "proof": _PROOF})
+        resp = _client().post(
+            "/verify", json=_verify_json(statement=_STMT, proof=_PROOF)
+        )
     assert resp.status_code == 500 and "exit code" in resp.json()["detail"]
 
 
 def test_verify_missing_output_500():
     with _fake_run(_raiser(500, "verification output was not found")):
-        resp = _client().post("/verify", json={"statement": _STMT, "proof": _PROOF})
+        resp = _client().post(
+            "/verify", json=_verify_json(statement=_STMT, proof=_PROOF)
+        )
     assert resp.status_code == 500 and "was not found" in resp.json()["detail"]
 
 
 def test_verify_bad_json_500():
     with _fake_run(_raiser(500, "verification output ... is not valid JSON")):
-        resp = _client().post("/verify", json={"statement": _STMT, "proof": _PROOF})
+        resp = _client().post(
+            "/verify", json=_verify_json(statement=_STMT, proof=_PROOF)
+        )
     assert resp.status_code == 500 and "not valid JSON" in resp.json()["detail"]
 
 
@@ -572,13 +765,15 @@ def test_verify_bad_json_500():
 
 def test_verify_empty_field_422():
     with _fake_run(_must_not_run):
-        resp = _client().post("/verify", json={"statement": "", "proof": _PROOF})
+        resp = _client().post(
+            "/verify", json=_verify_json(statement="", proof=_PROOF)
+        )
     assert resp.status_code == 422
 
 
 def test_verify_missing_field_422():
     with _fake_run(_must_not_run):
-        resp = _client().post("/verify", json={"statement": _STMT})
+        resp = _client().post("/verify", json=_verify_json(statement=_STMT))
     assert resp.status_code == 422
 
 

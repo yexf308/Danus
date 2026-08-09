@@ -17,17 +17,23 @@ echo "DANUS_ROOT=$DANUS_ROOT"
 "$DANUS_PY" -c 'import openai' 2>/dev/null && ok "python dep: openai (gpt_pro consult)" || wn "openai missing (gpt_pro consult disabled)"
 "$DANUS_PY" -c 'import anthropic' 2>/dev/null && ok "python dep: anthropic (claude_api consult)" || wn "anthropic missing (claude_api consult disabled)"
 if [ -n "${DANUS_NODE:-}" ] && [ -x "${DANUS_NODE:-/nonexist}" ]; then ok "node: $DANUS_NODE"; else wn "node not provisioned"; fi
-if "$DANUS_ROOT/bin/codex" --version >/dev/null 2>&1; then ok "codex: $("$DANUS_ROOT/bin/codex" --version 2>/dev/null)"; else no "codex wrapper not working (run bootstrap.sh)"; fi
+CODEX_PROBE_BIN="${DANUS_CODEX_BIN:-$DANUS_ROOT/bin/codex}"
+if "$CODEX_PROBE_BIN" --version >/dev/null 2>&1; then
+  ok "codex: $("$CODEX_PROBE_BIN" --version 2>/dev/null)"
+else
+  no "configured codex binary not working: $CODEX_PROBE_BIN"
+fi
 if [ "${CODEX_BACKEND:-api}" = "api" ]; then
   if [ -f "$CODEX_HOME/config.toml" ] && grep -q danus_api "$CODEX_HOME/config.toml" 2>/dev/null; then ok "codex backend: api provider configured"; else no "codex api provider missing (scripts/setup-codex.sh api)"; fi
   bash "$DANUS_ROOT/scripts/check-codex.sh" >/dev/null 2>&1 && ok "codex API live ping ok" || wn "codex API ping FAILED (bash scripts/check-codex.sh — endpoint down/rate-limited?)"
 else
-  env CODEX_HOME="$CODEX_HOME" "$DANUS_ROOT/bin/codex" login status >/dev/null 2>&1 && ok "codex login ok ($CODEX_HOME)" || wn "codex not logged in (scripts/setup-codex.sh login)"
+  env CODEX_HOME="$CODEX_HOME" "$CODEX_PROBE_BIN" login status >/dev/null 2>&1 && ok "codex login ok ($CODEX_HOME)" || wn "codex not logged in (scripts/setup-codex.sh login)"
 fi
 case "$(danus_verify_health)" in
   ours)    ok "verify service up :$VERIFY_PORT (ours)" ;;
   foreign) no "verify port :$VERIFY_PORT answered by a FOREIGN process — another deployment holds this port; set a distinct VERIFY_PORT/DASHBOARD_PORT in config/danus.env (fact_submit would post to the wrong verifier)" ;;
-  stale)   wn "verify service down :$VERIFY_PORT (stale pidfile; scripts/services.sh up verify)" ;;
+  cleanup_in_progress) wn "verify service stopping — owned paid cleanup still holds lifecycle authority" ;;
+  unsafe)  no "verify guardian/control identity is unsafe — reconcile manually; no numeric PID was signalled" ;;
   *)       wn "verify service down :$VERIFY_PORT (scripts/services.sh up verify)" ;;
 esac
 # write-paper PDF render (soft): TEX_ENGINE override, else pdflatex on PATH.

@@ -19,7 +19,12 @@ from pathlib import Path
 from fastapi import HTTPException
 
 from danus.verify import prechecks
-from danus.verify.service import VerifyRequest, verify
+from danus.verify.service import (
+    VERIFICATION_OUTPUT_PROTOCOL_VERSION,
+    VERIFIER_BUNDLE_DIGEST,
+    VerifyRequest,
+    verify,
+)
 
 FAKE = Path(__file__).resolve().parent / "fake_codex.py"
 
@@ -52,7 +57,16 @@ def _ensure_fake_executable():
 def _call(statement, proof, tmp):
     with _env(DANUS_CODEX_BIN=str(FAKE)), \
             _env(VERIFIER_RESULTS_DIR=str(Path(tmp) / "runs"), VERIFY_AGENT_HOME=str(tmp)):
-        return verify(VerifyRequest(statement=statement, proof=proof))
+        return verify(
+            VerifyRequest(
+                expected_output_protocol_version=(
+                    VERIFICATION_OUTPUT_PROTOCOL_VERSION
+                ),
+                expected_verifier_bundle_digest=VERIFIER_BUNDLE_DIGEST,
+                statement=statement,
+                proof=proof,
+            )
+        )
 
 
 def test_prechecks_units():

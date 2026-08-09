@@ -66,7 +66,8 @@ For unattended operation see `operations.md` (the tmux example).
 `danus start <p>` launches the autonomous worker loops. Each worker reads its
 `TASK.md` + `master_guidance`, picks proving skills, works, and submits results via
 `fact_submit` — which the **verifier** gates. A submission becomes a **fact** only
-on a `correct` verdict; every verdict is traced to global memory either way.
+after a `correct` verdict *and* successful graph promotion (`promoted: true` with
+a non-null `fact_id`); every verdict is traced to global memory either way.
 
 Monitor with:
 

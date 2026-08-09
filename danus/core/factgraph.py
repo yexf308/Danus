@@ -45,6 +45,10 @@ VERIFICATION_CONTEXT_SCHEMA_VERSION = 3
 VERIFICATION_CONTEXT_PROJECTION = "full-statement-closure-adaptive-proofs-v1"
 
 
+class FactPromotionOutcomeUnknown(RuntimeError):
+    """The storage outcome cannot be stated definitively after an fsync failure."""
+
+
 def _term_occurs(term: str, text: str) -> bool:
     """Literal notation match with identifier boundaries where applicable."""
     if not term or not text:
@@ -289,6 +293,8 @@ class FactGraph:
         self.glossary_path = self.dir / "glossary.json"
         self.revocation_log = self.dir / "revocation_log.jsonl"
         self.pending_add_path = self.dir / ".pending_add.json"
+        self.pending_add_commit_path = self.dir / ".pending_add.committed.json"
+        self.pending_add_abort_path = self.dir / ".pending_add.rollback_required.json"
         self.pending_revocation_path = self.dir / ".pending_revocation.json"
 
     @staticmethod
@@ -300,9 +306,51 @@ class FactGraph:
         finally:
             os.close(descriptor)
 
+    def _fsync_directory_with_retry(self, directory: Path) -> None:
+        """Prove directory-entry durability, retrying one transient failure.
+
+        A successful ``unlink`` followed by a failed directory ``fsync`` leaves
+        the pathname absent in the running kernel while the old entry may still
+        reappear after power loss.  Retrying the barrier is therefore materially
+        different from checking ``Path.exists()``: only a successful fsync proves
+        that a later mutation cannot be followed by resurrection of an obsolete
+        transaction marker.
+        """
+        try:
+            self._fsync_directory(directory)
+        except Exception as first_error:
+            try:
+                self._fsync_directory(directory)
+            except Exception as retry_error:
+                raise retry_error from first_error
+
+    def _mkdir_durable(self, directory: Path) -> None:
+        """Create ``directory`` and durably publish its path entry.
+
+        The parent barrier also runs when ``directory`` is already visible.  It
+        may be a retry after an earlier ``mkdir`` succeeded but the parent fsync
+        failed; fsyncing the child directory cannot make its own parent entry
+        durable.
+        """
+        missing: List[Path] = []
+        cursor = directory
+        while not cursor.exists():
+            missing.append(cursor)
+            if cursor.parent == cursor:
+                break
+            cursor = cursor.parent
+        directory.mkdir(parents=True, exist_ok=True)
+        parents_to_sync = (
+            [created.parent for created in reversed(missing)]
+            if missing
+            else [directory.parent]
+        )
+        for parent in parents_to_sync:
+            self._fsync_directory_with_retry(parent)
+
     def _atomic_write_text(self, path: Path, text: str) -> None:
         """Write ``text`` through a same-directory durable atomic replace."""
-        path.parent.mkdir(parents=True, exist_ok=True)
+        self._mkdir_durable(path.parent)
         temporary_path: Optional[Path] = None
         try:
             with tempfile.NamedTemporaryFile(
@@ -324,16 +372,41 @@ class FactGraph:
                 temporary_path.unlink()
 
     def _unlink_durable(self, path: Path) -> None:
+        """Remove ``path`` and prove the parent entry state is durable.
+
+        The barrier also runs when the pathname is already absent.  That case can
+        be a retry after an earlier process observed a successful unlink but lost
+        the following fsync; treating absence as success would let recovery erase
+        its own journal and later resurrect stale bytes after another mutation.
+        """
         if path.exists():
             path.unlink()
-            self._fsync_directory(path.parent)
+        self._fsync_directory_with_retry(path.parent)
 
     def _assert_graph_readable(self) -> None:
-        pending = [
-            path.name
-            for path in (self.pending_add_path, self.pending_revocation_path)
-            if path.exists()
-        ]
+        pending = []
+        prepared_add = self._load_pending_add_unlocked()
+        aborted_add = self._load_pending_add_abort_unlocked()
+        if aborted_add is not None:
+            pending.append(self.pending_add_abort_path.name)
+        elif (committed_add := self._load_pending_add_commit_unlocked()) is not None:
+            # The commit marker may be visible after ``os.replace`` even though
+            # the creating process crashed before fsyncing this directory.  A
+            # read must not expose that transient state as authoritative: power
+            # loss could otherwise discard the marker, leaving prepared-only
+            # recovery to roll back a fact that callers already observed.
+            try:
+                self._fsync_directory_with_retry(self.dir)
+            except Exception as exc:
+                raise ValueError(
+                    "fact_graph_recovery_required: committed add marker "
+                    "durability barrier failed"
+                ) from exc
+            self._validate_committed_add_unlocked(prepared_add, committed_add)
+        elif prepared_add is not None:
+            pending.append(self.pending_add_path.name)
+        if self.pending_revocation_path.exists():
+            pending.append(self.pending_revocation_path.name)
         if pending:
             raise ValueError(
                 "fact_graph_recovery_required: pending graph transaction "
@@ -386,7 +459,7 @@ class FactGraph:
     @contextmanager
     def _graph_lock(self, operation: int) -> Iterator[None]:
         """Take the stable cross-process lock shared by readers and writers."""
-        self.dir.mkdir(parents=True, exist_ok=True)
+        self._mkdir_durable(self.dir)
         lock_path = self.dir / ".mutation.lock"
         with lock_path.open("a+", encoding="utf-8") as lock_handle:
             fcntl.flock(lock_handle.fileno(), operation)
@@ -399,6 +472,17 @@ class FactGraph:
     def _mutation_lock(self) -> Iterator[None]:
         """Serialize dependency checks and mutations across processes."""
         with self._graph_lock(fcntl.LOCK_EX):
+            # Stabilize every prior transaction-marker create/unlink before
+            # inspecting recovery state or changing fact/glossary bytes.  This is
+            # the cross-process guard for the narrow case where a prior cleanup
+            # made a marker visibly absent but could not fsync that absence.
+            try:
+                self._fsync_directory_with_retry(self.dir)
+            except Exception as exc:
+                raise RuntimeError(
+                    "fact_graph_recovery_required: mutation directory durability "
+                    "barrier failed"
+                ) from exc
             yield
 
     @contextmanager
@@ -427,28 +511,128 @@ class FactGraph:
             raise ValueError("fact_graph_recovery_error: malformed pending add")
         fact_id = payload.get("fact_id")
         previous_fact = payload.get("previous_fact")
-        previous_glossary = payload.get("previous_glossary")
-        glossary_existed = payload.get("glossary_existed")
         if (
-            payload.get("schema_version") != 1
-            or not isinstance(fact_id, str)
+            not isinstance(fact_id, str)
             or not _SAFE_FACT_ID_RE.fullmatch(fact_id)
             or (previous_fact is not None and not isinstance(previous_fact, str))
-            or not isinstance(previous_glossary, dict)
-            or any(
-                not isinstance(term, str) or not isinstance(definition, str)
-                for term, definition in previous_glossary.items()
+        ):
+            raise ValueError("fact_graph_recovery_error: malformed pending add")
+        if payload.get("schema_version") == 1:
+            previous_glossary = payload.get("previous_glossary")
+            glossary_existed = payload.get("glossary_existed")
+            if (
+                not isinstance(previous_glossary, dict)
+                or any(
+                    not isinstance(term, str) or not isinstance(definition, str)
+                    for term, definition in previous_glossary.items()
+                )
+                or not isinstance(glossary_existed, bool)
+            ):
+                raise ValueError("fact_graph_recovery_error: malformed pending add")
+            return payload
+        if (
+            payload.get("schema_version") != 2
+            or payload.get("state") != "prepared"
+            or not _CONTENT_FACT_ID_RE.fullmatch(fact_id)
+            or not isinstance(payload.get("transaction_id"), str)
+            or not re.fullmatch(r"[0-9a-f]{32}", str(payload["transaction_id"]))
+            or (
+                payload.get("previous_glossary_text") is not None
+                and not isinstance(payload.get("previous_glossary_text"), str)
             )
-            or not isinstance(glossary_existed, bool)
+            or not isinstance(payload.get("expected_fact_sha256"), str)
+            or not re.fullmatch(
+                r"[0-9a-f]{64}", str(payload["expected_fact_sha256"])
+            )
+            or (
+                payload.get("expected_glossary_sha256") is not None
+                and (
+                    not isinstance(payload.get("expected_glossary_sha256"), str)
+                    or not re.fullmatch(
+                        r"[0-9a-f]{64}",
+                        str(payload["expected_glossary_sha256"]),
+                    )
+                )
+            )
         ):
             raise ValueError("fact_graph_recovery_error: malformed pending add")
         return payload
 
-    def _rollback_pending_add_unlocked(self) -> None:
-        """Idempotently restore the snapshot recorded before a glossary add."""
-        payload = self._load_pending_add_unlocked()
-        if payload is None:
-            return
+    def _load_pending_add_commit_unlocked(self) -> Optional[Dict[str, object]]:
+        if not self.pending_add_commit_path.exists():
+            return None
+        try:
+            payload = json.loads(
+                self.pending_add_commit_path.read_text(encoding="utf-8")
+            )
+        except (json.JSONDecodeError, OSError) as exc:
+            raise ValueError(
+                "fact_graph_recovery_error: unreadable committed add marker"
+            ) from exc
+        if not isinstance(payload, dict):
+            raise ValueError(
+                "fact_graph_recovery_error: malformed committed add marker"
+            )
+        if (
+            payload.get("schema_version") != 2
+            or payload.get("state") != "committed"
+            or not isinstance(payload.get("transaction_id"), str)
+            or not re.fullmatch(r"[0-9a-f]{32}", str(payload["transaction_id"]))
+            or not isinstance(payload.get("fact_id"), str)
+            or not _CONTENT_FACT_ID_RE.fullmatch(str(payload["fact_id"]))
+            or not isinstance(payload.get("expected_fact_sha256"), str)
+            or not re.fullmatch(
+                r"[0-9a-f]{64}", str(payload["expected_fact_sha256"])
+            )
+            or (
+                payload.get("expected_glossary_sha256") is not None
+                and (
+                    not isinstance(payload.get("expected_glossary_sha256"), str)
+                    or not re.fullmatch(
+                        r"[0-9a-f]{64}",
+                        str(payload["expected_glossary_sha256"]),
+                    )
+                )
+            )
+        ):
+            raise ValueError(
+                "fact_graph_recovery_error: malformed committed add marker"
+            )
+        return payload
+
+    def _load_pending_add_abort_unlocked(self) -> Optional[Dict[str, object]]:
+        if not self.pending_add_abort_path.exists():
+            return None
+        try:
+            payload = json.loads(
+                self.pending_add_abort_path.read_text(encoding="utf-8")
+            )
+        except (json.JSONDecodeError, OSError) as exc:
+            raise ValueError(
+                "fact_graph_recovery_error: unreadable add rollback marker"
+            ) from exc
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema_version") != 1
+            or payload.get("state") != "rollback_required"
+            or not isinstance(payload.get("transaction_id"), str)
+            or not re.fullmatch(r"[0-9a-f]{32}", str(payload["transaction_id"]))
+            or not isinstance(payload.get("fact_id"), str)
+            or not _CONTENT_FACT_ID_RE.fullmatch(str(payload["fact_id"]))
+        ):
+            raise ValueError(
+                "fact_graph_recovery_error: malformed add rollback marker"
+            )
+        return payload
+
+    @staticmethod
+    def _pending_add_text(payload: Dict[str, object]) -> str:
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n"
+
+    def _restore_pending_add_snapshot_unlocked(
+        self, payload: Dict[str, object]
+    ) -> None:
+        """Idempotently restore the exact snapshot preceding an add."""
         fact_path = self._path(str(payload["fact_id"]))
         previous_fact = payload["previous_fact"]
         if isinstance(previous_fact, str):
@@ -456,21 +640,169 @@ class FactGraph:
         else:
             self._unlink_durable(fact_path)
 
-        previous_glossary = payload["previous_glossary"]
-        if payload["glossary_existed"]:
-            assert isinstance(previous_glossary, dict)
+        if payload["schema_version"] == 1:
+            previous_glossary = payload["previous_glossary"]
+            if payload["glossary_existed"]:
+                assert isinstance(previous_glossary, dict)
+                self._atomic_write_text(
+                    self.glossary_path,
+                    json.dumps(
+                        dict(sorted(previous_glossary.items())),
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                    + "\n",
+                )
+            else:
+                self._unlink_durable(self.glossary_path)
+            return
+
+        previous_glossary_text = payload["previous_glossary_text"]
+        if isinstance(previous_glossary_text, str):
             self._atomic_write_text(
                 self.glossary_path,
-                json.dumps(
-                    dict(sorted(previous_glossary.items())),
-                    ensure_ascii=False,
-                    indent=2,
-                )
-                + "\n",
+                previous_glossary_text,
             )
         else:
             self._unlink_durable(self.glossary_path)
+
+    def _rollback_pending_add_unlocked(self) -> None:
+        """Rollback a prepared add; committed transactions are never reverted."""
+        aborted = self._load_pending_add_abort_unlocked()
+        if aborted is not None:
+            self._recover_aborted_add_unlocked(aborted)
+            return
+        committed = self._load_pending_add_commit_unlocked()
+        if committed is not None:
+            prepared = self._load_pending_add_unlocked()
+            self._validate_committed_add_unlocked(prepared, committed)
+            if not self._cleanup_committed_add_unlocked():
+                raise RuntimeError(
+                    "fact_graph_recovery_required: committed add cleanup did not complete"
+                )
+            return
+        payload = self._load_pending_add_unlocked()
+        if payload is None:
+            return
+        self._restore_pending_add_snapshot_unlocked(payload)
         self._unlink_durable(self.pending_add_path)
+
+    def _recover_aborted_add_unlocked(self, aborted: Dict[str, object]) -> None:
+        """Idempotently finish rollback after an uncertain commit-marker write."""
+        prepared = self._load_pending_add_unlocked()
+        if (
+            prepared is None
+            or prepared.get("schema_version") != 2
+            or prepared.get("transaction_id") != aborted.get("transaction_id")
+            or prepared.get("fact_id") != aborted.get("fact_id")
+        ):
+            raise RuntimeError(
+                "fact_graph_recovery_required: add rollback snapshot is unavailable"
+            )
+
+        # The rollback marker stays durable throughout, so even a partially
+        # restored snapshot cannot be observed as graph truth.
+        try:
+            self._unlink_durable(self.pending_add_commit_path)
+        except Exception:
+            pass
+        self._restore_pending_add_snapshot_unlocked(prepared)
+        if self.pending_add_commit_path.exists():
+            raise RuntimeError(
+                "fact_graph_recovery_required: uncertain add commit marker remains"
+            )
+        try:
+            self._fsync_directory(self.dir)
+        except Exception as exc:
+            raise RuntimeError(
+                "fact_graph_recovery_required: add rollback is not durable"
+            ) from exc
+        # Removing the abort marker first is safe: a crash then leaves the
+        # prepared snapshot, whose normal recovery repeats this rollback.
+        self._unlink_durable(self.pending_add_abort_path)
+        self._unlink_durable(self.pending_add_path)
+
+    def _validate_committed_add_unlocked(
+        self,
+        prepared: Optional[Dict[str, object]],
+        committed: Dict[str, object],
+    ) -> None:
+        """Fail closed unless a committed marker matches exact graph bytes."""
+        try:
+            if prepared is not None:
+                if prepared.get("schema_version") != 2 or any(
+                    prepared.get(key) != committed.get(key)
+                    for key in (
+                        "transaction_id",
+                        "fact_id",
+                        "expected_fact_sha256",
+                        "expected_glossary_sha256",
+                    )
+                ):
+                    raise ValueError("prepared and committed add markers disagree")
+            fact_id = str(committed["fact_id"])
+            fact_path = self._path(fact_id)
+            raw_bytes = fact_path.read_bytes()
+            if hashlib.sha256(raw_bytes).hexdigest() != committed["expected_fact_sha256"]:
+                raise ValueError("committed fact bytes do not match marker")
+            raw = raw_bytes.decode("utf-8")
+            self._validate_fact_integrity(fact_id, raw, parse_frontmatter(raw))
+
+            expected_glossary_sha256 = committed["expected_glossary_sha256"]
+            if expected_glossary_sha256 is None:
+                if self.glossary_path.exists():
+                    raise ValueError("committed glossary existence does not match marker")
+            else:
+                glossary_bytes = self.glossary_path.read_bytes()
+                if (
+                    hashlib.sha256(glossary_bytes).hexdigest()
+                    != expected_glossary_sha256
+                ):
+                    raise ValueError("committed glossary bytes do not match marker")
+                self._read_project_glossary(strict=True)
+        except Exception as exc:
+            raise ValueError(
+                "fact_graph_recovery_required: committed add state is not exact"
+            ) from exc
+
+    def _cleanup_committed_add_unlocked(self) -> bool:
+        """Best-effort cleanup in an order that can never turn commit into rollback."""
+        if self.pending_add_path.exists():
+            try:
+                self._unlink_durable(self.pending_add_path)
+            except Exception:
+                if self.pending_add_path.exists():
+                    return False
+                # A monkeypatched/platform unlink helper may raise after removing
+                # the entry but before proving the parent directory durable.
+                try:
+                    self._fsync_directory_with_retry(self.dir)
+                except Exception:
+                    return False
+        else:
+            # A prior cleanup may have unlinked the prepared snapshot and then
+            # failed its directory fsync.  Confirm that absence before removing
+            # the only marker that tells restart recovery to preserve the data.
+            try:
+                self._fsync_directory_with_retry(self.dir)
+            except Exception:
+                return False
+        try:
+            self._unlink_durable(self.pending_add_commit_path)
+        except Exception:
+            if self.pending_add_commit_path.exists():
+                return False
+            # Visible absence is not a durability proof.  A one-shot post-unlink
+            # fsync failure is retried here; persistent failure leaves cleanup
+            # incomplete, and the next mutation's mandatory root barrier blocks
+            # any byte change until the absence can be proven durable.
+            try:
+                self._fsync_directory_with_retry(self.dir)
+            except Exception:
+                return False
+        return not (
+            self.pending_add_path.exists() or self.pending_add_commit_path.exists()
+        )
 
     def _recover_pending_transactions_unlocked(self) -> Optional[Dict[str, object]]:
         self._rollback_pending_add_unlocked()
@@ -573,31 +905,77 @@ class FactGraph:
         )
         fact_path = self._path(fact_id)
         serialized = serialize_fact(fact)
-        self.facts_dir.mkdir(parents=True, exist_ok=True)
-        if not glossary_introduces:
-            self._atomic_write_text(fact_path, serialized)
-            return fact_id
+        self._mkdir_durable(self.facts_dir)
 
-        # Fact and derived glossary are a small recoverable transaction. The
-        # durable snapshot makes a crash or a failed rollback fail closed until
-        # the next graph mutation restores the pre-add state.
+        # Every add, including one that leaves the glossary untouched, follows
+        # the same recoverable transaction protocol.  The prepared journal is
+        # durable before data changes; the separate committed marker becomes
+        # durable only after the exact fact/glossary bytes.  Cleanup deliberately
+        # removes the prepared snapshot first, so any crash state is unambiguous:
+        # prepared alone rolls back, while a committed marker always preserves.
         previous_fact = self._get_raw_unchecked(fact_id)
-        previous_glossary = self._read_project_glossary(strict=True)
+        glossary_existed = self.glossary_path.exists()
+        previous_glossary_text = (
+            self.glossary_path.read_text(encoding="utf-8")
+            if glossary_existed
+            else None
+        )
+        if glossary_introduces:
+            expected_glossary_text = json.dumps(
+                dict(sorted(merged_glossary.items())),
+                ensure_ascii=False,
+                indent=2,
+            ) + "\n"
+        else:
+            expected_glossary_text = previous_glossary_text
+        # Lost-response retries are a normal production path.  If this exact
+        # fact and its exact derived-glossary bytes are already authoritative,
+        # return the content id without opening a second write transaction.  A
+        # redundant rewrite could fail and falsely report non-promotion while
+        # the previously committed fact remains visible.
+        if (
+            previous_fact == serialized
+            and previous_glossary_text == expected_glossary_text
+        ):
+            return fact_id
+        transaction_id = uuid.uuid4().hex
         pending_add = {
-            "schema_version": 1,
+            "schema_version": 2,
+            "state": "prepared",
+            "transaction_id": transaction_id,
             "fact_id": fact_id,
             "previous_fact": previous_fact,
-            "previous_glossary": previous_glossary,
-            "glossary_existed": self.glossary_path.exists(),
+            "previous_glossary_text": previous_glossary_text,
+            "expected_fact_sha256": hashlib.sha256(
+                serialized.encode("utf-8")
+            ).hexdigest(),
+            "expected_glossary_sha256": (
+                hashlib.sha256(expected_glossary_text.encode("utf-8")).hexdigest()
+                if expected_glossary_text is not None
+                else None
+            ),
         }
+        committed_add = {
+            key: value
+            for key, value in pending_add.items()
+            if key
+            in {
+                "schema_version",
+                "transaction_id",
+                "fact_id",
+                "expected_fact_sha256",
+                "expected_glossary_sha256",
+            }
+        }
+        committed_add["state"] = "committed"
         self._atomic_write_text(
             self.pending_add_path,
-            json.dumps(pending_add, ensure_ascii=False, sort_keys=True) + "\n",
+            self._pending_add_text(pending_add),
         )
         try:
             self._atomic_write_text(fact_path, serialized)
-            self._write_project_glossary_atomic(merged_glossary)
-            self._unlink_durable(self.pending_add_path)
+            if glossary_introduces:
+                self._write_project_glossary_atomic(merged_glossary)
         except Exception:
             try:
                 self._rollback_pending_add_unlocked()
@@ -606,6 +984,60 @@ class FactGraph:
                     "fact_graph_recovery_required: add rollback did not complete"
                 ) from recovery_error
             raise
+        try:
+            self._atomic_write_text(
+                self.pending_add_commit_path,
+                self._pending_add_text(committed_add),
+            )
+        except Exception:
+            # A failed directory fsync can leave the new marker visible without
+            # proving it durable.  Record rollback intent first so even a commit
+            # marker that cannot be removed remains fail closed.
+            abort_add = {
+                "schema_version": 1,
+                "state": "rollback_required",
+                "transaction_id": transaction_id,
+                "fact_id": fact_id,
+            }
+            try:
+                self._atomic_write_text(
+                    self.pending_add_abort_path,
+                    self._pending_add_text(abort_add),
+                )
+            except Exception as marker_error:
+                try:
+                    visible_abort = self._load_pending_add_abort_unlocked()
+                except Exception as recovery_error:
+                    raise FactPromotionOutcomeUnknown(
+                        "fact_graph_promotion_unknown: rollback intent is uncertain"
+                    ) from recovery_error
+                if visible_abort != abort_add:
+                    raise FactPromotionOutcomeUnknown(
+                        "fact_graph_promotion_unknown: rollback intent is uncertain"
+                    ) from marker_error
+                # Readback proves only visibility, not crash durability.  A
+                # successful directory fsync is required before a definitive
+                # rollback response is safe.
+                try:
+                    self._fsync_directory(self.dir)
+                except Exception as durability_error:
+                    raise FactPromotionOutcomeUnknown(
+                        "fact_graph_promotion_unknown: rollback intent is not durable"
+                    ) from durability_error
+            try:
+                self._recover_aborted_add_unlocked(abort_add)
+            except Exception as recovery_error:
+                raise RuntimeError(
+                    "fact_graph_recovery_required: add rollback did not complete"
+                ) from recovery_error
+            raise
+        try:
+            self._cleanup_committed_add_unlocked()
+        except Exception:
+            # The commit marker is already durable.  Cleanup is never allowed to
+            # turn a published fact into an error response; a residual marker is
+            # validated by readers and finalized by a later mutation.
+            pass
         return fact_id
 
     def add_if_context_unchanged(
@@ -1718,7 +2150,7 @@ class FactGraph:
         # can be consumed as a normal truth snapshot.
         rebuilt_glossary = self._active_glossary_excluding(set(fact_ids))
         self._write_project_glossary_atomic(rebuilt_glossary)
-        self.revoked_dir.mkdir(parents=True, exist_ok=True)
+        self._mkdir_durable(self.revoked_dir)
         for fact_id in fact_ids:
             source = self._path(fact_id)
             destination = self._revoked_path(fact_id)
@@ -1770,8 +2202,7 @@ class FactGraph:
         """Cascade-revoke ``fact_id`` and everything depending on it. Moves the
         files into ``_revoked/`` and logs each. Returns the revoked ids."""
         with self._mutation_lock():
-            self._rollback_pending_add_unlocked()
-            recovered = self._resume_pending_revocation_unlocked()
+            recovered = self._recover_pending_transactions_unlocked()
             if recovered is not None and recovered["root_fact_id"] == fact_id:
                 return [str(item) for item in recovered["fact_ids"]]  # type: ignore[union-attr]
             return self._revoke_unlocked(fact_id, reason)

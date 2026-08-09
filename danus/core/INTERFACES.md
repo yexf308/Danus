@@ -80,7 +80,9 @@ Install: `danus/gateway/INSTALL.md`.
      transitive ancestor statement/edge/fact-local-definition closure, immutable
      selected definitions, and no ancestor proof, blocking missing, revoked,
      incomplete, or over-budget context;
-  4. **calls the verifier**; a `needs_context` control response may hydrate only
+  4. **calls the verifier**; output schema v3 requires every final finding to
+     carry an exact original candidate `{source,line,exact_line}` anchor, checked
+     by both the verify launcher and gateway. A `needs_context` control response may hydrate only
      exact strict-ancestor whole proofs from canonical fact files within the
      configured round/count/record budgets, with a fresh session per round. After
      a final acceptance it rechecks the exact expanded context and
@@ -94,10 +96,31 @@ Install: `danus/gateway/INSTALL.md`.
      verifier itself stays stateless — `fact_submit` (the worker's tool) does this
      write.
   - in: `problem_id, author, statement, proof, predecessors[], glossary_introduces{}` (+ optional `intuition`, `source_id`, `external_refs[]` — structured bibliography for cited external results, metadata only, not in the `fact_id`)
-  - out: `{accepted, fact_id}` · `{accepted: false, repair_hints, undefined_symbols}` ·
-    `{accepted: false, verdict: "error"}` (verify service down — retry) ·
-    `{accepted: true, fact_id: null, write_error}` (verified but a predecessor was revoked)
-  - **Guarantee:** once a verdict exists (accept / reject / accept-but-write-failed)
+  - out: every response carries `promoted`, `submission_status`, and
+    `verification_verdict` (`null` until a valid final mathematical verdict).
+    `accepted` remains the backward-compatible verifier-acceptance field and is
+    **not** the publication signal:
+    - `{accepted: true, verification_verdict: "correct", promoted: true,
+      submission_status: "promoted", fact_id}` — end-to-end success;
+    - `{accepted: true, verification_verdict: "correct", promoted: false,
+      submission_status: "verified_not_promoted", fact_id: null, write_error}` —
+      the verifier accepted the mathematics but the locked graph/glossary write
+      failed; repair/retry and never cite it as a fact;
+    - `{accepted: true, verification_verdict: "correct", promoted: null,
+      submission_status: "promotion_unknown", fact_id: null, write_error}` — an
+      fsync failure prevented a durable choice between commit and rollback; do
+      not count the response as a publication, and let graph recovery resolve it;
+    - `{accepted: false, verification_verdict: "wrong", promoted: false,
+      submission_status: "rejected", repair_hints, undefined_symbols}`;
+    - `{accepted: false, verification_verdict: null, promoted: false,
+      submission_status: "error", verdict: "error"}` (no valid final verifier
+      verdict, for example service down — retry).
+    Consumers count a publication only when `promoted` is true and `fact_id` is
+    present. During rolling compatibility with an older gateway that lacks
+    `promoted`, a valid non-null `fact_id` is the only safe success fallback;
+    `accepted` alone is never sufficient.
+  - **Guarantee:** once a verdict exists (promoted / reject /
+    verified-but-not-promoted / promotion-unknown)
     the outcome is **always** logged (step 5) before returning — a verdict is never
     stored by nobody. The verifier is stateless; `fact_submit` (the worker's tool)
     is what persists, so the write must not be skippable by a later failure (it

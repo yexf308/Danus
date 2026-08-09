@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import os
 import re
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -109,11 +110,69 @@ def worker_dir(project: str, worker: str) -> Path:
     return workers_dir(project) / worker
 
 
+def existing_project_dir(project: str) -> Optional[Path]:
+    """Resolve an existing project without following a final symlink."""
+    project = validate_segment(project, label="project")
+    root = agents_root()
+    path = root / project
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise ValueError(f"unsafe project directory: {project}")
+    resolved = path.resolve(strict=True)
+    if resolved.parent != root.resolve(strict=True):
+        raise ValueError(f"project escapes agents root: {project}")
+    return resolved
+
+
+def existing_worker_dir(project: str, worker: str) -> Optional[Path]:
+    """Resolve an existing worker under a real project/workers directory."""
+    worker = validate_segment(worker, label="worker")
+    pdir = existing_project_dir(project)
+    if pdir is None:
+        return None
+    parent = pdir / "workers"
+    try:
+        parent_info = os.lstat(parent)
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(parent_info.st_mode) or not stat.S_ISDIR(parent_info.st_mode):
+        raise ValueError(f"unsafe workers directory for project: {project}")
+    path = parent / worker
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise ValueError(f"unsafe worker directory: {project}/{worker}")
+    resolved = path.resolve(strict=True)
+    if resolved.parent != parent.resolve(strict=True):
+        raise ValueError(f"worker escapes project: {project}/{worker}")
+    return resolved
+
+
 def list_workers(project: str) -> List[str]:
-    wd = workers_dir(project)
-    if not wd.is_dir():
+    pdir = existing_project_dir(project)
+    if pdir is None:
         return []
-    return sorted(p.name for p in wd.iterdir() if p.is_dir())
+    wd = pdir / "workers"
+    try:
+        info = os.lstat(wd)
+    except FileNotFoundError:
+        return []
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise ValueError(f"unsafe workers directory for project: {project}")
+    workers: list[str] = []
+    for entry in wd.iterdir():
+        try:
+            entry_info = entry.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        if stat.S_ISDIR(entry_info.st_mode) and not stat.S_ISLNK(entry_info.st_mode):
+            workers.append(entry.name)
+    return sorted(workers)
 
 
 def list_projects() -> List[str]:
@@ -121,7 +180,21 @@ def list_projects() -> List[str]:
     root = agents_root()
     if not root.is_dir():
         return []
-    return sorted(p.name for p in root.iterdir() if (p / "workers").is_dir())
+    projects: list[str] = []
+    for entry in root.iterdir():
+        try:
+            entry_info = entry.stat(follow_symlinks=False)
+            workers_info = (entry / "workers").stat(follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        if (
+            stat.S_ISDIR(entry_info.st_mode)
+            and not stat.S_ISLNK(entry_info.st_mode)
+            and stat.S_ISDIR(workers_info.st_mode)
+            and not stat.S_ISLNK(workers_info.st_mode)
+        ):
+            projects.append(entry.name)
+    return sorted(projects)
 
 
 # --------------------------------------------------------------------------- #
@@ -189,21 +262,57 @@ class WorkerLayout:
 # target parsing                                                              #
 # --------------------------------------------------------------------------- #
 
+_TARGET_SEGMENT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+
+def validate_segment(value: str, *, label: str = "name") -> str:
+    """Return one exact safe path segment or raise before path construction."""
+    if (
+        not isinstance(value, str)
+        or value in {".", ".."}
+        or _TARGET_SEGMENT_RE.fullmatch(value) is None
+    ):
+        raise ValueError(
+            f"{label} must match [A-Za-z0-9][A-Za-z0-9._-]*"
+        )
+    return value
+
+
 def resolve_target(target: str) -> Tuple[str, Optional[str]]:
-    """``"proj"`` -> (proj, None);  ``"proj/worker"`` -> (proj, worker)."""
-    target = target.strip().strip("/")
-    if "/" in target:
-        project, worker = target.split("/", 1)
-        return project, (worker or None)
-    return target, None
+    """``"proj"`` -> (proj, None); ``"proj/worker"`` -> (proj, worker).
+
+    One optional leading and trailing slash are accepted for CLI convenience.
+    The project and worker themselves must each be one safe path segment.
+    """
+    normalized = target.strip()
+    if "\\" in normalized:
+        raise ValueError("target must not contain backslashes")
+    if normalized.startswith("/"):
+        normalized = normalized[1:]
+    if normalized.endswith("/"):
+        normalized = normalized[:-1]
+
+    parts = normalized.split("/")
+    if len(parts) not in {1, 2} or any(not part for part in parts):
+        raise ValueError("target must be <project> or <project>/<worker>")
+    for part in parts:
+        validate_segment(part, label="project and worker")
+
+    project = parts[0]
+    return project, (parts[1] if len(parts) == 2 else None)
 
 
 def target_worker_dirs(target: str) -> List[Path]:
     """Worker dirs addressed by ``target`` — one (proj/worker) or all (proj)."""
     project, worker = resolve_target(target)
     if worker:
-        return [worker_dir(project, worker)]
-    return [worker_dir(project, w) for w in list_workers(project)]
+        existing = existing_worker_dir(project, worker)
+        return [existing] if existing is not None else []
+    return [
+        existing
+        for name in list_workers(project)
+        if (existing := existing_worker_dir(project, name)) is not None
+    ]
 
 
 # --------------------------------------------------------------------------- #

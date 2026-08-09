@@ -21,7 +21,7 @@ Given:
 
 produce the verdict (the service returns it to `fact_submit`), with JSON fields:
 
-- `output_schema_version` (exactly `2`)
+- `output_schema_version` (exactly `3`)
 - `verification_status` (`"final"` or `"needs_context"`)
 - `verification_report`
 - `verdict` (`"correct"` or `"wrong"`)
@@ -118,7 +118,18 @@ For each statement/subproof in the markdown, in textual order:
 5. Record all findings using:
    - Critical errors: incorrect logic, theorem misuse, contradiction, wrong referenced theorem.
    - Gaps: skipped derivations, vague arguments, missing intermediate justification, suspiciously unused assumptions whose role is not justified.
-6. Keep each finding (its location, type, and issue) in context for the report.
+6. Keep each finding (its location, type, issue, and any required candidate
+   evidence) in context for the report.
+7. Every final finding (critical error or gap), whatever its cause, must be anchored to one complete
+   logical line of the decoded candidate `statement` or `proof`. Record
+   `candidate_evidence` with `source`, a 1-based `line`, and `exact_line`. Copy
+   the entire line exactly, excluding only its newline separator: do not
+   normalize notation, collapse whitespace, use an ellipsis, quote a summary,
+   or substitute a line from ancestor context.
+8. Before alleging a literal or syntactic mismatch, reread that raw candidate
+   line. Preserve strict versus non-strict comparison symbols (`<`, `<=`, `≤`,
+   `>`, `>=`, `≥`) and every open/closed interval endpoint exactly. Never base
+   such an allegation on a remembered or normalized restatement of the proof.
 
 ### Step 3: External reference checking
 
@@ -169,11 +180,16 @@ Aggregate every error and gap across the full markdown proof.
 `verification_report` must include:
 
 - `summary`
-- `critical_errors` (list of objects; each has `location` and `issue`)
-- `gaps` (list of objects; each has `location` and `issue`)
+- `critical_errors` (list of objects; each has `location`, `issue`, and
+  `candidate_evidence={source,line,exact_line}`)
+- `gaps` (the same exact finding shape, including `candidate_evidence`)
 
 These are exact object shapes: do not add any other top-level, report, or finding
-keys. In particular, never place findings in an `errors` field outside
+keys. `candidate_evidence` is required on every critical error and every gap.
+Its `source` is exactly `"statement"` or `"proof"`; `line` is the positive
+1-based logical line number in that decoded field; and `exact_line` is the whole
+line copied code-point-for-code-point, excluding its newline
+separator. In particular, never place findings in an `errors` field outside
 `critical_errors` or `gaps`; production validation rejects unknown or misplaced
 fields.
 
@@ -205,16 +221,12 @@ The final message (which the CLI persists) must be:
 
 ```json
 {
-  "output_schema_version": 2,
+  "output_schema_version": 3,
   "verification_status": "final",
   "verification_report": {
     "summary": "string",
-    "critical_errors": [
-      {"location": "string", "issue": "string"}
-    ],
-    "gaps": [
-      {"location": "string", "issue": "string"}
-    ]
+    "critical_errors": [],
+    "gaps": []
   },
   "verdict": "correct",
   "needs_expanded_proofs": [],
@@ -223,6 +235,32 @@ The final message (which the CLI persists) must be:
 ```
 
 If any error or gap exists, `verdict` must be `"wrong"` and `repair_hints` must be non-empty.
+For example, a final rejection has the opposite, self-consistent shape:
+
+```json
+{
+  "output_schema_version": 3,
+  "verification_status": "final",
+  "verification_report": {
+    "summary": "A claimed implication is not established.",
+    "critical_errors": [
+      {
+        "location": "proof line 1",
+        "issue": "The conclusion does not follow from the stated premise.",
+        "candidate_evidence": {
+          "source": "proof",
+          "line": 1,
+          "exact_line": "Therefore the conclusion follows."
+        }
+      }
+    ],
+    "gaps": []
+  },
+  "verdict": "wrong",
+  "needs_expanded_proofs": [],
+  "repair_hints": "Supply the missing implication or remove the conclusion."
+}
+```
 
 ## Hard Invariants
 
@@ -238,7 +276,11 @@ If any error or gap exists, `verdict` must be `"wrong"` and `repair_hints` must 
    this equality before you run.
 8. Round-zero context contains the full statement/edge/definition closure and no
    ancestor proof. Only `expanded_proofs` may carry a requested ancestor proof.
-9. `needs_context` is a non-final control response and always uses `verdict=wrong`,
+9. Every final critical error and gap has a candidate line whose source, 1-based line
+   number, and complete unnormalized text match the original decoded candidate
+   exactly. A finding without authentic candidate evidence is an invalid
+   verifier response, never a reason to accept the candidate.
+10. `needs_context` is a non-final control response and always uses `verdict=wrong`,
    non-empty unique requests, empty findings, and empty repair hints.
 
 ## Hard Prohibitions to enforce

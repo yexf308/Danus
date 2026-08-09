@@ -25,9 +25,11 @@ Run:
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import re
+import stat
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -39,6 +41,58 @@ from pydantic import BaseModel
 
 HERE = Path(__file__).resolve().parent
 STATIC = HERE / "static"
+
+
+def _adopt_service_authority() -> int | None:
+    """Validate and retain the guardian flock without leaking it to children."""
+    raw_fd = os.environ.get("DANUS_SERVICE_AUTHORITY_FD")
+    raw_path = os.environ.get("DANUS_SERVICE_AUTHORITY_PATH")
+    if raw_fd is None and raw_path is None:
+        return None
+    if (
+        raw_fd is None
+        or raw_path is None
+        or re.fullmatch(r"[0-9]+", raw_fd) is None
+        or not Path(raw_path).is_absolute()
+    ):
+        raise RuntimeError("malformed guardian service authority")
+    fd = int(raw_fd)
+    if fd < 3:
+        raise RuntimeError("guardian service authority fd is unsafe")
+    try:
+        info = os.fstat(fd)
+        probe_fd = os.open(
+            raw_path,
+            os.O_RDONLY
+            | os.O_NONBLOCK
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except OSError as exc:
+        raise RuntimeError(f"guardian service authority is unavailable: {exc}") from exc
+    try:
+        probe_info = os.fstat(probe_fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or info.st_uid != os.geteuid()
+            or (info.st_dev, info.st_ino) != (probe_info.st_dev, probe_info.st_ino)
+        ):
+            raise RuntimeError("guardian service authority identity mismatch")
+        try:
+            fcntl.flock(probe_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            pass
+        else:
+            raise RuntimeError("guardian service authority lock is not held")
+    finally:
+        os.close(probe_fd)
+    os.set_inheritable(fd, False)
+    os.environ.pop("DANUS_SERVICE_AUTHORITY_FD", None)
+    os.environ.pop("DANUS_SERVICE_AUTHORITY_PATH", None)
+    return fd
+
+
+_DASHBOARD_SERVICE_AUTHORITY_FD = _adopt_service_authority()
 
 # ------------------------------------------------------------------------- #
 # channels — global-memory kinds in display order, each with a semantic role  #
@@ -312,6 +366,17 @@ def build_channel(kind: str, project: Optional[Path] = None) -> Dict[str, Any]:
 # ------------------------------------------------------------------------- #
 
 app = FastAPI(title="danus-observability", version="0.1.0")
+
+
+@app.get("/health")
+def health() -> Dict[str, Any]:
+    """Self-identify the exact dashboard process to its service guardian."""
+    nonce = os.environ.get("DANUS_SERVICE_INSTANCE_NONCE", "standalone")
+    if nonce != "standalone" and re.fullmatch(r"[0-9a-f]{32}", nonce) is None:
+        # A malformed injected nonce must never accidentally satisfy guardian
+        # readiness.  Keep standalone development usable without a guardian.
+        nonce = "invalid"
+    return {"status": "ok", "pid": os.getpid(), "instance_nonce": nonce}
 
 
 @app.get("/api/overview", response_model=Overview)

@@ -11,7 +11,9 @@ Produce the final verification output JSON and verdict.
 
 Aggregate all findings you produced earlier in this verification session — the
 per-item records from the sequential check and the reference check, held in
-context. Each issue must include `location` and `issue`.
+context. Each issue must include `location` and `issue`; every critical error
+and gap must also include its authenticated candidate-line anchor as
+`candidate_evidence={source,line,exact_line}`.
 
 ## Procedure
 
@@ -28,11 +30,16 @@ context. Each issue must include `location` and `issue`.
    - otherwise `wrong`.
 5. If verdict is `wrong`, produce concrete non-empty `repair_hints`.
 6. Self-check the JSON against its schema before emitting — do this by reasoning, not by calling a tool:
-   - `output_schema_version` is exactly `2`,
+   - `output_schema_version` is exactly `3`,
    - `verification_status` is `"final"` and `needs_expanded_proofs=[]`,
    - `verdict` is exactly `"correct"` or `"wrong"`,
    - `repair_hints` is non-empty **iff** `verdict == "wrong"` (empty string when `"correct"`),
    - every entry of `critical_errors` and `gaps` has both `location` and `issue`,
+   - every critical error and gap also has exactly one `candidate_evidence` object with
+     `source` equal to `"statement"` or `"proof"`, a positive 1-based `line`,
+     and `exact_line` copied as the complete unnormalized decoded candidate line,
+   - before reporting a literal mismatch, the exact line has been reread and all
+     `<`/`<=`/`≤`, `>`/`>=`/`≥`, and open/closed endpoint notation is preserved,
    - the top-level object, report, and each finding have exactly the documented
      keys and no unknown or misplaced fields,
    - the verdict is consistent with the rule in step 3 (any critical error or gap forces `"wrong"`).
@@ -49,7 +56,7 @@ Final output JSON:
 
 ```json
 {
-  "output_schema_version": 2,
+  "output_schema_version": 3,
   "verification_status": "final",
   "verification_report": {
     "summary": "string",
@@ -70,7 +77,7 @@ not the candidate or an already-expanded id:
 
 ```json
 {
-  "output_schema_version": 2,
+  "output_schema_version": 3,
   "verification_status": "needs_context",
   "verification_report": {
     "summary": "Specific authenticated ancestor proofs are required.",

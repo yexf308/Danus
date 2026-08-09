@@ -11,15 +11,16 @@ recovery after a restart, and unattended-operation helpers.
 
 ## The persistent services
 
-Two services must be managed via `scripts/services.sh`, which `setsid`-detaches each
-so it **survives your shell / SSH session ending** (a bare `&` would die with the
-shell). Start them only this way.
+Two services must be managed via `scripts/services.sh`. It starts one persistent
+guardian per service, so the service **survives your shell / SSH session ending**
+and remains controllable through an authenticated local channel. Start them only
+this way.
 
 ```bash
 bash scripts/services.sh up verify            # REQUIRED — no verify ⇒ fact_submit fails ⇒ no facts
 bash scripts/services.sh up dashboard <p>     # optional read-only view of project <p>
 bash scripts/services.sh status               # what's up (+ a verify /health probe)
-bash scripts/services.sh logs <svc> [-f]      # tail a service log
+bash scripts/services.sh logs <svc>           # bounded last-50-lines snapshot
 bash scripts/services.sh down <svc> | all     # stop
 ```
 
@@ -31,15 +32,43 @@ bash scripts/services.sh down <svc> | all     # stop
 > **Shared-host caveat.** These ports are per-host, not per-deployment. If a second
 > Danus deployment (another user/checkout) is already bound to `8091`, your
 > `services.sh up verify` will **fail to bind** (`address already in use`). A bare
-> health probe cannot tell your verify from the other one, so `/health` now
-> **self-identifies with the serving process pid**: `doctor.sh` and `services.sh
-> status`/`test` match that pid against your `runtime/run/verify.pid` and report the
-> port as **`FAIL … answered by a FOREIGN process`** instead of a false `ok` when
-> another deployment holds it. On a shared host, give each deployment its own
-> `VERIFY_PORT` / `DASHBOARD_PORT` (`config/danus.env`).
+> health probe cannot tell your verify from the other one. The guardian therefore
+> gives each launch a random 128-bit instance nonce; `/health` must echo that nonce,
+> the actual child PID, output protocol, and pinned verifier-bundle digest. The
+> probe first authenticates the guardian over its owner-only Unix socket and then
+> matches the bounded HTTP response. A wrong nonce, PID, protocol/digest, oversized
+> body, or non-200 response is **foreign/failing**, never a false `ok`. On a shared
+> host, give each deployment its own `VERIFY_PORT` / `DASHBOARD_PORT`
+> (`config/danus.env`). Dashboard readiness uses the same instance nonce and PID.
 
-`services.sh` keeps a pid registry under `runtime/run/` and an `autostart` manifest
-of `up` invocations, so a restart can replay them (see recovery).
+`services.sh` keeps owner-only guardian records and Unix sockets under
+`runtime/run/`. The legacy `.pid` record suffix is only a filename: any PIDs in a
+record or status response are diagnostic and are never external signal authority.
+Only the retained guardian/service-host chain may signal its own exact,
+still-unreaped child process groups. If the guardian dies, its service host retains
+the lifecycle lock while it tears down the old group; a new start cannot overlap
+that cleanup.
+
+The trusted service process also adopts the same flock open-file-description,
+validates it against the no-follow lock path, marks it close-on-exec, and removes
+its descriptor/path variables from the environment. It is never printed or
+exposed through CLI, HTTP, logs, or model input. The verifier passes it explicitly
+only to its retained paid-child host—not to Codex—so a guardian/service crash
+cannot admit a new verifier until the old paid process group is terminal. During
+that bounded fence, authenticated status reports `cleanup_in_progress`, not a
+false `down`.
+
+The versioned `autostart` manifest is durable desired state, not a best-effort
+history. `up` fsyncs an intent generation before launch and rechecks that exact
+generation while holding the service lock; launch failure rolls back only a
+generation created by that invocation. `down` durably removes the intent before
+asking the guardian to stop. This ordering makes concurrent recovery/down and
+crash cuts monotone.
+
+Service logs are opened without following symlinks and must be owner-owned regular
+files with one link. `logs` returns a bounded snapshot. Continuous `-f` following
+is intentionally refused because it cannot preserve the same authenticated-file
+guarantee across rotation; request another snapshot instead.
 
 ## Health checks
 
@@ -86,12 +115,25 @@ bash scripts/recover.sh
 ```
 
 One command: re-runs `bootstrap.sh` (rebuilds the possibly-dangling venv + codex
-provider), clears stale pidfiles, **replays the `runtime/run/autostart` manifest**
-(brings the services back up), and prints codex + services health. Idempotent.
+provider), reconciles only structurally safe stale guardian records without
+signalling any recorded PID, takes a locked typed manifest snapshot, and
+**replays the still-current intent generations**. Before each launch the guardian
+rechecks that its generation is still present, so a concurrent `down` wins.
+Recovery aggregates every reconcile/start failure, runs the final authenticated
+health gate, and exits nonzero if any step failed. Idempotent.
 
 > Note: after a restart, worker loops are **not** auto-resumed by `recover.sh` — it
 > restores the services. Restart workers with `danus start <project>` (they resume
 > from persisted memory).
+
+Worker intent repair is deliberately separate from service recovery. If a
+prepared app-server intent is authoritatively known to be unspent, use
+`danus cancel-prepared-intent <project>/<worker> --thread-id ID --client-id ID
+--reason TEXT`; it performs an exact CAS under the worker lifecycle lock and
+appends a cancellation receipt. Reset or rotate the thread only as a separate
+explicit action. If paid execution may already have begun and the outcome is
+unknown, this command refuses; use the stronger acknowledged `abandon-intent`
+workflow instead.
 
 ## Worker lifecycle (operational view)
 
@@ -99,12 +141,14 @@ provider), clears stale pidfiles, **replays the `runtime/run/autostart` manifest
 danus status <project>          # per-worker liveness + round + last activity
 danus start  <project>          # (re)launch the worker loop(s); resumes from memory
 danus stop   <project>          # graceful: finish the round, then exit
-danus stop   <project> --force  # kill the process group now
+danus stop   <project> --force  # durable request: interrupt active owned work, then exit
 ```
 
 - Workers run detached in their own process groups, so they outlive your session and
   a graceful stop lets an in-flight round finish (no lost verified work). `--force`
-  kills a live codex child.
+  never signals a numeric PID/PGID from the CLI: the authenticated worker reads
+  the durable request, interrupts its app-server turn or cleans its retained
+  direct-child process group, reaps it, audits the result, and exits.
 - `status` shows a `stuck?` soft signal when a running round exceeds ~1.5× the hard
   timeout — investigate (often a flaky backend); decide stop/restart.
 

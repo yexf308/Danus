@@ -13,7 +13,7 @@ Config (env):
   DANUS_VERIFY_MODEL (default gpt-5.6-sol),
   DANUS_VERIFY_EFFORT (default xhigh),
   CODEX_TIMEOUT_SECONDS (0 = no timeout),
-  VERIFY_AGENT_HOME (the writable codex `-C` dir: AGENTS.md + .agents/skills),
+  VERIFY_AGENT_HOME (optional writable base for digest-keyed codex `-C` homes),
   VERIFIER_RESULTS_DIR (writable per-run result/log dirs),
   DANUS_STATE_DIR (default writable state root for both paths).
 """
@@ -21,15 +21,16 @@ Config (env):
 from __future__ import annotations
 
 import hashlib
+import fcntl
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
 import time
 from datetime import datetime, timezone
-from functools import lru_cache
 from importlib import resources
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -37,15 +38,71 @@ from typing import Any, Dict, List, Optional
 from fastapi import HTTPException
 
 from danus import codex
-from danus.core import validate_verification_output
+from danus.core import (
+    VERIFICATION_OUTPUT_PROTOCOL_VERSION,
+    validate_verification_output,
+)
 from danus.gateway_runtime import GatewayRuntimeUnavailable, require_gateway_runtime
+from danus.owned_child import (
+    owned_child_exited_no_reap,
+    spawn_owned_child,
+    stop_owned_child,
+)
 
 _HERE = Path(__file__).resolve().parent  # danus/verify/
 _REPO_ROOT = _HERE.parent.parent         # source-checkout root (parity tests only)
 VERIFICATION_FILENAMES = ("verification.json", "verificationt.json")
-_OUTPUT_SCHEMA = _HERE / "verification_output.schema.json"
 _RESOURCE_PACKAGE = "danus.verify._resources"
 _DEFAULT_VERIFY_EFFORT = "xhigh"
+_MAX_VERIFICATION_OUTPUT_BYTES = 8 * 1024 * 1024
+_SERVICE_AUTHORITY_FD_ENV = "DANUS_SERVICE_AUTHORITY_FD"
+_SERVICE_AUTHORITY_PATH_ENV = "DANUS_SERVICE_AUTHORITY_PATH"
+
+
+def _adopt_service_authority() -> Optional[int]:
+    """Authenticate and hide the guardian's inherited lifecycle-lock OFD."""
+    raw_fd = os.environ.pop(_SERVICE_AUTHORITY_FD_ENV, None)
+    raw_path = os.environ.pop(_SERVICE_AUTHORITY_PATH_ENV, None)
+    if raw_fd is None and raw_path is None:
+        return None
+    if raw_fd is None or raw_path is None or not raw_fd.isdecimal():
+        raise RuntimeError("incomplete service authority descriptor contract")
+    fd = int(raw_fd)
+    path = Path(raw_path)
+    if fd < 3 or not path.is_absolute():
+        raise RuntimeError("invalid service authority descriptor contract")
+    inherited = os.fstat(fd)
+    if (
+        not stat.S_ISREG(inherited.st_mode)
+        or inherited.st_nlink != 1
+        or inherited.st_uid != os.geteuid()
+    ):
+        raise RuntimeError("service authority descriptor is unsafe")
+    flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    probe = os.open(path, flags)
+    try:
+        observed = os.fstat(probe)
+        if (observed.st_dev, observed.st_ino) != (
+            inherited.st_dev,
+            inherited.st_ino,
+        ):
+            raise RuntimeError("service authority path does not match descriptor")
+        try:
+            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            pass
+        else:
+            fcntl.flock(probe, fcntl.LOCK_UN)
+            raise RuntimeError("service authority descriptor does not hold its lock")
+    finally:
+        os.close(probe)
+    os.set_inheritable(fd, False)
+    return fd
+
+
+_SERVICE_AUTHORITY_FD = _adopt_service_authority()
 
 
 # --------------------------------------------------------------------------- #
@@ -91,77 +148,188 @@ def _resource_file_entries(source: Any) -> List[tuple[str, bytes]]:
     return entries
 
 
-@lru_cache(maxsize=1)
-def _resource_revision() -> str:
+def _assert_schema_matches_validator(schema_bytes: bytes) -> None:
+    """Refuse to start with a CLI schema from another output protocol."""
+    try:
+        schema = json.loads(schema_bytes.decode("utf-8"))
+        output_version = schema["properties"]["output_schema_version"]
+        schema_enum = output_version["enum"]
+    except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise RuntimeError(
+            "packaged verifier output schema has no readable protocol enum"
+        ) from exc
+    if schema_enum != [VERIFICATION_OUTPUT_PROTOCOL_VERSION]:
+        raise RuntimeError(
+            "verifier output protocol mismatch: validator requires "
+            f"{VERIFICATION_OUTPUT_PROTOCOL_VERSION}, schema declares {schema_enum!r}"
+        )
+
+
+def _capture_protocol_bundle() -> tuple[tuple[tuple[str, bytes], ...], str]:
+    """Read every protocol-critical byte exactly once at process import.
+
+    A long-lived service must never combine its already-imported validator with
+    AGENTS/skills/schema bytes read from a checkout that changed later.  The
+    immutable tuple below is the sole materialization source for its lifetime.
+    """
+    entries = _resource_file_entries(resources.files(_RESOURCE_PACKAGE))
+    schema_path = _HERE / "verification_output.schema.json"
+    try:
+        schema_bytes = schema_path.read_bytes()
+    except OSError as exc:
+        raise RuntimeError("packaged verifier output schema is unavailable") from exc
+    _assert_schema_matches_validator(schema_bytes)
+    entries.append(("verification_output.schema.json", schema_bytes))
+
     digest = hashlib.sha256()
-    for relative, data in _resource_file_entries(resources.files(_RESOURCE_PACKAGE)):
+    for relative, data in entries:
         digest.update(relative.encode("utf-8"))
         digest.update(b"\0")
         digest.update(data)
         digest.update(b"\0")
-    return digest.hexdigest()[:12]
+    return tuple(entries), digest.hexdigest()
+
+
+_PROTOCOL_BUNDLE_ENTRIES, VERIFIER_BUNDLE_DIGEST = _capture_protocol_bundle()
+
+
+def _resource_revision() -> str:
+    """Full collision-resistant key for the immutable protocol bundle."""
+    return VERIFIER_BUNDLE_DIGEST
 
 
 def _agent_home() -> Path:
     configured = os.getenv("VERIFY_AGENT_HOME")
-    if configured:
-        return Path(configured).resolve()
-    return (_state_root() / "verify" / f"agent-{_resource_revision()}").resolve()
+    base = Path(configured).expanduser() if configured else (_state_root() / "verify")
+    if not base.is_absolute():
+        base = Path.cwd() / base
+    # Resolve the already-trusted parent only.  Resolving the final component
+    # would hide an attacker-planted ``agent-<digest>`` symlink before lstat.
+    base = base.parent.resolve() / base.name
+    digest_name = f"agent-{_resource_revision()}"
+    # A caller may provide the exact current digest home, but an unversioned or
+    # stale configured path is only a base.  Different service versions can
+    # therefore never overwrite one another's long-lived protocol snapshots.
+    if base.name == digest_name:
+        return base
+    return base / digest_name
 
 
-def _atomic_resource_copy(source: Any, destination: Path) -> None:
-    data = source.read_bytes()
-    if (
-        destination.is_file()
-        and not destination.is_symlink()
-        and destination.read_bytes() == data
-    ):
-        return
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary: Optional[Path] = None
+def _ensure_real_directory(path: Path) -> None:
     try:
-        with tempfile.NamedTemporaryFile(
-            "wb",
-            dir=destination.parent,
-            prefix=f".{destination.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as handle:
-            temporary = Path(handle.name)
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, destination)
+        path.mkdir()
+    except FileExistsError:
+        pass
+    info = os.lstat(path)
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise RuntimeError(f"verifier bundle directory is unsafe: {path}")
+
+
+def _ensure_bundle_parent(home: Path, destination: Path) -> None:
+    try:
+        relative = destination.parent.relative_to(home)
+    except ValueError as exc:
+        raise RuntimeError("verifier bundle destination escapes its home") from exc
+    current = home
+    for component in relative.parts:
+        if component in {"", ".", ".."}:
+            raise RuntimeError("verifier bundle destination is malformed")
+        current = current / component
+        _ensure_real_directory(current)
+
+
+def _atomic_resource_copy(data: bytes, destination: Path, *, home: Path) -> None:
+    _ensure_bundle_parent(home, destination)
+    if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
+        raise RuntimeError("host lacks no-follow verifier bundle operations")
+    parent_fd = os.open(
+        str(destination.parent), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    )
+    temporary_name = (
+        f".{destination.name}.{os.getpid()}-{os.urandom(12).hex()}.tmp"
+    )
+    temporary_fd: Optional[int] = None
+    try:
+        try:
+            existing_fd = os.open(
+                destination.name,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                dir_fd=parent_fd,
+            )
+        except FileNotFoundError:
+            existing_fd = None
+        except OSError as exc:
+            raise RuntimeError(
+                f"verifier bundle file is unsafe: {destination}"
+            ) from exc
+        if existing_fd is not None:
+            try:
+                info = os.fstat(existing_fd)
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    raise RuntimeError(
+                        f"verifier bundle file is unsafe: {destination}"
+                    )
+                if os.read(existing_fd, len(data) + 1) == data:
+                    return
+            finally:
+                os.close(existing_fd)
+        temporary_fd = os.open(
+            temporary_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=parent_fd,
+        )
+        offset = 0
+        while offset < len(data):
+            offset += os.write(temporary_fd, data[offset:])
+        os.fsync(temporary_fd)
+        os.close(temporary_fd)
+        temporary_fd = None
+        os.replace(
+            temporary_name,
+            destination.name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+        os.fsync(parent_fd)
     finally:
-        if temporary is not None and temporary.exists():
-            temporary.unlink()
-
-
-def _materialize_resource_tree(source: Any, destination: Path) -> None:
-    if destination.is_symlink():
-        destination.unlink()
-    destination.mkdir(parents=True, exist_ok=True)
-    for child in source.iterdir():
-        target = destination / child.name
-        if child.is_dir():
-            _materialize_resource_tree(child, target)
-        elif child.name != "__init__.py":
-            _atomic_resource_copy(child, target)
+        if temporary_fd is not None:
+            os.close(temporary_fd)
+        try:
+            os.unlink(temporary_name, dir_fd=parent_fd)
+        except FileNotFoundError:
+            pass
+        os.close(parent_fd)
 
 
 def ensure_agent_home() -> Path:
-    """Materialize packaged verifier contract/skills into a writable Codex home."""
+    """Materialize the import-time bundle into its digest-keyed Codex home.
+
+    This function intentionally performs no package-resource or checkout reads.
+    Repeated calls repair files only from the bytes captured when this process
+    imported the launcher.
+    """
     home = _agent_home()
-    agents_md = home / "AGENTS.md"
-    skills_dir = home / ".agents" / "skills"
-    packaged = resources.files(_RESOURCE_PACKAGE)
-    contract = packaged.joinpath("AGENTS.md")
-    skills = packaged.joinpath("skills")
-    if not contract.is_file() or not skills.is_dir():
-        raise RuntimeError("packaged verifier contract/skills are unavailable")
-    _atomic_resource_copy(contract, agents_md)
-    _materialize_resource_tree(skills, skills_dir)
+    home.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_real_directory(home.parent)
+    _ensure_real_directory(home)
+    for relative, data in _PROTOCOL_BUNDLE_ENTRIES:
+        if relative == "AGENTS.md" or relative == "verification_output.schema.json":
+            destination = home / relative
+        else:
+            destination = home / ".agents" / relative
+        _atomic_resource_copy(data, destination, home=home)
+    _atomic_resource_copy(
+        (VERIFIER_BUNDLE_DIGEST + "\n").encode("ascii"),
+        home / "bundle.sha256",
+        home=home,
+    )
     return home
+
+
+def _output_schema_path() -> Path:
+    """Return the schema inside this process's immutable bundle home."""
+    return _agent_home() / "verification_output.schema.json"
 
 
 
@@ -247,9 +415,47 @@ def _results_dir(run_id: str) -> Path:
 def _verification_path(run_id: str) -> Optional[Path]:
     for filename in VERIFICATION_FILENAMES:
         path = _results_dir(run_id) / filename
-        if path.exists():
+        try:
+            os.lstat(path)
+        except FileNotFoundError:
+            continue
+        else:
             return path
     return None
+
+
+def _read_verification_output(path: Path) -> str:
+    flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags)
+    try:
+        info = os.fstat(fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or info.st_uid != os.geteuid()
+        ):
+            raise OSError("verification output is not a private regular file")
+        if info.st_size > _MAX_VERIFICATION_OUTPUT_BYTES:
+            raise OSError("verification output exceeds the 8 MiB hard limit")
+        chunks: list[bytes] = []
+        total = 0
+        while total <= _MAX_VERIFICATION_OUTPUT_BYTES:
+            chunk = os.read(
+                fd,
+                min(65536, _MAX_VERIFICATION_OUTPUT_BYTES + 1 - total),
+            )
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        payload = b"".join(chunks)
+        if len(payload) > _MAX_VERIFICATION_OUTPUT_BYTES:
+            raise OSError("verification output exceeds the 8 MiB hard limit")
+        return payload.decode("utf-8", errors="strict")
+    finally:
+        os.close(fd)
 
 
 def _write_run_log(
@@ -322,11 +528,56 @@ def _parse_tokens_used(raw_output: Any) -> Optional[int]:
         return None
 
 
+def _wait_direct_child_no_reap(
+    proc: subprocess.Popen, timeout_seconds: Optional[float]
+) -> bool:
+    """Wait boundedly while preserving the owned-host PID/PGID fence."""
+    deadline = (
+        None
+        if timeout_seconds is None
+        else time.monotonic() + max(0.0, timeout_seconds)
+    )
+    while True:
+        try:
+            exited = owned_child_exited_no_reap(proc)
+        except InterruptedError:
+            continue
+        if exited:
+            return True
+        if deadline is not None and time.monotonic() >= deadline:
+            return False
+        time.sleep(
+            0.02
+            if deadline is None
+            else min(0.02, max(0.0, deadline - time.monotonic()))
+        )
+
+
+def _kill_verifier_group_and_reap(
+    proc: subprocess.Popen,
+    *,
+    terminate_first: bool,
+    grace: float = 2.0,
+) -> int:
+    """Revoke the verifier host lease, sweep its group, and reap it."""
+    del terminate_first
+    return stop_owned_child(proc, grace=max(5.0, grace + 4.0))
+
+
 def _prompt_json(value: object) -> str:
-    """Compact JSON for prompt data, escaping delimiter metacharacters too."""
-    return json.dumps(
+    """Compact JSON that preserves math notation but cannot spell delimiters.
+
+    Escaping every ``<``/``>`` obscured strict versus non-strict inequalities
+    from the verifier.  Only triple-angle metasequences can participate in our
+    block sentinels, so break those while leaving ``<``, ``<=``, ``>``, and
+    ``>=`` verbatim.  JSON decoding still reconstructs the original data.
+    """
+    serialized = json.dumps(
         value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-    ).replace("<", "\\u003c").replace(">", "\\u003e")
+    )
+    return serialized.replace("<<<", "\\u003c\\u003c\\u003c").replace(
+        ">>>", "\\u003e\\u003e\\u003e"
+    )
 
 
 def _prompt_fact_context(context: Dict[str, Any]) -> Dict[str, Any]:
@@ -381,6 +632,11 @@ def build_prompt(
         ])
     parts.extend([
         "Use AGENTS.md to verify the candidate proof for the candidate statement. "
+        "For every final critical_error or gap, copy one complete logical line verbatim "
+        "from the decoded candidate statement or proof into candidate_evidence; "
+        "never use a summary, normalized restatement, ellipsis, or ancestor line. "
+        "In particular, reread the raw line before alleging a strict/non-strict "
+        "inequality or an open/closed endpoint mismatch. "
         "If a specific strict-ancestor proof is genuinely required, return "
         "verification_status=needs_context and name only ids from the supplied "
         "fact statement closure; otherwise return verification_status=final. "
@@ -411,7 +667,7 @@ def build_codex_command(
         "--ignore-user-config",
         "--ignore-rules",
         "--strict-config",
-        "--output-schema", str(_OUTPUT_SCHEMA),
+        "--output-schema", str(_output_schema_path()),
         "--output-last-message", str(output_path),
         "--color", "never",
         "-",
@@ -464,6 +720,13 @@ def run_codex_verification(
         glossary_introduces=glossary_introduces,
     )
     env = codex.subprocess_env(cmd[0])
+    for protected_name in (
+        _SERVICE_AUTHORITY_FD_ENV,
+        _SERVICE_AUTHORITY_PATH_ENV,
+        "DANUS_VERIFY_INSTANCE_NONCE",
+        "DANUS_SERVICE_INSTANCE_NONCE",
+    ):
+        env.pop(protected_name, None)
     model_name = cmd[cmd.index("--model") + 1]
     effort_name = _effort()
     context_scope = fact_context.get("scope", {}) if fact_context else {}
@@ -498,33 +761,29 @@ def run_codex_verification(
         ) from exc
 
     tokens_used: Optional[int] = None
-    with tempfile.TemporaryFile(mode="w+b") as raw_output:
+    returncode: Optional[int] = None
+    timeout_seconds = _timeout()
+    with tempfile.TemporaryFile(mode="w+b") as raw_output, tempfile.TemporaryFile(
+        mode="w+t", encoding="utf-8"
+    ) as prompt_input:
+        prompt_input.write(prompt)
+        prompt_input.flush()
+        prompt_input.seek(0)
         try:
-            completed = subprocess.run(
-                cmd, cwd=_agent_home(), env=env,
-                input=prompt, stdout=raw_output, stderr=subprocess.STDOUT,
-                text=True, timeout=_timeout(), check=False,
+            proc = spawn_owned_child(
+                cmd,
+                cwd=_agent_home(),
+                env=env,
+                stdin=prompt_input,
+                stdout=raw_output,
+                stderr=subprocess.STDOUT,
+                popen=subprocess.Popen,
+                hold_fds=(
+                    ()
+                    if _SERVICE_AUTHORITY_FD is None
+                    else (_SERVICE_AUTHORITY_FD,)
+                ),
             )
-        except subprocess.TimeoutExpired as exc:
-            tokens_used = _parse_tokens_used(raw_output)
-            elapsed_seconds = time.monotonic() - started_monotonic
-            _write_run_log(
-                log_path,
-                started_at=started_at,
-                finished_at=datetime.now(timezone.utc).isoformat(),
-                status="timed_out",
-                returncode="unavailable",
-                model=model_name,
-                effort=effort_name,
-                elapsed_seconds=elapsed_seconds,
-                tokens_used=tokens_used,
-                context_round=context_round,
-                expanded_proof_ids=expanded_ids,
-            )
-            raise HTTPException(
-                status_code=504,
-                detail=f"codex exec timed out after {exc.timeout}s. See log at {log_path}",
-            ) from exc
         except OSError as exc:
             elapsed_seconds = time.monotonic() - started_monotonic
             _write_run_log(
@@ -543,58 +802,103 @@ def run_codex_verification(
                 status_code=500,
                 detail=f"could not start codex exec: {exc}. See log at {log_path}",
             ) from exc
-        tokens_used = _parse_tokens_used(raw_output)
+        try:
+            if not _wait_direct_child_no_reap(proc, timeout_seconds):
+                returncode = _kill_verifier_group_and_reap(
+                    proc, terminate_first=True
+                )
+                tokens_used = _parse_tokens_used(raw_output)
+                elapsed_seconds = time.monotonic() - started_monotonic
+                _write_run_log(
+                    log_path,
+                    started_at=started_at,
+                    finished_at=datetime.now(timezone.utc).isoformat(),
+                    status="timed_out",
+                    returncode="unavailable",
+                    model=model_name,
+                    effort=effort_name,
+                    elapsed_seconds=elapsed_seconds,
+                    tokens_used=tokens_used,
+                    context_round=context_round,
+                    expanded_proof_ids=expanded_ids,
+                )
+                raise HTTPException(
+                    status_code=504,
+                    detail=(
+                        f"codex exec timed out after {timeout_seconds}s. "
+                        f"See log at {log_path}"
+                    ),
+                )
+            returncode = _kill_verifier_group_and_reap(
+                proc, terminate_first=False
+            )
+            tokens_used = _parse_tokens_used(raw_output)
+        except BaseException:
+            if returncode is None:
+                _kill_verifier_group_and_reap(proc, terminate_first=True)
+            raise
 
     elapsed_seconds = time.monotonic() - started_monotonic
     finished_at = datetime.now(timezone.utc).isoformat()
 
-    _write_run_log(
-        log_path,
-        started_at=started_at,
-        finished_at=finished_at,
-        status="completed",
-        returncode=completed.returncode,
-        model=model_name,
-        effort=effort_name,
-        elapsed_seconds=elapsed_seconds,
-        tokens_used=tokens_used,
-        context_round=context_round,
-        expanded_proof_ids=expanded_ids,
-    )
+    def write_terminal_log(
+        status: str,
+        *,
+        verification_status: Optional[str] = None,
+        verdict: Optional[str] = None,
+    ) -> None:
+        _write_run_log(
+            log_path,
+            started_at=started_at,
+            finished_at=finished_at,
+            status=status,
+            returncode=returncode,
+            model=model_name,
+            effort=effort_name,
+            elapsed_seconds=elapsed_seconds,
+            tokens_used=tokens_used,
+            context_round=context_round,
+            expanded_proof_ids=expanded_ids,
+            verification_status=verification_status,
+            verdict=verdict,
+        )
 
-    if completed.returncode != 0:
+    assert returncode is not None
+    if returncode != 0:
+        write_terminal_log("completed")
         raise HTTPException(status_code=500,
-                            detail=f"codex exec failed with exit code {completed.returncode}. See log at {log_path}")
+                            detail=f"codex exec failed with exit code {returncode}. See log at {log_path}")
 
+    # The model process returning zero is not yet a protocol-complete verifier
+    # result.  Keep that distinction explicit until parsing and the independent
+    # validator both succeed.
+    write_terminal_log("validating")
     verification_path = _verification_path(run_id)
     if verification_path is None:
+        write_terminal_log("contract_error")
         expected = results_dir / VERIFICATION_FILENAMES[0]
         raise HTTPException(status_code=500,
                             detail=f"verification output was not found at {expected}. See log at {log_path}")
     try:
-        payload = json.loads(verification_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
+        payload = json.loads(_read_verification_output(verification_path))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        write_terminal_log("contract_error")
         raise HTTPException(status_code=500,
                             detail=f"verification output at {verification_path} is not valid JSON") from exc
     try:
-        validated = validate_verification_output(payload)
+        validated = validate_verification_output(
+            payload,
+            statement=statement,
+            proof=proof,
+        )
     except ValueError as exc:
+        write_terminal_log("contract_error")
         raise HTTPException(
             status_code=500,
             detail=f"verification output at {verification_path} violates the JSON contract: {exc}",
         ) from exc
-    _write_run_log(
-        log_path,
-        started_at=started_at,
-        finished_at=finished_at,
-        status="completed",
-        returncode=completed.returncode,
-        model=model_name,
-        effort=effort_name,
-        elapsed_seconds=elapsed_seconds,
-        tokens_used=tokens_used,
-        context_round=context_round,
-        expanded_proof_ids=expanded_ids,
+    write_terminal_log(
+        "completed",
         verification_status=validated["verification_status"],
         verdict=validated["verdict"],
     )

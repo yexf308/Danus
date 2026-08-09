@@ -4,7 +4,7 @@ This pins the shape the `synthesize-verification-report` skill must emit and the
 verify service returns verbatim as the `/verify` HTTP response:
 
     {
-      "output_schema_version": 2,
+      "output_schema_version": 3,
       "verification_status": "final" | "needs_context",
       "verification_report": {"summary", "critical_errors": [...], "gaps": [...]},
       "verdict": "correct" | "wrong",
@@ -21,10 +21,29 @@ import pytest
 
 from danus.core import validate_verification_output
 
+_STMT = "For every x, f(x) <= 1."
+_PROOF = "By construction, f(x) ≤ 1 on [0, 1]."
+
+
+def _finding(location="proof", issue="bad", *, source="proof", line=1, exact_line=_PROOF):
+    return {
+        "location": location,
+        "issue": issue,
+        "candidate_evidence": {
+            "source": source,
+            "line": line,
+            "exact_line": exact_line,
+        },
+    }
+
+
+def _validate(payload):
+    return validate_verification_output(payload, statement=_STMT, proof=_PROOF)
+
 
 def _final(payload):
     return {
-        "output_schema_version": 2,
+        "output_schema_version": 3,
         "verification_status": "final",
         "needs_expanded_proofs": [],
         **payload,
@@ -32,7 +51,7 @@ def _final(payload):
 
 
 def test_accept_clean_proof():
-    validate_verification_output(
+    _validate(
         _final({
             "verification_report": {"summary": "ok", "critical_errors": [], "gaps": []},
             "verdict": "correct",
@@ -42,11 +61,11 @@ def test_accept_clean_proof():
 
 
 def test_reject_on_critical_error():
-    validate_verification_output(
+    _validate(
         _final({
             "verification_report": {
                 "summary": "bad implication",
-                "critical_errors": [{"location": "Lemma 3", "issue": "A does not imply B."}],
+                "critical_errors": [_finding("Lemma 3", "A does not imply B.")],
                 "gaps": [],
             },
             "verdict": "wrong",
@@ -57,12 +76,12 @@ def test_reject_on_critical_error():
 
 def test_reject_on_gap_alone():
     # Gaps alone force "wrong" — never relax to "no critical errors only".
-    validate_verification_output(
+    _validate(
         _final({
             "verification_report": {
                 "summary": "missing bound",
                 "critical_errors": [],
-                "gaps": [{"location": "proof paragraph 2", "issue": "boundedness unproved."}],
+                "gaps": [_finding("proof paragraph 2", "boundedness unproved.")],
             },
             "verdict": "wrong",
             "repair_hints": "Add the boundedness argument.",
@@ -77,7 +96,7 @@ def test_reject_on_gap_alone():
         {
             "verification_report": {
                 "summary": "x",
-                "critical_errors": [{"location": "L1", "issue": "bad"}],
+                "critical_errors": [_finding("L1")],
                 "gaps": [],
             },
             "verdict": "correct",
@@ -99,7 +118,7 @@ def test_reject_on_gap_alone():
         {
             "verification_report": {
                 "summary": "x",
-                "critical_errors": [{"location": "L1", "issue": "bad"}],
+                "critical_errors": [_finding("L1")],
                 "gaps": [],
             },
             "verdict": "wrong",
@@ -115,7 +134,10 @@ def test_reject_on_gap_alone():
         {
             "verification_report": {
                 "summary": "x",
-                "critical_errors": [{"location": "L1"}],
+                "critical_errors": [{
+                    "location": "L1",
+                    "candidate_evidence": _finding()["candidate_evidence"],
+                }],
                 "gaps": [],
             },
             "verdict": "wrong",
@@ -147,7 +169,7 @@ def test_reject_on_gap_alone():
             "verification_report": {
                 "summary": "x",
                 "critical_errors": [
-                    {"location": "L1", "issue": "bad", "severity": "critical"}
+                    {**_finding("L1"), "severity": "critical"}
                 ],
                 "gaps": [],
             },
@@ -158,13 +180,13 @@ def test_reject_on_gap_alone():
 )
 def test_contract_violations_raise(payload):
     with pytest.raises(ValueError):
-        validate_verification_output(_final(payload))
+        _validate(_final(payload))
 
 
 def test_needs_context_is_valid_control_flow_not_a_math_verdict():
-    validate_verification_output(
+    _validate(
         {
-            "output_schema_version": 2,
+            "output_schema_version": 3,
             "verification_status": "needs_context",
             "verification_report": {
                 "summary": "Need the exact ancestor proof.",
@@ -196,7 +218,7 @@ def test_needs_context_is_valid_control_flow_not_a_math_verdict():
 )
 def test_needs_context_semantic_violations_raise(updates):
     payload = {
-        "output_schema_version": 2,
+        "output_schema_version": 3,
         "verification_status": "needs_context",
         "verification_report": {
             "summary": "Need context.", "critical_errors": [], "gaps": [],
@@ -209,4 +231,15 @@ def test_needs_context_semantic_violations_raise(updates):
     }
     payload.update(updates)
     with pytest.raises(ValueError):
-        validate_verification_output(payload)
+        _validate(payload)
+
+
+def test_legacy_v2_is_rejected_fail_closed():
+    payload = _final({
+        "verification_report": {"summary": "ok", "critical_errors": [], "gaps": []},
+        "verdict": "correct",
+        "repair_hints": "",
+    })
+    payload["output_schema_version"] = 2
+    with pytest.raises(ValueError, match="exactly 3"):
+        _validate(payload)

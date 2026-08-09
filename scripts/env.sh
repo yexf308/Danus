@@ -67,32 +67,29 @@ if [ "${DANUS_ENV_VERBOSE:-0}" = "1" ]; then
   echo "consult transport=$DANUS_CONSULT_TRANSPORT"
 fi
 
-# 6) verify-service identity probe (shared by doctor.sh / services.sh).
-# A bare `/health` 200 does NOT prove the responder is OURS: on a shared host a
-# second Danus deployment can hold the same VERIFY_PORT, and its verifier would
-# answer our probe (a false "up" that silently routes fact_submit to the wrong
-# verifier). This classifies the port by matching the pid /health self-reports
-# against our own runtime/run/verify.pid. Echoes one word + sets a code:
-#   ours    (0)  -> healthy AND the responder is our pidfile's process
-#   foreign (3)  -> something answers, but it is not ours (port collision)
-#   stale   (4)  -> our pidfile process is dead and nothing answers the port
-#   down    (5)  -> nothing answers and we have no pidfile process
+# 6) verify-service guardian + health probe (shared by doctor/services/recover).
+# The Python guardian authenticates a bounded 0600 Unix-socket control response,
+# then requires a <=4 KiB HTTP 200 JSON body with the same random instance nonce,
+# child PID, verifier protocol and pinned bundle digest.  No shell PID parsing,
+# sed extraction, unbounded curl body, or numeric signal is involved.
+#
+#   ours (0), foreign (3), unsafe/cleanup_in_progress (4), down (5)
 danus_verify_health(){
   local url="http://127.0.0.1:${VERIFY_PORT}/health"
   local pf="$DANUS_RUNTIME/run/verify.pid"
-  local our_pid resp health_pid
-  our_pid="$(cat "$pf" 2>/dev/null || true)"
-  resp="$(curl -s --max-time 5 "$url" 2>/dev/null || true)"
-  if [ -z "$resp" ]; then
-    if [ -n "$our_pid" ] && kill -0 "$our_pid" 2>/dev/null; then echo down; return 5; fi
-    { [ -n "$our_pid" ]; } && { echo stale; return 4; }
-    echo down; return 5
-  fi
-  # pull "pid": <n> out of the JSON without a json dep
-  health_pid="$(printf '%s' "$resp" | sed -n 's/.*"pid"[[:space:]]*:[[:space:]]*\([0-9]\{1,\}\).*/\1/p')"
-  if [ -n "$our_pid" ] && [ -n "$health_pid" ] && [ "$our_pid" = "$health_pid" ]; then
-    echo ours; return 0
-  fi
-  # answered, but not by our pidfile's process (or an old build with no pid field)
-  echo foreign; return 3
+  local helper="$DANUS_ROOT/scripts/service-identity.py"
+  local result rc state
+  result="$("$DANUS_PY" -I -B "$helper" verify-health "$pf" "$url" 2>/dev/null)"
+  rc=$?
+  state="$(printf '%s' "$result" | "$DANUS_PY" -I -c \
+    'import json,sys
+try: print(json.load(sys.stdin).get("state", "unsafe"))
+except Exception: print("unsafe")' 2>/dev/null || echo unsafe)"
+  case "$state" in
+    ours) echo ours; return 0 ;;
+    foreign) echo foreign; return 3 ;;
+    cleanup_in_progress) echo cleanup_in_progress; return 4 ;;
+    down) echo down; return 5 ;;
+    *) echo unsafe; return "${rc:-4}" ;;
+  esac
 }

@@ -221,7 +221,9 @@ State only what you have **verified**. This is a hard rule, not a tone preferenc
   - `danus status <project>[/<worker>]` — liveness + round + last activity (a
     `stuck?` is a soft signal; decide stop/restart).
   - `danus stop <project>[/<worker>] [--force]` — graceful (finish the round) or
-    `--force` (kill now). To **extend** a run, adjust the project's `.run_deadline`;
+    `--force` (durably ask the worker to interrupt its active owned work and
+    exit; the CLI never signals an inspected numeric PID/PGID). To **extend** a
+    run, adjust the project's `.run_deadline`;
     to **restart**, `stop` then `start`. (There is no pause/resume — re-`start`.)
 - **Human report:** the `human-summary` skill — render the verified fact graph into
   a clean self-contained PDF (problem statement, key results with real proof

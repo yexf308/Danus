@@ -28,6 +28,18 @@ def main() -> int:
         sys.stderr.write("fake_codex: no prompt source\n")
         return 2
     prompt = sys.stdin.read() if sys.argv[-1] == "-" else sys.argv[-1]
+    candidate = prompt.split("<<<BEGIN_CANDIDATE_JSON>>>\n", 1)[1]
+    candidate = candidate.split("\n<<<END_CANDIDATE_JSON>>>", 1)[0]
+    candidate_proof = json.loads(candidate)["proof"]
+    proof_lines = candidate_proof.splitlines()
+    evidence_line_number, evidence_line = next(
+        (
+            (line_number, line)
+            for line_number, line in enumerate(proof_lines, start=1)
+            if "[[FAKE:wrong]]" in line
+        ),
+        (1, proof_lines[0]),
+    )
 
     if "--output-last-message" not in sys.argv:
         sys.stderr.write("fake_codex: missing --output-last-message\n")
@@ -36,12 +48,20 @@ def main() -> int:
 
     if "[[FAKE:wrong]]" in prompt:
         payload = {
-            "output_schema_version": 2,
+            "output_schema_version": 3,
             "verification_status": "final",
             "verification_report": {
                 "summary": "FAKE stub verdict (plumbing test): marker [[FAKE:wrong]] present.",
                 "critical_errors": [
-                    {"location": "proof", "issue": "fake_codex injected critical error for the reject path"}
+                    {
+                        "location": "proof",
+                        "issue": "fake_codex injected critical error for the reject path",
+                        "candidate_evidence": {
+                            "source": "proof",
+                            "line": evidence_line_number,
+                            "exact_line": evidence_line,
+                        },
+                    }
                 ],
                 "gaps": [],
             },
@@ -51,7 +71,7 @@ def main() -> int:
         }
     else:
         payload = {
-            "output_schema_version": 2,
+            "output_schema_version": 3,
             "verification_status": "final",
             "verification_report": {
                 "summary": "FAKE stub verdict (plumbing test): no error marker; accepting.",

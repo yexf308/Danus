@@ -10,7 +10,7 @@
     "repair_hints"
   ],
   "properties": {
-    "output_schema_version": {"type": "integer", "enum": [2]},
+    "output_schema_version": {"type": "integer", "enum": [3]},
     "verification_status": {"type": "string", "enum": ["final", "needs_context"]},
     "verification_report": {
       "type": "object",
@@ -44,13 +44,24 @@
     "repair_hints": {"type": "string"}
   },
   "$defs": {
+    "candidateEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "line", "exact_line"],
+      "properties": {
+        "source": {"type": "string", "enum": ["statement", "proof"]},
+        "line": {"type": "integer"},
+        "exact_line": {"type": "string"}
+      }
+    },
     "finding": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["location", "issue"],
+      "required": ["location", "issue", "candidate_evidence"],
       "properties": {
         "location": {"type": "string"},
-        "issue": {"type": "string"}
+        "issue": {"type": "string"},
+        "candidate_evidence": {"$ref": "#/$defs/candidateEvidence"}
       }
     }
   }

@@ -26,13 +26,16 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import tomllib
+import pytest
 from contextlib import contextmanager
 from pathlib import Path
 
 from danus.execution import layout as L
 from danus.execution import loop, scaffold
+from danus.hotjoin import HotJoinError
 
 
 @contextmanager
@@ -82,6 +85,16 @@ def _write_fake_codex(tmp: Path, body: str) -> Path:
     return p
 
 
+def _running(pid: int) -> bool:
+    result = subprocess.run(
+        ["ps", "-o", "state=", "-p", str(pid)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return bool(result.stdout.strip()) and not result.stdout.lstrip().startswith("Z")
+
+
 # --- run_round: chosen exit code ------------------------------------------- #
 
 def test_run_round_returns_codex_rc(tmp: Path):
@@ -106,6 +119,305 @@ def test_run_round_success_rc0(tmp: Path):
     assert rc == 0
 
 
+def test_run_round_normal_exit_sweeps_unreaped_owned_process_group(tmp: Path):
+    wl = _mk_worker(tmp)
+    marker = tmp / "normal-exit-owned-group"
+    fake = _write_fake_codex(
+        tmp,
+        "import os, pathlib, subprocess, sys\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'])\n"
+        f"pathlib.Path({str(marker)!r}).write_text("
+        "f'{os.getpid()} {os.getpgrp()} {child.pid} {os.getpgid(child.pid)}')\n",
+    )
+    log = wl.dir / "round-normal-group.log"
+    with _env(DANUS_CODEX_BIN=str(fake)):
+        rc = loop.run_round(
+            wl,
+            {"MODEL": "m", "REASONING_EFFORT": "high"},
+            "prompt",
+            log,
+            hard_timeout=30,
+        )
+    assert rc == 0
+    leader, leader_group, grandchild, grandchild_group = map(
+        int, marker.read_text(encoding="utf-8").split()
+    )
+    # The actual Codex and its descendants share the retained host's group;
+    # the Codex leader is deliberately not allowed to detach from that host.
+    assert leader_group != leader
+    assert grandchild_group == leader_group
+    assert leader_group != os.getpgrp()
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline and (
+        _running(leader) or _running(grandchild)
+    ):
+        time.sleep(0.02)
+    assert not _running(leader)
+    assert not _running(grandchild)
+
+
+def _wait_processes_gone(*pids: int) -> None:
+    deadline = time.monotonic() + 8
+    while time.monotonic() < deadline and any(_running(pid) for pid in pids):
+        time.sleep(0.02)
+    assert all(not _running(pid) for pid in pids)
+
+
+def test_exec_owner_sigkill_revokes_liveness_and_kills_paid_group(tmp: Path):
+    wl = _mk_worker(tmp)
+    marker = tmp / "exec-owner-death"
+    fake = _write_fake_codex(
+        tmp,
+        "import os, pathlib, signal, subprocess, sys, time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "child = subprocess.Popen([sys.executable, '-c', "
+        "'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(120)'])\n"
+        f"pathlib.Path({str(marker)!r}).write_text("
+        "f'{os.getpid()} {os.getpgrp()} {child.pid} {os.getpgid(child.pid)}')\n"
+        "time.sleep(120)\n",
+    )
+    code = (
+        "from pathlib import Path\n"
+        "from danus.execution import layout, loop\n"
+        "loop.require_gateway_runtime=lambda: None\n"
+        "wl=layout.WorkerLayout(Path(__import__('sys').argv[1]))\n"
+        "raise SystemExit(loop.run_round(wl, {'MODEL':'m','REASONING_EFFORT':'high'},"
+        " 'prompt', wl.dir/'owner-death.log', 120))\n"
+    )
+    env = os.environ.copy()
+    env["DANUS_CODEX_BIN"] = str(fake)
+    owner = subprocess.Popen([sys.executable, "-c", code, str(wl.dir)], env=env)
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not marker.exists():
+            time.sleep(0.02)
+        assert marker.exists()
+        leader, group, grandchild, grandchild_group = map(
+            int, marker.read_text(encoding="utf-8").split()
+        )
+        assert group != leader
+        assert grandchild_group == group
+        os.kill(owner.pid, signal.SIGKILL)
+        owner.wait(timeout=5)
+        second_marker = tmp / "overlapping-paid-launch"
+        second = tmp / "fake_codex_second"
+        second.write_text(
+            "#!/usr/bin/env python3\n"
+            f"from pathlib import Path; Path({str(second_marker)!r}).write_text('started')\n",
+            encoding="utf-8",
+        )
+        second.chmod(0o755)
+        # The old host retains the same flock OFD during its TERM/KILL cleanup,
+        # so an immediate replacement worker cannot begin a second paid job.
+        with _env(DANUS_CODEX_BIN=str(second)):
+            assert loop.run_round(
+                wl,
+                {"MODEL": "m", "REASONING_EFFORT": "high"},
+                "prompt",
+                wl.dir / "overlap-refused.log",
+                hard_timeout=10,
+            ) == 126
+        assert not second_marker.exists()
+        refused_status = json.loads(wl.status.read_text(encoding="utf-8"))
+        assert refused_status["attempt_failure_code"] == (
+            "prior_paid_cleanup_in_progress"
+        )
+        assert "cleanup is still in progress" in refused_status["attempt_failure"]
+        _wait_processes_gone(leader, grandchild, group)
+        # Once the old group is terminal the same fence is released.
+        with _env(DANUS_CODEX_BIN=str(second)):
+            assert loop.run_round(
+                wl,
+                {"MODEL": "m", "REASONING_EFFORT": "high"},
+                "prompt",
+                wl.dir / "overlap-after-cleanup.log",
+                hard_timeout=10,
+            ) == 0
+        assert second_marker.exists()
+    finally:
+        if owner.poll() is None:
+            owner.kill()
+            owner.wait()
+
+
+def test_host_sigkill_is_swept_by_live_worker_under_unreaped_fence(tmp: Path):
+    wl = _mk_worker(tmp)
+    marker = tmp / "host-crash"
+    release = tmp / "release-host-sweep"
+    fake = _write_fake_codex(
+        tmp,
+        "import os, pathlib, subprocess, sys, time\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'])\n"
+        f"pathlib.Path({str(marker)!r}).write_text("
+        "f'{os.getpid()} {os.getpgrp()} {child.pid} {os.getpgid(child.pid)}')\n"
+        "time.sleep(120)\n",
+    )
+    code = (
+        "from pathlib import Path\n"
+        "import time\n"
+        "from danus.execution import layout, loop\n"
+        "loop.require_gateway_runtime=lambda: None\n"
+        "wl=layout.WorkerLayout(Path(__import__('sys').argv[1]))\n"
+        "marker=Path(__import__('sys').argv[2])\n"
+        "release=Path(__import__('sys').argv[3])\n"
+        "real_poll=loop._owned_child_exited_no_reap\n"
+        "def gated_poll(proc):\n"
+        "    if marker.exists() and not release.exists():\n"
+        "        while not release.exists(): time.sleep(0.01)\n"
+        "    return real_poll(proc)\n"
+        "loop._owned_child_exited_no_reap=gated_poll\n"
+        "loop.run_round(wl, {'MODEL':'m','REASONING_EFFORT':'high'},"
+        " 'prompt', wl.dir/'host-crash.log', 120)\n"
+    )
+    env = os.environ.copy()
+    env["DANUS_CODEX_BIN"] = str(fake)
+    owner = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            code,
+            str(wl.dir),
+            str(marker),
+            str(release),
+        ],
+        env=env,
+    )
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not marker.exists():
+            time.sleep(0.02)
+        assert marker.exists()
+        leader, host_group, grandchild, grandchild_group = map(
+            int, marker.read_text(encoding="utf-8").split()
+        )
+        assert host_group == grandchild_group
+        os.kill(host_group, signal.SIGKILL)
+        # The worker-side copy of the paid authority stays locked while host
+        # death has been observed but group sweep is deliberately barriered.
+        with pytest.raises(HotJoinError, match="cleanup is still in progress"):
+            loop._acquire_paid_authority(wl)
+        release.touch()
+        owner.wait(timeout=8)
+        _wait_processes_gone(leader, grandchild, host_group)
+        paid_fd = loop._acquire_paid_authority(wl)
+        os.close(paid_fd)
+    finally:
+        release.touch(exist_ok=True)
+        if owner.poll() is None:
+            owner.kill()
+            owner.wait()
+
+
+def test_run_round_post_spawn_exception_revokes_host_and_paid_group(
+    tmp: Path, monkeypatch: pytest.MonkeyPatch
+):
+    wl = _mk_worker(tmp)
+    marker = tmp / "post-spawn-exception"
+    fake = _write_fake_codex(
+        tmp,
+        "import os, pathlib, signal, subprocess, sys, time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "child = subprocess.Popen([sys.executable, '-c', "
+        "'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(120)'])\n"
+        f"pathlib.Path({str(marker)!r}).write_text("
+        "f'{os.getpid()} {os.getpgrp()} {child.pid} {os.getpgid(child.pid)}')\n"
+        "time.sleep(120)\n",
+    )
+
+    def injected_failure(_worker: L.WorkerLayout) -> bool:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not marker.exists():
+            time.sleep(0.02)
+        assert marker.exists()
+        raise RuntimeError("injected post-spawn failure")
+
+    monkeypatch.setattr(loop, "_force_stop_requested", injected_failure)
+    with _env(DANUS_CODEX_BIN=str(fake)), pytest.raises(
+        RuntimeError, match="injected post-spawn failure"
+    ):
+        loop.run_round(
+            wl,
+            {"MODEL": "m", "REASONING_EFFORT": "high"},
+            "prompt",
+            wl.dir / "post-spawn.log",
+            hard_timeout=30,
+        )
+    leader, group, grandchild, grandchild_group = map(
+        int, marker.read_text(encoding="utf-8").split()
+    )
+    assert group == grandchild_group
+    _wait_processes_gone(leader, grandchild, group)
+    assert loop._Child.proc is None
+
+
+def test_run_round_cooperative_stop_terminates_only_owned_child(tmp: Path):
+    wl = _mk_worker(tmp)
+    fake = _write_fake_codex(tmp, "import time\ntime.sleep(120)\n")
+    log = wl.dir / "round.log"
+    wl.stop.write_text("force\n", encoding="utf-8")
+    started = time.monotonic()
+    with _env(DANUS_CODEX_BIN=str(fake)):
+        rc = loop.run_round(
+            wl,
+            {"MODEL": "m", "REASONING_EFFORT": "high"},
+            "prompt",
+            log,
+            hard_timeout=30,
+        )
+    assert rc == loop.WORKER_STOP_REQUESTED_RC
+    assert time.monotonic() - started < 5
+    assert "cooperative owner stop requested" in log.read_text(encoding="utf-8")
+    assert loop._Child.proc is None
+
+
+def test_run_round_force_stop_removes_owned_child_process_group(tmp: Path):
+    wl = _mk_worker(tmp)
+    marker = tmp / "owned-group"
+    fake = _write_fake_codex(
+        tmp,
+        "import os, pathlib, subprocess, sys, time\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'])\n"
+        f"pathlib.Path({str(marker)!r}).write_text("
+        "f'{os.getpid()} {os.getpgrp()} {child.pid} {os.getpgid(child.pid)}')\n"
+        "time.sleep(120)\n",
+    )
+    log = wl.dir / "round-group.log"
+
+    def request_stop() -> None:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not marker.exists():
+            time.sleep(0.02)
+        assert marker.exists()
+        wl.stop.write_text("force\n", encoding="utf-8")
+
+    stopper = threading.Thread(target=request_stop)
+    stopper.start()
+    with _env(DANUS_CODEX_BIN=str(fake)):
+        rc = loop.run_round(
+            wl,
+            {"MODEL": "m", "REASONING_EFFORT": "high"},
+            "prompt",
+            log,
+            hard_timeout=30,
+        )
+    stopper.join(timeout=5)
+    assert not stopper.is_alive()
+    assert rc == loop.WORKER_STOP_REQUESTED_RC
+    leader, leader_group, grandchild, grandchild_group = map(
+        int, marker.read_text(encoding="utf-8").split()
+    )
+    assert leader_group != leader
+    assert grandchild_group == leader_group
+    assert leader_group != os.getpgrp()
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline and (
+        _running(leader) or _running(grandchild)
+    ):
+        time.sleep(0.02)
+    assert not _running(leader)
+    assert not _running(grandchild)
+
+
 def test_worker_mcp_config_arg_is_one_complete_toml_object(tmp: Path):
     wl = _mk_worker(tmp, "author7")
     with _env(DANUS_VERIFY_URL="http://127.0.0.1:18091/verify"):
@@ -117,11 +429,13 @@ def test_worker_mcp_config_arg_is_one_complete_toml_object(tmp: Path):
         "mcp_servers": {
             "danus": {
                 "command": sys.executable,
-                "args": ["-m", "danus.gateway"],
+                "args": ["-I", "-B", "-m", "danus.gateway"],
                 "env": {
                     "DANUS_PROJECT_DIR": str(wl.project_dir),
                     "DANUS_AUTHOR": "author7",
                     "DANUS_ROLE": "worker",
+                    "DANUS_HOTJOIN_ENABLED": "1",
+                    "DANUS_HOTJOIN_TARGET": "author7",
                     "DANUS_VERIFY_URL": "http://127.0.0.1:18091/verify",
                 },
                 "tool_timeout_sec": 3600,
@@ -138,16 +452,15 @@ def test_run_round_injects_complete_mcp_without_project_config(tmp: Path):
     log = wl.dir / "round.log"
     captured = {}
 
-    class _StubProc:
-        def wait(self, timeout=None):
-            return 0
+    original_spawn = loop.spawn_owned_child
 
-    def fake_popen(command, **kwargs):
+    def fake_spawn(command, **kwargs):
         captured["command"] = command
-        return _StubProc()
+        # Preserve the retained-child/PID-fence contract while replacing only
+        # the external Codex command under test.
+        return original_spawn([sys.executable, "-c", "pass"], **kwargs)
 
-    original_popen = subprocess.Popen
-    subprocess.Popen = fake_popen
+    loop.spawn_owned_child = fake_spawn
     try:
         with _env(
             DANUS_CODEX_BIN=str(tmp / "fake-codex"),
@@ -161,7 +474,7 @@ def test_run_round_injects_complete_mcp_without_project_config(tmp: Path):
                 hard_timeout=30,
             )
     finally:
-        subprocess.Popen = original_popen
+        loop.spawn_owned_child = original_spawn
 
     assert rc == 0
     command = captured["command"]
@@ -169,19 +482,22 @@ def test_run_round_injects_complete_mcp_without_project_config(tmp: Path):
         (token, command[index + 1])
         for index, token in enumerate(command[:-1])
         if token in ("--config", "-c")
-        and command[index + 1].startswith("mcp_servers.danus")
+        and command[index + 1].startswith("mcp_servers=")
     ]
     assert len(mcp_overrides) == 1
     assert mcp_overrides[0][0] == "--config"
+    assert "--json" in command
     assert not any(part.startswith("mcp_servers.danus.") for part in command)
     parsed = tomllib.loads(mcp_overrides[0][1])["mcp_servers"]["danus"]
     assert parsed == {
         "command": sys.executable,
-        "args": ["-m", "danus.gateway"],
+        "args": ["-I", "-B", "-m", "danus.gateway"],
         "env": {
             "DANUS_PROJECT_DIR": str(wl.project_dir),
             "DANUS_AUTHOR": "worker9",
             "DANUS_ROLE": "worker",
+            "DANUS_HOTJOIN_ENABLED": "1",
+            "DANUS_HOTJOIN_TARGET": "worker9",
             "DANUS_VERIFY_URL": "http://127.0.0.1:18091/verify",
         },
         "tool_timeout_sec": 3600,
@@ -216,7 +532,7 @@ def test_run_round_missing_binary_returns_127(tmp: Path):
         rc = loop.run_round(wl, {"MODEL": "m", "REASONING_EFFORT": "high"},
                             "prompt", log, hard_timeout=30)
     assert rc == 127
-    assert "codex binary not found" in log.read_text()
+    assert "owned paid child failed to exec" in log.read_text()
 
 
 def test_run_round_gateway_preflight_failure_starts_no_codex(tmp: Path, monkeypatch):
@@ -245,39 +561,24 @@ def test_run_round_gateway_preflight_failure_starts_no_codex(tmp: Path, monkeypa
 # --- run_round: unresponsive child → terminate times out → kill → 124 ------ #
 
 def test_run_round_timeout_then_kill(tmp: Path):
-    """A child that ignores terminate() (wait(10) times out) is force-killed. We
-    fake Popen so the 10s terminate-grace does not slow the test."""
+    """A child that ignores TERM is group-KILLed while still unreaped."""
     wl = _mk_worker(tmp)
     log = wl.dir / "round.log"
-
-    class _StubProc:
-        def __init__(self):
-            self.terminated = False
-            self.killed = False
-            self._waits = 0
-
-        def wait(self, timeout=None):
-            self._waits += 1
-            # 1st wait = the hard-timeout expiry; 2nd wait = the 10s grace expiry.
-            raise subprocess.TimeoutExpired(cmd="codex", timeout=timeout)
-
-        def terminate(self):
-            self.terminated = True
-
-        def kill(self):
-            self.killed = True
-
-    stub = _StubProc()
-    orig_popen = subprocess.Popen
-    subprocess.Popen = lambda *a, **k: stub
+    fake = _write_fake_codex(
+        tmp,
+        "import signal, time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "time.sleep(60)\n",
+    )
+    original_terminate = loop._terminate_owned_child
+    loop._terminate_owned_child = lambda proc: original_terminate(proc, grace=0.1)
     try:
-        with _env(DANUS_CODEX_BIN=str(tmp / "anything")):
+        with _env(DANUS_CODEX_BIN=str(fake)):
             rc = loop.run_round(wl, {"MODEL": "m", "REASONING_EFFORT": "high"},
                                 "prompt", log, hard_timeout=1)
     finally:
-        subprocess.Popen = orig_popen
+        loop._terminate_owned_child = original_terminate
     assert rc == 124
-    assert stub.terminated and stub.killed          # terminate → (grace expired) → kill
     assert loop._Child.proc is None
 
 
@@ -295,6 +596,29 @@ def test_main_stops_on_stop_flag(tmp: Path):
     assert rc == 0
     assert not wl.stop.exists()                       # consumed
     assert json.loads(wl.status.read_text())["state"] == "stopped"
+
+
+def test_main_consumes_stop_reported_during_active_round(tmp: Path):
+    wl = _mk_worker(tmp)
+    calls = []
+
+    def stopped_round(worker, *_args, **_kwargs):
+        calls.append(1)
+        worker.stop.write_text("force\n", encoding="utf-8")
+        return loop.WORKER_STOP_REQUESTED_RC
+
+    with _restore_sigterm(), _env(DANUS_ROUND_BEAT="0"):
+        _patch_run_round(stopped_round)
+        try:
+            rc = loop.main(str(wl.dir))
+        finally:
+            _unpatch_run_round()
+    assert rc == 0
+    assert calls == [1]
+    assert not wl.stop.exists()
+    status = json.loads(wl.status.read_text(encoding="utf-8"))
+    assert status["state"] == "stopped"
+    assert status["last_rc"] == loop.WORKER_STOP_REQUESTED_RC
 
 
 # --- main loop: deadline → stop -------------------------------------------- #
@@ -329,6 +653,40 @@ def test_main_max_rounds_cap(tmp: Path):
     st = json.loads(wl.status.read_text())
     assert st["state"] == "max_rounds"
     assert st["round"] == 2 and st["last_rc"] == 0
+
+
+def test_main_restart_preserves_old_logs_and_advances_round_sequence(tmp: Path):
+    wl = _mk_worker(tmp)
+    wl.logs.mkdir()
+    old_bytes = b"immutable prior round\n"
+    (wl.logs / "round_3.log").write_bytes(old_bytes)
+    wl.status.write_text(json.dumps({"state": "stopped", "round": 3}))
+    observed = []
+
+    def one_round(_wl, _role, _prompt, log_path, _hard_timeout):
+        observed.append(log_path.name)
+        log_path.write_text(f"new {log_path.name}\n", encoding="utf-8")
+        return 0
+
+    with _restore_sigterm(), _env(
+        DANUS_ROUND_BEAT="0",
+        DANUS_MAX_ROUNDS="1",
+        DANUS_MAX_CONSEC_FAILURES="0",
+    ):
+        _patch_run_round(one_round)
+        try:
+            assert loop.main(str(wl.dir)) == 0
+            assert loop.main(str(wl.dir)) == 0
+        finally:
+            _unpatch_run_round()
+
+    assert observed == ["round_4.log", "round_5.log"]
+    assert (wl.logs / "round_3.log").read_bytes() == old_bytes
+    assert (wl.logs / "round_4.log").read_text() == "new round_4.log\n"
+    assert (wl.logs / "round_5.log").read_text() == "new round_5.log\n"
+    status = json.loads(wl.status.read_text())
+    assert status["state"] == "max_rounds"
+    assert status["round"] == 5
 
 
 # --- main loop: consecutive-failure cap → error / rc 1 --------------------- #
@@ -424,15 +782,11 @@ def test_main_gateway_preflight_fails_before_any_state_or_launch(tmp: Path, monk
 
 def test_main_sigterm_handler(tmp: Path):
     wl = _mk_worker(tmp)
-
-    class _FakeProc:
-        def __init__(self):
-            self.terminated = False
-
-        def terminate(self):
-            self.terminated = True
-
-    fake_proc = _FakeProc()
+    fake_proc = loop.spawn_owned_child(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        cwd=tmp,
+        popen=subprocess.Popen,
+    )
 
     # run_round: install a live child then deliver SIGTERM to ourselves so the
     # loop's own handler fires (covers _on_term end to end).
@@ -453,7 +807,7 @@ def test_main_sigterm_handler(tmp: Path):
         finally:
             _unpatch_run_round()
             loop._Child.proc = None
-    assert fake_proc.terminated
+    assert fake_proc.returncode is not None
     assert json.loads(wl.status.read_text())["state"] == "terminated"
 
 
@@ -467,6 +821,17 @@ def test_write_status_corrupt_existing_recovers(tmp: Path):
     assert st["state"] == "running" and st["worker"] == "high"
 
 
+def test_write_status_legal_nonobject_json_recovers(tmp: Path):
+    wl = _mk_worker(tmp)
+    for value in ([], ["old"], "old", 7, True, None):
+        wl.status.write_text(json.dumps(value), encoding="utf-8")
+        loop.write_status(wl, state="running")
+        status = json.loads(wl.status.read_text(encoding="utf-8"))
+        assert isinstance(status, dict)
+        assert status["state"] == "running"
+        assert status["worker"] == "high"
+
+
 # --- _parse_last_fact_id: unreadable path → None --------------------------- #
 
 def test_parse_last_fact_id_missing_file(tmp: Path):
@@ -477,14 +842,14 @@ def test_parse_last_fact_id_missing_file(tmp: Path):
 
 def test_cleanup_pid_removes_own(tmp: Path):
     wl = _mk_worker(tmp)
-    wl.pid.write_text(str(os.getpid()))
+    wl.pid.write_text(json.dumps({"schema_version": 1, "pid": os.getpid()}))
     loop._cleanup_pid(wl)
     assert not wl.pid.exists()
 
 
 def test_cleanup_pid_keeps_foreign(tmp: Path):
     wl = _mk_worker(tmp)
-    wl.pid.write_text("999999999")            # some other pid
+    wl.pid.write_text(json.dumps({"schema_version": 1, "pid": 999_999_999}))
     loop._cleanup_pid(wl)
     assert wl.pid.exists()                     # left intact
 
@@ -640,12 +1005,14 @@ def main() -> None:
         test_main_stops_on_stop_flag,
         test_main_stops_on_deadline,
         test_main_max_rounds_cap,
+        test_main_restart_preserves_old_logs_and_advances_round_sequence,
         test_main_consecutive_failure_cap,
         test_main_timeout_rc124_does_not_count_as_failure,
         test_main_codex_missing_127,
         test_main_missing_worker_dir,
         test_main_sigterm_handler,
         test_write_status_corrupt_existing_recovers,
+        test_write_status_legal_nonobject_json_recovers,
         test_parse_last_fact_id_missing_file,
         test_cleanup_pid_removes_own,
         test_cleanup_pid_keeps_foreign,

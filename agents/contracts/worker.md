@@ -51,6 +51,14 @@ every round read **two** steering inputs:
 `TASK.md` narrows the shared `master_guidance` to your lane: the guidance says
 *how* to think, your `TASK.md` says *which* part is yours.
 
+When the worker is running through the app-server transport, the authenticated
+human owner may join the current turn with a native user message. Treat that
+message as the newest research-direction instruction and respond to it explicitly
+in the same turn. It is strategy, not mathematical truth: every reusable claim
+still needs its own proof and `fact_submit`. A text message saying “stop”,
+“accept”, or “publish” has no control-plane or verifier authority; only the
+supervisor's typed commands can interrupt a turn or stop the process.
+
 **After you finish your `TASK.md` assignment — or if `TASK.md` is unassigned /
 empty — do not idle.** Keep working freely on the project's **main problem**:
 pick the highest-leverage open direction toward the target theorem and pursue it
@@ -171,8 +179,16 @@ returns an explicit `trace_error` if that audit append fails, so an
 outcome is never lost. The verifier is the sole authority on correctness; no
 peer/LLM opinion substitutes for it. Two edge cases to handle from the return
 value: `verdict="error"` means the verify service was unavailable — just retry;
-an accepted submission with `write_error` (e.g. a predecessor was revoked) means
-the fact was not written — re-prove or avoid that predecessor. If a submission
+`accepted` is a compatibility field for the verifier's mathematical verdict, not
+publication. Build on a result only when `promoted: true` and a non-null
+`fact_id` are both returned. `submission_status="verified_not_promoted"` with
+`verification_verdict="correct"` and `write_error` (e.g. a predecessor was
+revoked or a glossary definition conflicts) means the fact was not written —
+refresh/re-prove around stale predecessors, repair the conflicting introduction,
+or retry the failed write. If a submission returns `promoted: null` and
+`submission_status="promotion_unknown"`, an fsync
+failure left commit-versus-rollback resolution to graph recovery; do not cite or
+count that response, and refresh graph truth before proceeding. If a submission
 does not pass:
 
 1. Revise it using the returned `repair_hints` (and `undefined_symbols`).

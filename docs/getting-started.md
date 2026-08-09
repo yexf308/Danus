@@ -87,7 +87,9 @@ bash scripts/services.sh up verify
 ```
 
 **Without the verify service, `fact_submit` fails and no facts are ever produced.**
-`services.sh` `setsid`-detaches it so it survives your shell. See `operations.md`.
+`services.sh` launches an authenticated local guardian that survives your shell,
+owns and reaps the exact service child, and enforces nonce-bound readiness before
+reporting success. See `operations.md`.
 
 ## 5. Health check
 

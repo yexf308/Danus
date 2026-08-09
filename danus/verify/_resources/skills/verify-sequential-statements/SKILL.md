@@ -37,6 +37,12 @@ Do not split the proof with utility code. Read the markdown in order and use its
 8. Classify findings:
    - `critical_error`: logical contradiction, invalid theorem use, false implication.
    - `gap`: missing derivation, vague justification, unsupported step, or suspiciously unused assumptions whose role is not justified.
+   Every `critical_error` and every `gap` must also carry `candidate_evidence`: identify whether
+   its anchor is in the decoded candidate `statement` or `proof`, give the
+   positive 1-based logical line number, and copy that complete line exactly
+   (without its newline separator). Never normalize, shorten, or summarize it.
+   For literal/syntactic claims, reread that raw line and preserve comparison
+   strictness and interval endpoint openness exactly.
 9. Also apply the **Hard Prohibitions** defined in the verifier contract (`agents/contracts/verifier.md`, "Hard Prohibitions to enforce"): P1 (citing `problem.md` / `data/<NAME>.md` as a substantive math source), P3 (an unproven conditional premise with no same-paragraph `fact_id` citation), P5 (a vague gesture at a "well-known"/"classical" result without a specific citation), and P6 (a statement that is not self-contained). Do not restate or fork the prohibition wording here — read and apply it from the contract so there is a single source of truth. These prohibitions are strictly additive: they only ever add findings (reject more), never remove them.
 10. Keep each checked item in context for the synthesis step. You persist nothing —
    the verifier is stateless; the worker does all writing.
@@ -50,10 +56,26 @@ Produce one record per checked item, kept in context for synthesis:
   "location": "Lemma 3",
   "status": "checked",
   "critical_errors": [
-    {"location": "Lemma 3", "issue": "Incorrect implication from A to B."}
+    {
+      "location": "Lemma 3",
+      "issue": "Incorrect implication from A to B.",
+      "candidate_evidence": {
+        "source": "proof",
+        "line": 7,
+        "exact_line": "Therefore A implies B."
+      }
+    }
   ],
   "gaps": [
-    {"location": "Lemma 3", "issue": "Missing justification of boundedness."}
+    {
+      "location": "Lemma 3",
+      "issue": "Missing justification of boundedness.",
+      "candidate_evidence": {
+        "source": "proof",
+        "line": 8,
+        "exact_line": "The sequence is therefore bounded."
+      }
+    }
   ]
 }
 ```

@@ -72,14 +72,24 @@ Concretely, before you submit:
 Call `fact_submit(statement, proof, predecessors=[...], glossary_introduces={...})`.
 Read the result:
 
-- `accepted: true, fact_id` — the fact is written. **Cite `fact_id`** downstream.
+- `promoted: true, submission_status: "promoted", fact_id` — the fact is
+  written. **Cite `fact_id`** downstream. (`accepted: true` is retained as a
+  verifier-verdict compatibility field; never use it alone as publication
+  success.)
 - `accepted: false, repair_hints` (+ `undefined_symbols`) — revise: resolve
   critical errors first, then all remaining gaps; do not assume the fix is local —
   change strategy or backtrack if needed; then resubmit. Treat any `wrong` verdict,
   any critical error, or any gap as failure.
 - `verdict: "error"` — the verify service was unavailable; retry.
-- `accepted: true, write_error` (e.g. a predecessor was revoked) — the fact was not
-  written; re-prove or avoid that predecessor.
+- `accepted: true, verification_verdict: "correct", promoted: false,
+  submission_status: "verified_not_promoted", fact_id: null, write_error` — the
+  mathematics passed but the fact was not written. Refresh/re-prove around stale
+  predecessors, repair a conflicting glossary introduction, or retry the failed
+  write. Do not cite or build on it. For an older response without `promoted`, a
+  valid non-null `fact_id` is the only safe publication fallback.
+- `accepted: true, promoted: null, submission_status: "promotion_unknown"` — an
+  fsync failure made commit versus rollback crash recovery ambiguous. Do not cite
+  or count the response; refresh graph truth before proceeding.
 
 Every outcome is auto-logged to global memory (kind `verification`), so the
 feedback is shared — `gm_search` it to learn from others' rejections.

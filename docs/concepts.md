@@ -54,7 +54,8 @@ Everything a project knows lives in three tiers that differ by **scope** and
 
 A finding flows left to right, getting more structured and more trusted: a private
 note becomes a shared finding (`global memory`), and a *verifiable* finding that
-the verifier accepts becomes a **fact**. Crucially:
+the verifier accepts becomes a **fact only after the gateway completes the locked
+graph write**. Crucially:
 
 - **Only the fact graph is truth.** Global memory — even a plausible, not-yet-checked
   claim — is awareness only. A proof may build **only** on facts (by citing their

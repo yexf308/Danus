@@ -16,6 +16,7 @@ from pathlib import Path
 
 from danus.core import (
     FactGraph,
+    FactPromotionOutcomeUnknown,
     GlobalMemory,
     LocalMemory,
     clean_external_refs,
@@ -1109,6 +1110,996 @@ def test_fact_add_is_atomic_and_rolls_back_glossary_failure():
         assert fg.list() == [survivor]
         assert fg.glossary() == {}
         assert not fg.pending_add_path.exists()
+
+
+def test_fact_add_no_glossary_post_replace_fsync_failure_rolls_back():
+    """A fact is not published until its data rename is durably acknowledged."""
+    with tempfile.TemporaryDirectory() as d:
+        fg = FactGraph(Path(d) / "no-glossary-fsync")
+        original_fsync_directory = fg._fsync_directory
+        injected = False
+
+        def fail_after_fact_directory_fsync(directory):
+            nonlocal injected
+            original_fsync_directory(directory)
+            if directory == fg.facts_dir and not injected:
+                injected = True
+                raise OSError("injected post-replace fact fsync failure")
+
+        fg._fsync_directory = fail_after_fact_directory_fsync  # type: ignore[method-assign]
+        try:
+            try:
+                fg.add(
+                    problem_id="P",
+                    author="w",
+                    statement="Never visible after a failed add",
+                    proof="proof",
+                )
+                assert False, "the post-replace fsync failure must propagate"
+            except OSError as exc:
+                assert "post-replace fact fsync failure" in str(exc)
+        finally:
+            fg._fsync_directory = original_fsync_directory  # type: ignore[method-assign]
+
+        assert fg.list() == []
+        assert not fg.pending_add_path.exists()
+        assert not fg.pending_add_commit_path.exists()
+
+
+def test_fact_add_exact_retry_returns_without_rewriting_committed_state():
+    """A lost-response retry is an idempotent read of the existing exact commit."""
+    for index, glossary_introduces in enumerate(
+        ({}, {"IDEMPOTENT_RETRY_X_418": "the retry test object"})
+    ):
+        with tempfile.TemporaryDirectory() as d:
+            fg = FactGraph(Path(d) / f"idempotent-retry-{index}")
+            kwargs = {
+                "problem_id": "P",
+                "author": "w",
+                "statement": f"An exactly repeated fact {index}",
+                "proof": "proof",
+                "glossary_introduces": glossary_introduces,
+            }
+            fact_id = fg.add(**kwargs)
+            original_fsync_directory = fg._fsync_directory
+            fact_fsync_attempted = False
+
+            def reject_redundant_fact_fsync(directory):
+                nonlocal fact_fsync_attempted
+                if directory == fg.facts_dir:
+                    fact_fsync_attempted = True
+                    raise OSError("redundant fact rewrite must not run")
+                original_fsync_directory(directory)
+
+            fg._fsync_directory = reject_redundant_fact_fsync  # type: ignore[method-assign]
+            try:
+                assert fg.add(**kwargs) == fact_id
+            finally:
+                fg._fsync_directory = original_fsync_directory  # type: ignore[method-assign]
+
+            assert fact_fsync_attempted is False
+            assert fg.list() == [fact_id]
+            assert not fg.pending_add_path.exists()
+            assert not fg.pending_add_commit_path.exists()
+
+
+def test_fact_add_commit_marker_fsync_failure_rolls_back():
+    """A visible but unacknowledged commit marker cannot publish the new data."""
+    with tempfile.TemporaryDirectory() as d:
+        fg = FactGraph(Path(d) / "commit-marker-fsync")
+        original_fsync_directory = fg._fsync_directory
+        injected = False
+
+        def fail_after_commit_marker_directory_fsync(directory):
+            nonlocal injected
+            original_fsync_directory(directory)
+            if (
+                directory == fg.dir
+                and fg.pending_add_commit_path.exists()
+                and not injected
+            ):
+                injected = True
+                raise OSError("injected commit-marker fsync failure")
+
+        fg._fsync_directory = fail_after_commit_marker_directory_fsync  # type: ignore[method-assign]
+        try:
+            try:
+                fg.add(
+                    problem_id="P",
+                    author="w",
+                    statement="Not committed until the marker fsync returns",
+                    proof="proof",
+                    glossary_introduces={
+                        "FAILED_COMMIT_X_615": "an uncommitted test object"
+                    },
+                )
+                assert False, "the commit-marker fsync failure must propagate"
+            except OSError as exc:
+                assert "commit-marker fsync failure" in str(exc)
+        finally:
+            fg._fsync_directory = original_fsync_directory  # type: ignore[method-assign]
+
+        assert fg.list() == []
+        assert "FAILED_COMMIT_X_615" not in fg.glossary()
+        assert not fg.pending_add_path.exists()
+        assert not fg.pending_add_commit_path.exists()
+        assert not fg.pending_add_abort_path.exists()
+
+    # If the uncertain marker itself cannot be removed, the durable rollback
+    # intent makes every read fail closed.  A later mutation completes rollback
+    # before preparing any new add.
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d) / "commit-marker-uncertain"
+        fg = FactGraph(root)
+        original_fsync_directory = fg._fsync_directory
+        original_unlink = fg._unlink_durable
+        injected = False
+
+        def fail_commit_marker_fsync_once(directory):
+            nonlocal injected
+            original_fsync_directory(directory)
+            if (
+                directory == fg.dir
+                and fg.pending_add_commit_path.exists()
+                and not fg.pending_add_abort_path.exists()
+                and not injected
+            ):
+                injected = True
+                raise OSError("injected uncertain commit-marker fsync")
+
+        def fail_commit_marker_unlink(path):
+            if path == fg.pending_add_commit_path:
+                raise OSError("injected commit-marker unlink failure")
+            original_unlink(path)
+
+        fg._fsync_directory = fail_commit_marker_fsync_once  # type: ignore[method-assign]
+        fg._unlink_durable = fail_commit_marker_unlink  # type: ignore[method-assign]
+        try:
+            try:
+                fg.add(
+                    problem_id="P",
+                    author="w",
+                    statement="An uncertain commit must remain hidden",
+                    proof="proof",
+                )
+                assert False, "uncertain rollback must surface recovery-required"
+            except RuntimeError as exc:
+                assert "fact_graph_recovery_required" in str(exc)
+        finally:
+            fg._fsync_directory = original_fsync_directory  # type: ignore[method-assign]
+            fg._unlink_durable = original_unlink  # type: ignore[method-assign]
+
+        assert fg.pending_add_abort_path.exists()
+        try:
+            FactGraph(root).list()
+            assert False, "uncertain rollback state must fail closed"
+        except ValueError as exc:
+            assert "fact_graph_recovery_required" in str(exc)
+        survivor = FactGraph(root).add(
+            problem_id="P", author="w", statement="After rollback recovery", proof="proof"
+        )
+        restarted = FactGraph(root)
+        assert restarted.list() == [survivor]
+        assert not restarted.pending_add_path.exists()
+        assert not restarted.pending_add_commit_path.exists()
+        assert not restarted.pending_add_abort_path.exists()
+
+
+def test_fact_add_reports_unknown_when_rollback_intent_cannot_be_durable():
+    """An ambiguous crash outcome is never mislabeled as a definitive rollback."""
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d) / "promotion-unknown"
+        fg = FactGraph(root)
+        original_atomic_write = fg._atomic_write_text
+        original_fsync_directory = fg._fsync_directory
+
+        def inject_ambiguous_markers(path, text):
+            if path == fg.pending_add_commit_path:
+                original_atomic_write(path, text)
+                raise MemoryError("injected error after durable commit marker")
+            if path == fg.pending_add_abort_path:
+                path.write_text(text, encoding="utf-8")
+                raise OSError("injected error before rollback-marker durability")
+            original_atomic_write(path, text)
+
+        def fail_abort_directory_fsync(directory):
+            if directory == fg.dir and fg.pending_add_abort_path.exists():
+                raise OSError("injected rollback-marker fsync failure")
+            original_fsync_directory(directory)
+
+        fg._atomic_write_text = inject_ambiguous_markers  # type: ignore[method-assign]
+        fg._fsync_directory = fail_abort_directory_fsync  # type: ignore[method-assign]
+        try:
+            try:
+                fg.add(
+                    problem_id="P",
+                    author="w",
+                    statement="Durability outcome is intentionally ambiguous",
+                    proof="proof",
+                )
+                assert False, "an ambiguous outcome must not return a fact id"
+            except FactPromotionOutcomeUnknown as exc:
+                assert "fact_graph_promotion_unknown" in str(exc)
+        finally:
+            fg._atomic_write_text = original_atomic_write  # type: ignore[method-assign]
+            fg._fsync_directory = original_fsync_directory  # type: ignore[method-assign]
+
+        assert fg.pending_add_path.exists()
+        assert fg.pending_add_commit_path.exists()
+        assert fg.pending_add_abort_path.exists()
+        try:
+            fg.list()
+            assert False, "a visible rollback marker must fail closed"
+        except ValueError as exc:
+            assert "fact_graph_recovery_required" in str(exc)
+
+        # Simulate power loss discarding only the non-durable abort entry.  The
+        # durable commit marker then preserves the exact fact on restart.  This
+        # is compatible only with the explicit unknown outcome above, never with
+        # a definitive promoted:false response.
+        fg.pending_add_abort_path.unlink()
+        restarted = FactGraph(root)
+        visible = restarted.list()
+        assert len(visible) == 1
+        assert restarted.get_raw(visible[0]) is not None
+
+
+def test_factgraph_all_journal_unlinks_retry_transient_directory_fsync_failure():
+    """Every transaction-marker deletion retries a one-shot root fsync fault."""
+    with tempfile.TemporaryDirectory() as d:
+        fg = FactGraph(Path(d) / "journal-unlink-retry")
+        marker_paths = (
+            fg.pending_add_path,
+            fg.pending_add_commit_path,
+            fg.pending_add_abort_path,
+            fg.pending_revocation_path,
+        )
+        for marker_path in marker_paths:
+            fg._atomic_write_text(marker_path, "{}\n")
+            original_fsync_directory = fg._fsync_directory
+            root_attempts = 0
+
+            def fail_first_root_fsync(directory):
+                nonlocal root_attempts
+                if directory == fg.dir:
+                    root_attempts += 1
+                    if root_attempts == 1:
+                        raise OSError("injected one-shot journal cleanup fsync failure")
+                original_fsync_directory(directory)
+
+            fg._fsync_directory = fail_first_root_fsync  # type: ignore[method-assign]
+            try:
+                fg._unlink_durable(marker_path)
+            finally:
+                fg._fsync_directory = original_fsync_directory  # type: ignore[method-assign]
+
+            assert root_attempts == 2
+            assert not marker_path.exists()
+
+
+def test_factgraph_read_barriers_visible_commit_marker_before_exposure():
+    """A commit rename is never authoritative before its root-dir barrier."""
+
+    class SimulatedCrash(BaseException):
+        pass
+
+    def leave_visible_commit_before_directory_fsync(root, statement):
+        fg = FactGraph(root)
+        original_fsync_directory = fg._fsync_directory
+        crashed = False
+
+        def crash_at_commit_marker_directory_fsync(directory):
+            nonlocal crashed
+            if (
+                directory == fg.dir
+                and fg.pending_add_commit_path.exists()
+                and fg.pending_add_path.exists()
+                and not fg.pending_add_abort_path.exists()
+                and not crashed
+            ):
+                crashed = True
+                raise SimulatedCrash()
+            original_fsync_directory(directory)
+
+        fg._fsync_directory = crash_at_commit_marker_directory_fsync  # type: ignore[method-assign]
+        try:
+            try:
+                fg.add(
+                    problem_id="P",
+                    author="w",
+                    statement=statement,
+                    proof="proof",
+                )
+                assert False, "the simulated process crash must escape"
+            except SimulatedCrash:
+                pass
+        finally:
+            fg._fsync_directory = original_fsync_directory  # type: ignore[method-assign]
+
+        expected_id = compute_fact_id(
+            problem_id="P",
+            predecessors=[],
+            glossary_introduces={},
+            statement=statement,
+            proof="proof",
+        )
+        assert fg.pending_add_path.exists()
+        assert fg.pending_add_commit_path.exists()
+        return expected_id
+
+    # A one-shot failure is retried under the shared lock; only the successful
+    # second barrier permits the exact committed fact to become visible.
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d) / "commit-read-one-shot"
+        expected_id = leave_visible_commit_before_directory_fsync(
+            root, "visible commit requires a read barrier"
+        )
+        reader = FactGraph(root)
+        original_fsync_directory = reader._fsync_directory
+        root_attempts = 0
+
+        def fail_first_read_barrier(directory):
+            nonlocal root_attempts
+            if directory == reader.dir:
+                root_attempts += 1
+                if root_attempts == 1:
+                    raise OSError("injected one-shot read barrier failure")
+            original_fsync_directory(directory)
+
+        reader._fsync_directory = fail_first_read_barrier  # type: ignore[method-assign]
+        try:
+            assert reader.list() == [expected_id]
+        finally:
+            reader._fsync_directory = original_fsync_directory  # type: ignore[method-assign]
+        assert root_attempts == 2
+
+        survivor = reader.add(
+            problem_id="P", author="w", statement="after durable read", proof="proof"
+        )
+        assert reader.list() == sorted([expected_id, survivor])
+
+    # Persistent failure exposes nothing.  If power loss then discards the
+    # unacknowledged commit entry, prepared-only recovery rolls it back without
+    # contradicting any successful read.
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d) / "commit-read-persistent"
+        expected_id = leave_visible_commit_before_directory_fsync(
+            root, "never expose an unacknowledged commit marker"
+        )
+        reader = FactGraph(root)
+        original_fsync_directory = reader._fsync_directory
+
+        def fail_read_barrier_persistently(directory):
+            if directory == reader.dir:
+                raise OSError("injected persistent read barrier failure")
+            original_fsync_directory(directory)
+
+        reader._fsync_directory = fail_read_barrier_persistently  # type: ignore[method-assign]
+        try:
+            try:
+                reader.list()
+                assert False, "an unacknowledged commit must not be exposed"
+            except ValueError as exc:
+                assert "committed add marker durability barrier failed" in str(exc)
+        finally:
+            reader._fsync_directory = original_fsync_directory  # type: ignore[method-assign]
+
+        reader.pending_add_commit_path.unlink()
+        restarted = FactGraph(root)
+        try:
+            restarted.list()
+            assert False, "prepared-only crash state must remain fail closed"
+        except ValueError as exc:
+            assert "fact_graph_recovery_required" in str(exc)
+        survivor = restarted.add(
+            problem_id="P", author="w", statement="after crash rollback", proof="proof"
+        )
+        assert restarted.list() == [survivor]
+        assert restarted.get_raw(expected_id) is None
+
+
+def test_factgraph_root_directory_parent_barrier_retries_before_graph_writes():
+    """Root mkdir durability is retried and persistent failure changes no data."""
+    # A one-shot parent fsync error is absorbed by the bounded retry, so the
+    # first mutation can safely proceed.
+    with tempfile.TemporaryDirectory() as d:
+        fg = FactGraph(Path(d) / "mkdir-parent-one-shot")
+        original_fsync_directory = fg._fsync_directory
+        parent_attempts = 0
+
+        def fail_parent_barrier_once(directory):
+            nonlocal parent_attempts
+            if directory == fg.dir.parent:
+                parent_attempts += 1
+                if parent_attempts == 1:
+                    raise OSError("injected one-shot parent fsync failure")
+            original_fsync_directory(directory)
+
+        fg._fsync_directory = fail_parent_barrier_once  # type: ignore[method-assign]
+        try:
+            fact_id = fg.add(
+                problem_id="P",
+                author="w",
+                statement="safe after one-shot root parent failure",
+                proof="proof",
+            )
+        finally:
+            fg._fsync_directory = original_fsync_directory  # type: ignore[method-assign]
+
+        assert parent_attempts >= 2
+        assert fg.list() == [fact_id]
+
+    # If both bounded attempts fail after mkdir, the visible directory is not
+    # assumed durable.  The next call barriers its parent even though it exists.
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d) / "mkdir-parent-retry"
+        fg = FactGraph(root)
+        original_fsync_directory = fg._fsync_directory
+        failed_parent_attempts = 0
+
+        def fail_initial_factgraph_parent_barrier(directory):
+            nonlocal failed_parent_attempts
+            if directory == fg.dir.parent:
+                failed_parent_attempts += 1
+                if failed_parent_attempts <= 2:
+                    raise OSError("injected persistent first parent fsync failure")
+            original_fsync_directory(directory)
+
+        fg._fsync_directory = fail_initial_factgraph_parent_barrier  # type: ignore[method-assign]
+        try:
+            try:
+                fg.add(
+                    problem_id="P",
+                    author="w",
+                    statement="must wait for durable graph root",
+                    proof="proof",
+                )
+                assert False, "the first undurable root creation must fail"
+            except OSError as exc:
+                assert "persistent first parent fsync failure" in str(exc)
+        finally:
+            fg._fsync_directory = original_fsync_directory  # type: ignore[method-assign]
+
+        assert fg.dir.exists()
+        parent_barriers = 0
+
+        def record_parent_barrier(directory):
+            nonlocal parent_barriers
+            if directory == fg.dir.parent:
+                parent_barriers += 1
+            original_fsync_directory(directory)
+
+        fg._fsync_directory = record_parent_barrier  # type: ignore[method-assign]
+        try:
+            fact_id = fg.add(
+                problem_id="P",
+                author="w",
+                statement="written only after durable graph root",
+                proof="proof",
+            )
+        finally:
+            fg._fsync_directory = original_fsync_directory  # type: ignore[method-assign]
+
+        assert parent_barriers >= 1
+        assert fg.list() == [fact_id]
+
+    # A persistent parent failure occurs before even the lock file or journals
+    # are created.  Removing the empty, unacknowledged directory models power
+    # loss discarding its parent entry; restart then begins from a clean state.
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d) / "mkdir-parent-power-loss"
+        fg = FactGraph(root)
+        original_fsync_directory = fg._fsync_directory
+
+        def fail_parent_barrier_persistently(directory):
+            if directory == fg.dir.parent:
+                raise OSError("injected persistent parent fsync failure")
+            original_fsync_directory(directory)
+
+        fg._fsync_directory = fail_parent_barrier_persistently  # type: ignore[method-assign]
+        try:
+            try:
+                fg.add(
+                    problem_id="P",
+                    author="w",
+                    statement="never written under an undurable graph root",
+                    proof="proof",
+                )
+                assert False, "persistent root parent failure must stop mutation"
+            except OSError as exc:
+                assert "persistent parent fsync failure" in str(exc)
+        finally:
+            fg._fsync_directory = original_fsync_directory  # type: ignore[method-assign]
+
+        assert fg.dir.exists()
+        assert list(fg.dir.iterdir()) == []
+        fg.dir.rmdir()
+        restarted = FactGraph(root)
+        fact_id = restarted.add(
+            problem_id="P",
+            author="w",
+            statement="safe after simulated loss of the unacknowledged root",
+            proof="proof",
+        )
+        assert restarted.list() == [fact_id]
+
+
+def test_fact_add_committed_cleanup_failure_preserves_fact_and_glossary():
+    """Cleanup is not part of the publication decision after durable commit."""
+    for index, injected_error in enumerate((OSError(), MemoryError())):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / f"whole-cleanup-failure-{index}"
+            fg = FactGraph(root)
+            term = f"WHOLE_CLEANUP_X_{index}"
+            original_cleanup = fg._cleanup_committed_add_unlocked
+
+            def fail_whole_cleanup(_error=injected_error):
+                raise _error
+
+            fg._cleanup_committed_add_unlocked = fail_whole_cleanup  # type: ignore[method-assign]
+            try:
+                fact_id = fg.add(
+                    problem_id="P",
+                    author="w",
+                    statement=f"Committed despite cleanup exception {index}",
+                    proof="proof",
+                    glossary_introduces={term: "a durably committed test object"},
+                )
+            finally:
+                fg._cleanup_committed_add_unlocked = original_cleanup  # type: ignore[method-assign]
+
+            assert fg.pending_add_path.exists()
+            assert fg.pending_add_commit_path.exists()
+            restarted = FactGraph(root)
+            assert restarted.list() == [fact_id]
+            assert restarted.glossary()[term] == "a durably committed test object"
+            later = restarted.add(
+                problem_id="P",
+                author="w",
+                statement=f"After whole cleanup exception {index}",
+                proof="proof",
+            )
+            assert restarted.list() == sorted([fact_id, later])
+            assert not restarted.pending_add_path.exists()
+            assert not restarted.pending_add_commit_path.exists()
+
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d) / "committed-cleanup"
+        fg = FactGraph(root)
+        term = "COMMITTED_CLEANUP_X_812"
+        original_unlink = fg._unlink_durable
+        injected = False
+
+        def unlink_commit_then_fail(path):
+            nonlocal injected
+            original_unlink(path)
+            if path == fg.pending_add_commit_path and not injected:
+                injected = True
+                raise OSError("injected committed-marker unlink fsync failure")
+
+        fg._unlink_durable = unlink_commit_then_fail  # type: ignore[method-assign]
+        try:
+            fact_id = fg.add(
+                problem_id="P",
+                author="w",
+                statement="A durably committed definition",
+                proof="proof",
+                glossary_introduces={term: "the committed test object"},
+            )
+        finally:
+            fg._unlink_durable = original_unlink  # type: ignore[method-assign]
+
+        restarted = FactGraph(root)
+        assert restarted.list() == [fact_id]
+        assert restarted.glossary()[term] == "the committed test object"
+        assert not restarted.pending_add_path.exists()
+        assert not restarted.pending_add_commit_path.exists()
+
+    # If cleanup cannot even unlink the committed marker, reads still validate
+    # and expose the exact commit.  A later mutation must finalize that marker
+    # before it is allowed to prepare another transaction.
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d) / "committed-marker-residue"
+        fg = FactGraph(root)
+        original_unlink = fg._unlink_durable
+
+        def leave_committed_marker(path):
+            if path == fg.pending_add_commit_path:
+                raise OSError("injected committed-marker residue")
+            original_unlink(path)
+
+        fg._unlink_durable = leave_committed_marker  # type: ignore[method-assign]
+        try:
+            committed = fg.add(
+                problem_id="P",
+                author="w",
+                statement="Committed with a residual marker",
+                proof="proof",
+            )
+        finally:
+            fg._unlink_durable = original_unlink  # type: ignore[method-assign]
+
+        restarted = FactGraph(root)
+        assert restarted.list() == [committed]
+        assert restarted.pending_add_commit_path.exists()
+        later = restarted.add(
+            problem_id="P", author="w", statement="After finalization", proof="proof"
+        )
+        assert restarted.list() == sorted([committed, later])
+        assert not restarted.pending_add_path.exists()
+        assert not restarted.pending_add_commit_path.exists()
+
+
+def test_committed_marker_unlink_ambiguity_blocks_mutable_metadata_change():
+    """A resurrectable commit marker cannot be invalidated by later ref edits."""
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d) / "committed-unlink-ambiguity"
+        fg = FactGraph(root)
+        original_unlink = fg._unlink_durable
+        original_fsync_directory = fg._fsync_directory
+        committed_marker = b""
+        cleanup_ambiguous = False
+
+        def unlink_commit_without_directory_barrier(path):
+            nonlocal committed_marker, cleanup_ambiguous
+            if path == fg.pending_add_commit_path:
+                committed_marker = path.read_bytes()
+                path.unlink()
+                cleanup_ambiguous = True
+                raise OSError("injected unlink-before-fsync failure")
+            original_unlink(path)
+
+        def fail_root_barrier_after_ambiguous_unlink(directory):
+            if cleanup_ambiguous and directory == fg.dir:
+                raise OSError("injected persistent root directory fsync failure")
+            original_fsync_directory(directory)
+
+        fg._unlink_durable = unlink_commit_without_directory_barrier  # type: ignore[method-assign]
+        fg._fsync_directory = fail_root_barrier_after_ambiguous_unlink  # type: ignore[method-assign]
+        try:
+            fact_id = fg.add(
+                problem_id="P",
+                author="w",
+                statement="Committed before ambiguous marker cleanup",
+                proof="proof",
+            )
+            raw_before = fg.get_raw(fact_id)
+            assert committed_marker and not fg.pending_add_commit_path.exists()
+            try:
+                fg.set_external_refs(
+                    fact_id,
+                    [{"key": "R", "title": "must not be written yet"}],
+                )
+                assert False, "persistent directory ambiguity must block ref mutation"
+            except RuntimeError as exc:
+                assert "mutation directory durability barrier failed" in str(exc)
+            assert fg.get_raw(fact_id) == raw_before
+            assert fg.external_refs(fact_id) == []
+        finally:
+            fg._unlink_durable = original_unlink  # type: ignore[method-assign]
+            fg._fsync_directory = original_fsync_directory  # type: ignore[method-assign]
+
+        # Model the only crash state permitted by the failed directory fsync:
+        # the old commit-marker entry reappears.  Since the ref edit was blocked,
+        # its exact byte hash still matches and normal recovery can finish.
+        fg.pending_add_commit_path.write_bytes(committed_marker)
+        restarted = FactGraph(root)
+        assert restarted.list() == [fact_id]
+        refs = [{"key": "R", "title": "written after durable recovery"}]
+        assert restarted.set_external_refs(fact_id, refs) == refs
+        assert restarted.external_refs(fact_id) == refs
+        assert not restarted.pending_add_commit_path.exists()
+
+
+def test_prepared_marker_unlink_ambiguity_blocks_later_mutation():
+    """A failed rollback cleanup cannot erase its journal then permit writes."""
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d) / "prepared-unlink-ambiguity"
+        fg = FactGraph(root)
+        stable = fg.add(
+            problem_id="P", author="w", statement="stable", proof="proof"
+        )
+        stable_raw = fg.get_raw(stable)
+        stable_path = fg._path(stable)
+        original_atomic_write = fg._atomic_write_text
+        original_unlink = fg._unlink_durable
+        original_fsync_directory = fg._fsync_directory
+        prepared_marker = b""
+        cleanup_ambiguous = False
+
+        def fail_candidate_fact_write(path, text):
+            if path.parent == fg.facts_dir and path != stable_path:
+                raise OSError("injected candidate fact write failure")
+            original_atomic_write(path, text)
+
+        def unlink_prepared_without_directory_barrier(path):
+            nonlocal prepared_marker, cleanup_ambiguous
+            if path == fg.pending_add_path:
+                prepared_marker = path.read_bytes()
+                path.unlink()
+                cleanup_ambiguous = True
+                raise OSError("injected prepared-marker cleanup failure")
+            original_unlink(path)
+
+        def fail_root_barrier_after_ambiguous_unlink(directory):
+            if cleanup_ambiguous and directory == fg.dir:
+                raise OSError("injected persistent root directory fsync failure")
+            original_fsync_directory(directory)
+
+        fg._atomic_write_text = fail_candidate_fact_write  # type: ignore[method-assign]
+        fg._unlink_durable = unlink_prepared_without_directory_barrier  # type: ignore[method-assign]
+        fg._fsync_directory = fail_root_barrier_after_ambiguous_unlink  # type: ignore[method-assign]
+        try:
+            try:
+                fg.add(
+                    problem_id="P",
+                    author="w",
+                    statement="candidate rolled back before commit",
+                    proof="proof",
+                )
+                assert False, "ambiguous rollback cleanup must fail closed"
+            except RuntimeError as exc:
+                assert "fact_graph_recovery_required" in str(exc)
+            assert prepared_marker and not fg.pending_add_path.exists()
+            try:
+                fg.set_external_refs(
+                    stable,
+                    [{"key": "R", "title": "must not cross rollback ambiguity"}],
+                )
+                assert False, "persistent directory ambiguity must block ref mutation"
+            except RuntimeError as exc:
+                assert "mutation directory durability barrier failed" in str(exc)
+            assert fg.get_raw(stable) == stable_raw
+        finally:
+            fg._atomic_write_text = original_atomic_write  # type: ignore[method-assign]
+            fg._unlink_durable = original_unlink  # type: ignore[method-assign]
+            fg._fsync_directory = original_fsync_directory  # type: ignore[method-assign]
+
+        fg.pending_add_path.write_bytes(prepared_marker)
+        restarted = FactGraph(root)
+        refs = [{"key": "R", "title": "written after prepared recovery"}]
+        assert restarted.set_external_refs(stable, refs) == refs
+        assert restarted.list() == [stable]
+        assert restarted.external_refs(stable) == refs
+        assert not restarted.pending_add_path.exists()
+
+
+def test_aborted_add_final_prepared_unlink_ambiguity_blocks_later_mutation():
+    """Abort recovery also requires durable final prepared-marker removal."""
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d) / "aborted-prepared-unlink-ambiguity"
+        fg = FactGraph(root)
+        stable = fg.add(
+            problem_id="P", author="w", statement="stable", proof="proof"
+        )
+        stable_raw = fg.get_raw(stable)
+        original_atomic_write = fg._atomic_write_text
+        original_unlink = fg._unlink_durable
+        original_fsync_directory = fg._fsync_directory
+        prepared_marker = b""
+        cleanup_ambiguous = False
+        commit_write_failed = False
+
+        def commit_marker_then_fail(path, text):
+            nonlocal commit_write_failed
+            if path == fg.pending_add_commit_path and not commit_write_failed:
+                commit_write_failed = True
+                original_atomic_write(path, text)
+                raise OSError("injected error after durable commit-marker write")
+            original_atomic_write(path, text)
+
+        def unlink_final_prepared_without_directory_barrier(path):
+            nonlocal prepared_marker, cleanup_ambiguous
+            if path == fg.pending_add_path and not fg.pending_add_abort_path.exists():
+                prepared_marker = path.read_bytes()
+                path.unlink()
+                cleanup_ambiguous = True
+                raise OSError("injected aborted prepared-marker cleanup failure")
+            original_unlink(path)
+
+        def fail_root_barrier_after_ambiguous_unlink(directory):
+            if cleanup_ambiguous and directory == fg.dir:
+                raise OSError("injected persistent root directory fsync failure")
+            original_fsync_directory(directory)
+
+        fg._atomic_write_text = commit_marker_then_fail  # type: ignore[method-assign]
+        fg._unlink_durable = unlink_final_prepared_without_directory_barrier  # type: ignore[method-assign]
+        fg._fsync_directory = fail_root_barrier_after_ambiguous_unlink  # type: ignore[method-assign]
+        try:
+            try:
+                fg.add(
+                    problem_id="P",
+                    author="w",
+                    statement="candidate with explicit abort recovery",
+                    proof="proof",
+                )
+                assert False, "ambiguous abort cleanup must fail closed"
+            except RuntimeError as exc:
+                assert "fact_graph_recovery_required" in str(exc)
+            assert prepared_marker and not fg.pending_add_path.exists()
+            assert not fg.pending_add_abort_path.exists()
+            try:
+                fg.set_external_refs(
+                    stable,
+                    [{"key": "R", "title": "must not cross abort ambiguity"}],
+                )
+                assert False, "persistent directory ambiguity must block ref mutation"
+            except RuntimeError as exc:
+                assert "mutation directory durability barrier failed" in str(exc)
+            assert fg.get_raw(stable) == stable_raw
+        finally:
+            fg._atomic_write_text = original_atomic_write  # type: ignore[method-assign]
+            fg._unlink_durable = original_unlink  # type: ignore[method-assign]
+            fg._fsync_directory = original_fsync_directory  # type: ignore[method-assign]
+
+        # If only the prepared entry reappears, ordinary prepared recovery
+        # repeats the already-completed rollback before allowing the ref edit.
+        fg.pending_add_path.write_bytes(prepared_marker)
+        restarted = FactGraph(root)
+        refs = [{"key": "R", "title": "written after abort recovery"}]
+        assert restarted.set_external_refs(stable, refs) == refs
+        assert restarted.list() == [stable]
+        assert restarted.external_refs(stable) == refs
+        assert not restarted.pending_add_path.exists()
+
+
+def test_revocation_marker_unlink_ambiguity_blocks_later_mutation():
+    """A completed revoke with an ambiguous journal unlink stays retry-safe."""
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d) / "revocation-unlink-ambiguity"
+        fg = FactGraph(root)
+        stable = fg.add(
+            problem_id="P", author="w", statement="stable", proof="proof"
+        )
+        victim = fg.add(
+            problem_id="P", author="w", statement="victim", proof="proof"
+        )
+        stable_raw = fg.get_raw(stable)
+        original_unlink = fg._unlink_durable
+        original_fsync_directory = fg._fsync_directory
+        revocation_marker = b""
+        cleanup_ambiguous = False
+
+        def unlink_revocation_without_directory_barrier(path):
+            nonlocal revocation_marker, cleanup_ambiguous
+            if path == fg.pending_revocation_path:
+                revocation_marker = path.read_bytes()
+                path.unlink()
+                cleanup_ambiguous = True
+                raise OSError("injected revocation-marker cleanup failure")
+            original_unlink(path)
+
+        def fail_root_barrier_after_ambiguous_unlink(directory):
+            if cleanup_ambiguous and directory == fg.dir:
+                raise OSError("injected persistent root directory fsync failure")
+            original_fsync_directory(directory)
+
+        fg._unlink_durable = unlink_revocation_without_directory_barrier  # type: ignore[method-assign]
+        fg._fsync_directory = fail_root_barrier_after_ambiguous_unlink  # type: ignore[method-assign]
+        try:
+            try:
+                fg.revoke(victim, reason="test ambiguous cleanup")
+                assert False, "ambiguous revocation cleanup must propagate"
+            except OSError as exc:
+                assert "revocation-marker cleanup failure" in str(exc)
+            assert revocation_marker and not fg.pending_revocation_path.exists()
+            try:
+                fg.set_external_refs(
+                    stable,
+                    [{"key": "R", "title": "must not cross revoke ambiguity"}],
+                )
+                assert False, "persistent directory ambiguity must block ref mutation"
+            except RuntimeError as exc:
+                assert "mutation directory durability barrier failed" in str(exc)
+            assert fg.get_raw(stable) == stable_raw
+        finally:
+            fg._unlink_durable = original_unlink  # type: ignore[method-assign]
+            fg._fsync_directory = original_fsync_directory  # type: ignore[method-assign]
+
+        fg.pending_revocation_path.write_bytes(revocation_marker)
+        restarted = FactGraph(root)
+        refs = [{"key": "R", "title": "written after revoke recovery"}]
+        assert restarted.set_external_refs(stable, refs) == refs
+        assert restarted.list() == [stable]
+        assert restarted.external_refs(stable) == refs
+        logged = read_jsonl(restarted.revocation_log)
+        assert [entry["fact_id"] for entry in logged].count(victim) == 1
+        assert not restarted.pending_revocation_path.exists()
+
+
+def test_fact_add_restart_recovers_prepared_and_preserves_committed():
+    """Crash recovery rolls back prepared state but never a committed marker."""
+
+    class SimulatedCrash(BaseException):
+        pass
+
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d) / "prepared-crash"
+        fg = FactGraph(root)
+        term = "PREPARED_CRASH_X_724"
+        original_atomic_write = fg._atomic_write_text
+
+        def crash_before_commit_marker(path, text):
+            if path == fg.pending_add_commit_path:
+                raise SimulatedCrash()
+            original_atomic_write(path, text)
+
+        fg._atomic_write_text = crash_before_commit_marker  # type: ignore[method-assign]
+        try:
+            try:
+                fg.add(
+                    problem_id="P",
+                    author="w",
+                    statement="Prepared but not committed",
+                    proof="proof",
+                    glossary_introduces={term: "a transient test object"},
+                )
+                assert False, "the simulated crash must escape"
+            except SimulatedCrash:
+                pass
+        finally:
+            fg._atomic_write_text = original_atomic_write  # type: ignore[method-assign]
+
+        restarted = FactGraph(root)
+        try:
+            restarted.list()
+            assert False, "prepared crash state must fail closed before recovery"
+        except ValueError as exc:
+            assert "fact_graph_recovery_required" in str(exc)
+        survivor = restarted.add(
+            problem_id="P", author="w", statement="Recovery survivor", proof="proof"
+        )
+        assert restarted.list() == [survivor]
+        assert term not in restarted.glossary()
+        assert not restarted.pending_add_path.exists()
+        assert not restarted.pending_add_commit_path.exists()
+
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d) / "committed-crash"
+        fg = FactGraph(root)
+        term = "COMMITTED_CRASH_X_539"
+        expected_fact_id = compute_fact_id(
+            problem_id="P",
+            predecessors=[],
+            glossary_introduces={term: "a durable test object"},
+            statement="Committed before cleanup",
+            proof="proof",
+        )
+        original_unlink = fg._unlink_durable
+
+        def crash_before_committed_cleanup(path):
+            if path == fg.pending_add_path:
+                raise SimulatedCrash()
+            original_unlink(path)
+
+        fg._unlink_durable = crash_before_committed_cleanup  # type: ignore[method-assign]
+        try:
+            try:
+                fg.add(
+                    problem_id="P",
+                    author="w",
+                    statement="Committed before cleanup",
+                    proof="proof",
+                    glossary_introduces={term: "a durable test object"},
+                )
+                assert False, "the simulated crash must escape"
+            except SimulatedCrash:
+                pass
+        finally:
+            fg._unlink_durable = original_unlink  # type: ignore[method-assign]
+
+        assert fg.pending_add_path.exists()
+        assert fg.pending_add_commit_path.exists()
+        restarted = FactGraph(root)
+        assert restarted.list() == [expected_fact_id]
+        assert restarted.glossary()[term] == "a durable test object"
+        survivor = restarted.add(
+            problem_id="P", author="w", statement="After committed crash", proof="proof"
+        )
+        assert restarted.list() == sorted([expected_fact_id, survivor])
+        assert restarted.glossary()[term] == "a durable test object"
+        assert not restarted.pending_add_path.exists()
+        assert not restarted.pending_add_commit_path.exists()
 
 
 def test_revoke_journal_recovers_second_move_and_log_failures_once():

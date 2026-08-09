@@ -90,7 +90,7 @@ danus/                 the engine (installable Python package)
   gateway/             role-gated MCP server — the only door to the truth stores
   verify/              cold-start mathematical authority behind the write-gate
   execution/           worker swarm: the autonomous per-worker round loop + scaffolding
-  orchestration/       the `danus` CLI verbs (list/new/assign/start/status/stop)
+  orchestration/       lifecycle plus durable human hot-join (`say`/`messages`)
   strategy/            consult gateway (elaboration → strong model → master_guidance)
   integrations/        arXiv theorem search
   observability/       read-only dashboard
@@ -130,6 +130,122 @@ Everything runs on your own keys (BYO). Workers and the verifier run on your cod
 backend; the strategy consult runs on a top-tier reasoning model over the `gpt_pro`
 transport (paid), `claude_api` (the Anthropic API, per-token), or `claude_code`
 (your Claude subscription), or `off` to skip it.
+
+To let the human owner join a running worker's native Codex turn, start that
+worker with the app-server transport and use the durable mailbox:
+
+```bash
+export DANUS_WORKER_TRANSPORT=app-server
+bin/danus start my-project/max
+bin/danus say my-project/max --text 'Try the one-sided Sigma-Delta route next.'
+bin/danus messages my-project/max
+# Only this typed command interrupts; message text never does:
+bin/danus interrupt-turn my-project/max
+```
+
+The app-server process is local stdio only. Every message is written durably
+before routing, uses a stable Codex client-message id, and is either attested to
+the exact active turn, visibly queued, failed, or marked `delivery_unknown` after
+an ambiguous crash. This control transcript is research provenance only: there
+is no direct transcript/ledger channel into verification, and ledger bytes are
+not included in proof-context digests. If a worker deliberately incorporates
+human-supplied mathematics into a candidate statement or proof, that candidate
+text is of course sent through the normal production verifier.
+
+If Codex reports that a persisted thread was deleted or is no longer
+resumable, Danus fails closed instead of silently starting a second paid
+conversation. Inspect the exact id with `bin/danus status <project>/<worker>
+--json`, then explicitly clear only that mapping with `bin/danus reset-thread
+<project>/<worker> --expected-thread-id <id>`. The reset is CAS-fenced,
+append-only audited, and valid only after the worker has fail-stopped: a live
+worker or busy lifecycle lock is rejected, with the liveness check and mapping
+CAS serialized under `start`'s `.pid.lock`. It is also refused while a paid
+round is unfinished or has unknown delivery. Resolving an ambiguous paid round
+remains a separate incident decision; reset never retries or abandons it.
+
+For a different failure mode, a multi-hour terminal thread can make 0.147's
+mandatory full-history `thread/resume` response exceed Danus's 8 MiB JSONL
+ceiling. Danus first checks `thread/read(includeTurns=false)` to attest that the
+thread is inactive, then attempts the configured continuation round. If the
+resume itself is too large, the next attempt fails before `turn/start`; status
+keeps the prior paid timeout under `last_paid_turn` and the resume failure under
+`last_attempt`. No retry or context drop is automatic. After inspecting
+`status --json`, the owner may explicitly accept conversation-context loss while
+retaining FactGraph/global/local memory:
+
+```bash
+bin/danus rotate-thread my-project/max \
+  --expected-thread-id <id-from-status> \
+  --reason 'terminal history exceeds the app-server JSONL limit'
+bin/danus start my-project/max
+```
+
+Rotation is CAS-fenced, append-only audited, and refused while a paid-turn
+intent is unfinished, the worker is live, or its lifecycle lock is busy. The
+PID identity/liveness check and thread-mapping CAS share `start`'s `.pid.lock`,
+including the spawn-to-PID-registration window. Rotation only clears the thread
+mapping; the second command is a separate owner decision that creates the
+replacement conversation.
+If an oversized resume coincides with a `dispatching`, `started`, or
+`delivery_unknown` paid intent, Danus preserves that ambiguous intent and
+publishes no rotation argv. If the remote outcome cannot be reconciled, the
+owner can terminalize only the exact incident while the worker is fail-stopped:
+
+```bash
+# Copy client_id, thread_id, and state from
+#   bin/danus status my-project/max --json
+bin/danus abandon-intent my-project/max \
+  --thread-id <exact-thread-id> \
+  --client-id <exact-danus-round-client-id> \
+  --expected-state delivery_unknown \
+  --reason 'remote history cannot establish the paid outcome' \
+  --acknowledge-paid-outcome-unknown
+```
+
+This risk-acknowledged CAS appends an operator receipt and marks the intent
+`failed/owner_abandoned_outcome_unknown`; it never resends or deletes round,
+message, delivery, or audit history. The abandoned thread remains fenced from
+new paid turns until the owner separately runs `reset-thread` or
+`rotate-thread`. A live worker, busy lifecycle lock, wrong target/thread/client/
+state, missing acknowledgement, or unreadable ledger fails closed unchanged.
+`status --json` exposes the canonical ledger row as
+`unfinished_paid_intent` and a matching `recovery_required.argv`; a separate
+`intent_ledger_error` is reported instead of guessing if that read fails. A
+`prepared` intent is authoritatively not dispatched and therefore recommends
+resuming the same immutable intent with `start`, never unknown-outcome abandon.
+If the immutable prompt/model/effort has drifted, or the owner deliberately
+wants to discard that unspent preparation, status also supplies an exact safe
+cancel command:
+
+```bash
+bin/danus cancel-prepared-intent my-project/max \
+  --thread-id <exact-thread-id> \
+  --client-id <exact-danus-round-client-id> \
+  --reason 'configuration changed before dispatch'
+```
+
+This command is valid only for exact `prepared` state under the same
+fail-stopped lifecycle lock. It needs no paid-outcome acknowledgement because
+no paid RPC was dispatched, appends an operator receipt, and preserves all
+round/message/delivery/audit history. Clearing or rotating the old thread is a
+separate subsequent command.
+
+Every worker paid process is launched through a retained owned-child host. The
+host holds a worker-liveness pipe and the worker's `.paid.lock` until the entire
+Codex/MCP process group is terminal and reaped. Thus an owner `SIGKILL` closes
+the pipe and cleans the paid group, while an immediate replacement worker
+cannot overlap a second paid launch. `stop --force` remains a durable
+cooperative request; the CLI never signals an inspected numeric PID or PGID.
+
+The protected round audit records requested/attested model data, observed token
+usage, and exact-turn `model/rerouted` events. Token totals are explicitly marked
+as observed rather than schema-attested final. If an adapter restart recovers a
+pre-existing paid turn, historical reroute notifications cannot be replayed;
+Danus preserves the turn result but quarantines it and disables automatic retry
+instead of claiming that the requested model was proven.
+Known app-server protocol, configuration, authentication, delivery, and failed
+terminal outcomes are also fail-stop conditions; the outer loop does not turn
+them into repeated paid attempts.
 
 **Notes**
 

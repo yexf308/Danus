@@ -19,7 +19,10 @@ under pytest.
 from __future__ import annotations
 
 import json
+import fcntl
 import os
+import subprocess
+import sys
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
@@ -128,6 +131,60 @@ def test_overview_counts():
         assert ov["verdicts"] == {"correct": 1, "wrong": 1}
         assert ov["consult_count"] == 2
         assert ov["consult_cost_usd"] == 2.0
+
+
+def test_health_echoes_guardian_instance_nonce_and_pid():
+    from fastapi.testclient import TestClient
+
+    with _env(DANUS_SERVICE_INSTANCE_NONCE="0123456789abcdef0123456789abcdef"):
+        response = TestClient(obs_app).get("/health")
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "ok",
+        "pid": os.getpid(),
+        "instance_nonce": "0123456789abcdef0123456789abcdef",
+    }
+
+
+def test_dashboard_authority_is_validated_then_closed_to_ordinary_children(tmp_path):
+    lock_path = tmp_path / "dashboard.lock"
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    env = os.environ.copy()
+    env.update(
+        DANUS_SERVICE_AUTHORITY_FD=str(fd),
+        DANUS_SERVICE_AUTHORITY_PATH=str(lock_path),
+    )
+    code = r'''
+import importlib, os, subprocess, sys
+module = importlib.import_module("danus.observability.app")
+fd = module._DASHBOARD_SERVICE_AUTHORITY_FD
+assert fd is not None and not os.get_inheritable(fd)
+assert "DANUS_SERVICE_AUTHORITY_FD" not in os.environ
+assert "DANUS_SERVICE_AUTHORITY_PATH" not in os.environ
+probe = subprocess.run(
+    [sys.executable, "-c", "import os,sys; fd=int(sys.argv[1]); "
+     "print('env' if 'DANUS_SERVICE_AUTHORITY_FD' in os.environ else 'noenv'); "
+     "\ntry: os.fstat(fd); print('open')\nexcept OSError: print('closed')", str(fd)],
+    text=True, capture_output=True, check=True,
+)
+print(probe.stdout, end="")
+'''
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=Path(__file__).resolve().parents[3],
+            env=env,
+            pass_fds=(fd,),
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=8,
+        )
+    finally:
+        os.close(fd)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.splitlines() == ["noenv", "closed"]
 
 
 def test_factgraph_nodes_edges_depth():

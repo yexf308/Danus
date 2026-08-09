@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, Dict, Optional
+
+
+# This is the wire/output contract implemented by this validator.  The verify
+# service checks its captured CLI JSON schema against this constant at process
+# import, and callers declare the same value before any paid verification may
+# start.  Bump it whenever an incompatible verifier output contract ships.
+VERIFICATION_OUTPUT_PROTOCOL_VERSION = 3
 
 
 def _require_exact_keys(value: Dict[str, Any], expected: set[str], path: str) -> None:
@@ -20,7 +27,67 @@ def _require_exact_keys(value: Dict[str, Any], expected: set[str], path: str) ->
     raise ValueError(f"{path} must have exactly the required keys ({'; '.join(problems)})")
 
 
-def validate_verification_output(payload: Any) -> Dict[str, Any]:
+def _candidate_lines(text: str) -> list[str]:
+    """Return logical lines without changing any non-newline character."""
+    return text.splitlines()
+
+
+def _validate_candidate_evidence(
+    evidence: Any,
+    *,
+    statement: Optional[str],
+    proof: Optional[str],
+    path: str,
+) -> None:
+    """Validate a finding's verbatim candidate-line anchor.
+
+    This deliberately checks provenance, not mathematical truth.  A verifier
+    may still be wrong about what an exact line implies, but it may no longer
+    support a critical error with a normalized, truncated, or invented quote.
+    """
+    if not isinstance(evidence, dict):
+        raise ValueError(f"{path} must be a dict")
+    _require_exact_keys(
+        evidence,
+        {"source", "line", "exact_line"},
+        path,
+    )
+    source = evidence.get("source")
+    if source not in ("statement", "proof"):
+        raise ValueError(f'{path}.source must be "statement" or "proof"')
+    line = evidence.get("line")
+    if isinstance(line, bool) or not isinstance(line, int) or line <= 0:
+        raise ValueError(f"{path}.line must be a positive integer")
+    exact_line = evidence.get("exact_line")
+    if not isinstance(exact_line, str):
+        raise ValueError(f"{path}.exact_line must be a string")
+    if not exact_line.strip():
+        raise ValueError(f"{path}.exact_line must contain non-whitespace candidate text")
+
+    candidate = statement if source == "statement" else proof
+    if candidate is None:
+        raise ValueError(
+            f"{path} cannot be authenticated without the original candidate "
+            f"{source}"
+        )
+    lines = _candidate_lines(candidate)
+    if line > len(lines):
+        raise ValueError(
+            f"{path}.line {line} is outside candidate {source} "
+            f"({len(lines)} logical lines)"
+        )
+    if exact_line != lines[line - 1]:
+        raise ValueError(
+            f"{path}.exact_line is not the verbatim candidate {source} line {line}"
+        )
+
+
+def validate_verification_output(
+    payload: Any,
+    *,
+    statement: Optional[str] = None,
+    proof: Optional[str] = None,
+) -> Dict[str, Any]:
     """Return ``payload`` iff it satisfies the strict verdict contract.
 
     Mathematical judgment remains the verifier's job. This validator prevents a
@@ -42,8 +109,11 @@ def validate_verification_output(payload: Any) -> Dict[str, Any]:
         "payload",
     )
 
-    if payload.get("output_schema_version") != 2:
-        raise ValueError("output_schema_version must be exactly 2")
+    if payload.get("output_schema_version") != VERIFICATION_OUTPUT_PROTOCOL_VERSION:
+        raise ValueError(
+            "output_schema_version must be exactly "
+            f"{VERIFICATION_OUTPUT_PROTOCOL_VERSION}"
+        )
 
     verification_status = payload.get("verification_status")
     if verification_status not in ("final", "needs_context"):
@@ -69,11 +139,18 @@ def validate_verification_output(payload: Any) -> Dict[str, Any]:
         for finding in findings:
             if not isinstance(finding, dict):
                 raise ValueError(f"each {key} entry must be a dict")
-            _require_exact_keys(finding, {"location", "issue"}, f"each {key} entry")
+            expected_keys = {"location", "issue", "candidate_evidence"}
+            _require_exact_keys(finding, expected_keys, f"each {key} entry")
             if not isinstance(finding.get("location"), str) or not finding["location"]:
                 raise ValueError(f"each {key} entry needs a non-empty string location")
             if not isinstance(finding.get("issue"), str) or not finding["issue"]:
                 raise ValueError(f"each {key} entry needs a non-empty string issue")
+            _validate_candidate_evidence(
+                finding.get("candidate_evidence"),
+                statement=statement,
+                proof=proof,
+                path=f"each {key} entry.candidate_evidence",
+            )
 
     verdict = payload.get("verdict")
     if verdict not in ("correct", "wrong"):

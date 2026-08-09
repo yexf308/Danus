@@ -23,17 +23,24 @@ there is no default project.
 | `list` | `danus list [--json]` | all projects + live worker counts + model |
 | `new` | `danus new <project> [--roles high:3,xhigh:4] [--model M]` | scaffold a project + worker dirs; default roster 3 `high` + 4 `xhigh` |
 | `assign` | `danus assign <project>/<worker> (--task "…" \| --file P \| --stdin)` | write that worker's per-round `TASK.md` (**replaces**, not appends) |
+| `say` | `danus say <project>/<worker> (--text "…" \| --file P \| --stdin)` | durably hot-join owner guidance into the exact active app-server turn |
+| `messages` | `danus messages <project>[/<worker>] [--json]` | inspect human-message delivery receipts |
+| `interrupt-turn` | `danus interrupt-turn <project>/<worker>` | explicit owner-only active-turn interrupt |
+| `cancel-prepared-intent` | `danus cancel-prepared-intent <project>/<worker> --thread-id ID --client-id ID --reason TEXT` | exact-CAS cancellation of an authoritatively unspent prepared intent under the worker lifecycle lock; append-only receipt, then reset/rotate separately |
+| `abandon-intent` | `danus abandon-intent <project>/<worker> --thread-id ID --client-id ID --expected-state STATE --reason TEXT --acknowledge-paid-outcome-unknown` | fail-stopped exact-CAS of one unreconcilable paid outcome; append-only risk receipt, no retry/deletion, and old-thread dispatch remains fenced until reset/rotation |
+| `reset-thread` | `danus reset-thread <project>/<worker> --expected-thread-id ID` | CAS-fenced reset of a server-deleted thread mapping; fail closed for a live/busy worker and share `start`'s `.pid.lock` |
+| `rotate-thread` | `danus rotate-thread <project>/<worker> --expected-thread-id ID --reason TEXT` | explicitly accept terminal conversation-context loss after bounded resume failure; fail closed for a live/busy worker, share `start`'s `.pid.lock`, and preserve research stores |
 | `finalize` | `danus finalize <project> [--paper <paper_id>] [<fact_id> …]` | record the approved target theorem(s) in the paper's `TARGET.md` (what write-paper reads; default paper → `<project>/TARGET.md`, a non-default `--paper` → `<project>/papers/<paper_id>/TARGET.md`). **With no id:** print candidate terminal facts as suggestions (writes nothing) |
 | `start` | `danus start <project>[/<worker>]` | launch the autonomous worker loop(s) |
 | `status` | `danus status <project>[/<worker>] [--json]` | per-worker liveness + round + last activity (`stuck?` is a soft signal) |
-| `stop` | `danus stop <project>[/<worker>] [--force]` | graceful (finish the round, exit at the boundary) or `--force` (kill the process group) |
+| `stop` | `danus stop <project>[/<worker>] [--force]` | graceful (finish the round, exit at the boundary) or `--force` (durably request the worker to interrupt its active turn/direct child and exit) |
 
 Notes:
 - `finalize` only **records** the answer; it does not stop workers. Deciding a
   verified fact is *the answer* is your call (the main agent surfaces it).
 - `start` launches each worker detached in its own process group, so it survives
-  your session; `stop --force` can therefore kill a live worker and its in-flight
-  codex child.
+  your session. `stop --force` does not signal an externally inspected numeric
+  PID; the worker owns and stops its in-flight direct child itself.
 
 ---
 
@@ -48,7 +55,7 @@ main agent runs as `role=main`.
 |---|---|---|
 | `gm_add` | `kind, claim, evidence, verifiable?, glossary?, links?, project?` | publish a finding to shared global memory |
 | `gm_search` | `query, kinds?, limit_per_kind?, project?` | search global-memory findings |
-| `fact_submit` | `statement, proof, predecessors?, glossary_introduces?, intuition?, source_id?, external_refs?` | **the write-gate** — after `correct`, recheck the exact context and add under the graph lock; stale context returns `write_error`; audit-trace failures never hide a written fact id |
+| `fact_submit` | `statement, proof, predecessors?, glossary_introduces?, intuition?, source_id?, external_refs?` | **the write-gate** — after `correct`, recheck the exact context and add under the graph lock; `promoted` + non-null `fact_id` mean publication, while a write failure preserves the correct `verification_verdict` but returns `promoted: false` + `write_error`; audit-trace failures never hide a written fact id |
 | `fact_search` | `query, limit?, project?` | full-text BM25 discovery whose result payload contains statement summaries only |
 | `fact_context` | `fact_ids, predecessor_depth?, proof_mode?, max_chars?, project?` | lazy explicit-id context; statements/relations by default, proofs opt-in, with completeness metadata |
 | `fact_revoke` | `fact_id, reason, project?` | cascade-revoke a fact + its dependents |
@@ -64,6 +71,19 @@ main agent runs as `role=main`.
 
 The main agent thus **cannot write a fact** and **cannot** even see `fact_submit`;
 the verifier can write nothing. See `security-and-trust.md`.
+
+`fact_submit.accepted` is retained for compatibility and means only that the
+verifier returned a valid final `correct` verdict. Consumers and monitors must
+count a published fact only when `promoted` is true and `fact_id` is non-null.
+`submission_status` is one of `promoted`, `verified_not_promoted`,
+`promotion_unknown`, `rejected`, or `error`; `verification_verdict` keeps
+`correct`/`wrong` separate from graph-write success. `promotion_unknown` carries
+`promoted: null` when an fsync failure made the crash-recovery outcome ambiguous;
+it is not counted as publication. On `verified_not_promoted`, use `write_error`
+to repair the conflicting
+glossary introduction, refresh stale predecessors/context, or retry the failed
+write. For responses from an older gateway without `promoted`, only a valid
+non-null `fact_id` is a safe publication fallback.
 
 ---
 
@@ -122,8 +142,14 @@ lifecycle.
 ```bash
 bash scripts/services.sh up verify            # required before any proving
 bash scripts/services.sh up dashboard <p>     # optional
-bash scripts/services.sh status | logs <svc> [-f] | down <svc>|all
+bash scripts/services.sh status
+bash scripts/services.sh logs <svc>            # bounded snapshot; -f is refused
+bash scripts/services.sh down <svc>|dashboard|all
 ```
 
-See `operations.md` for the runbook and `configuration.md` for the environment
-variables that tune all of the above.
+Each resident service is owned by a lifecycle-locking guardian and controlled over
+an owner-only, nonce-authenticated Unix socket. PIDs are diagnostics, never CLI
+signal authority. `up`/`down` update the fsynced desired-state manifest before
+launch/stop; recovery rechecks the exact intent generation. See `operations.md`
+for the runbook and `configuration.md` for the environment variables that tune
+all of the above.

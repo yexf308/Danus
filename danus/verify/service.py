@@ -1,10 +1,15 @@
 """Danus verify service — the mathematical authority behind the write-gate.
 
-    POST /verify {statement, proof, glossary_introduces?, fact_context?}
+    POST /verify {expected_output_protocol_version,
+                  expected_verifier_bundle_digest,
+                  statement, proof, glossary_introduces?, fact_context?}
       -> {output_schema_version, verification_status, verification_report,
           verdict, needs_expanded_proofs, repair_hints,
           verification_context_digest?, verification_metrics?}
-    GET  /health                    -> {status: "ok", pid: <int>}
+    GET  /health                    -> {status: "ok", pid: <int>,
+                                       instance_nonce: <guardian nonce>,
+                                       output_protocol_version: 3,
+                                       verifier_bundle_digest: <sha256>}
 
 /verify runs the deterministic pre-checks (``prechecks.run_prechecks``) and, if
 they pass, cold-starts a fresh codex verifier (``launcher.run_codex_verification``)
@@ -24,16 +29,21 @@ from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from danus.core import (
+    VERIFICATION_OUTPUT_PROTOCOL_VERSION,
     VERIFICATION_CONTEXT_PROJECTION,
     VERIFICATION_CONTEXT_SCHEMA_VERSION,
     verification_context_digest,
 )
 from danus.gateway_runtime import GatewayRuntimeUnavailable, require_gateway_runtime
 
-from .launcher import _allocate_run_id, run_codex_verification
+from .launcher import (
+    VERIFIER_BUNDLE_DIGEST,
+    _allocate_run_id,
+    run_codex_verification,
+)
 from .prechecks import run_prechecks
 
 
@@ -67,6 +77,19 @@ VERIFY_MAX_CONCURRENT_REQUESTS = _positive_int_env(
     "DANUS_VERIFY_MAX_CONCURRENT_REQUESTS", 1
 )
 _ADMISSION_SLOTS = threading.BoundedSemaphore(VERIFY_MAX_CONCURRENT_REQUESTS)
+# This lease is intentionally separate from ASGI body admission.  A sync
+# endpoint continues in Starlette's thread pool after a client disconnect or
+# task cancellation; only the paid job itself may release this semaphore.
+_PAID_JOB_SLOTS = threading.BoundedSemaphore(VERIFY_MAX_CONCURRENT_REQUESTS)
+
+_raw_instance_nonce = os.getenv("DANUS_VERIFY_INSTANCE_NONCE")
+if _raw_instance_nonce is None:
+    VERIFY_INSTANCE_NONCE = "standalone"
+elif re.fullmatch(r"[0-9a-f]{32}", _raw_instance_nonce):
+    VERIFY_INSTANCE_NONCE = _raw_instance_nonce
+else:
+    # Fail import/startup rather than exposing an ambiguous health identity.
+    raise RuntimeError("DANUS_VERIFY_INSTANCE_NONCE must be 128-bit lowercase hex")
 
 
 def _preflight_gateway_or_500() -> None:
@@ -393,6 +416,12 @@ def _validate_fact_context(
 
 
 class VerifyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_output_protocol_version: int = Field(..., strict=True)
+    expected_verifier_bundle_digest: str = Field(
+        ..., pattern=r"^[0-9a-f]{64}$"
+    )
     statement: str = Field(..., min_length=1)
     proof: str = Field(..., min_length=1)
     fact_context: Optional[Dict[str, Any]] = None
@@ -456,9 +485,11 @@ async def protect_verification_ingress(request: Request, call_next: Any) -> Any:
         # bounded bytes lets FastAPI/Pydantic parse without touching the socket a
         # second time.
         request._body = request_body
-        return await call_next(request)
     finally:
         _ADMISSION_SLOTS.release()
+    # Body admission ends before endpoint execution.  In particular, ASGI
+    # cancellation cannot release the independent paid-job lease below.
+    return await call_next(request)
 
 
 @app.get("/health")
@@ -468,11 +499,61 @@ async def health() -> Dict[str, Any]:
     # `pid` self-identifies this instance: a health probe alone cannot tell OUR
     # verify from another deployment's verify holding the same port on a shared
     # host — callers match this pid against runtime/run/verify.pid to be sure.
-    return {"status": "ok", "pid": os.getpid()}
+    return {
+        "status": "ok",
+        "pid": os.getpid(),
+        "instance_nonce": VERIFY_INSTANCE_NONCE,
+        "output_protocol_version": VERIFICATION_OUTPUT_PROTOCOL_VERSION,
+        "verifier_bundle_digest": VERIFIER_BUNDLE_DIGEST,
+    }
+
+
+def _run_paid_verification(
+    request: VerifyRequest, *, fact_context: Optional[Dict[str, Any]]
+) -> Dict[str, Any]:
+    """Own the paid lease in the sync worker until Codex is truly terminal."""
+    if not _PAID_JOB_SLOTS.acquire(blocking=False):
+        # This happens before result-directory allocation and before Codex.
+        raise HTTPException(status_code=429, detail="verification service is busy")
+    try:
+        _preflight_gateway_or_500()
+        run_id = _allocate_run_id(request.statement)
+        kwargs: Dict[str, Any] = {
+            "run_id": run_id,
+            "statement": request.statement,
+            "proof": request.proof,
+        }
+        if fact_context is not None:
+            kwargs["fact_context"] = fact_context
+        if request.glossary_introduces:
+            kwargs["glossary_introduces"] = request.glossary_introduces
+        return run_codex_verification(**kwargs)
+    finally:
+        _PAID_JOB_SLOTS.release()
 
 
 @app.post("/verify")
 def verify(request: VerifyRequest) -> Dict[str, Any]:
+    # This is the first endpoint action: a stale caller is rejected before
+    # prechecks, result-directory allocation, gateway preflight, or Codex.  The
+    # digest echoed from /health also closes a service-restart race between the
+    # gateway's health probe and this POST.
+    if (
+        request.expected_output_protocol_version
+        != VERIFICATION_OUTPUT_PROTOCOL_VERSION
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "verifier output protocol mismatch: service requires "
+                f"{VERIFICATION_OUTPUT_PROTOCOL_VERSION}"
+            ),
+        )
+    if request.expected_verifier_bundle_digest != VERIFIER_BUNDLE_DIGEST:
+        raise HTTPException(
+            status_code=409,
+            detail="verifier bundle changed after caller health preflight",
+        )
     rejected = run_prechecks(request.statement, request.proof)
     if rejected is not None:
         status_code, detail = rejected
@@ -488,20 +569,7 @@ def verify(request: VerifyRequest) -> Dict[str, Any]:
                     "internal fact_id"
                 ),
             )
-        _preflight_gateway_or_500()
-        run_id = _allocate_run_id(request.statement)
-        # Keep old monkeypatches/callers that implement the original three-arg
-        # launcher seam working for self-contained requests.
-        if not request.glossary_introduces:
-            return run_codex_verification(
-                run_id=run_id, statement=request.statement, proof=request.proof
-            )
-        return run_codex_verification(
-            run_id=run_id,
-            statement=request.statement,
-            proof=request.proof,
-            glossary_introduces=request.glossary_introduces,
-        )
+        return _run_paid_verification(request, fact_context=None)
     try:
         _validate_fact_context(
             request.fact_context,
@@ -531,15 +599,7 @@ def verify(request: VerifyRequest) -> Dict[str, Any]:
             + "; ".join(details)
             + ")",
         )
-    _preflight_gateway_or_500()
-    run_id = _allocate_run_id(request.statement)
-    result = run_codex_verification(
-        run_id=run_id,
-        statement=request.statement,
-        proof=request.proof,
-        fact_context=request.fact_context,
-        glossary_introduces=request.glossary_introduces,
-    )
+    result = _run_paid_verification(request, fact_context=request.fact_context)
     # Server-side attestation: the gateway requires this exact digest. An older
     # service that silently ignores the new request field cannot accidentally
     # authorize a context-free write during a rolling upgrade.
