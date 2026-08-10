@@ -25,16 +25,21 @@ danus/strategy/
   current durable elaboration (the CLI returns a valid `$0` envelope with a
   non-zero exit as an expected signal).
 - **`gpt_pro`** (explicit opt-in) — a paid OpenAI-compatible Responses endpoint
-  (`DANUS_CONSULT_API_KEY`/`_BASE_URL`/`_MODEL`). Driven `background=True,
-  stream=True, store=False` with the canonical message-list `input` shape (a sync
-  xhigh call would hang the proxy, and consult prompts must not be server-stored).
-  Gateways that explicitly reject `background` or `max_output_tokens` are retried
-  without that parameter while preserving effort/tools. Other 400s use the
-  graceful lower-effort step-down (`full → no-tools → no-effort → bare`);
-  `max` instead preserves its effort (`full → no-tools → no-summary →
-  effort-only`). Cost is computed per-call. Streamed output-text deltas are
-  retained as the reply when a compatible gateway returns a sparse final
-  `response.completed` object.
+  (`DANUS_CONSULT_API_KEY`/`_BASE_URL`/`_MODEL`). Driven `stream=True` with the
+  canonical message-list `input` shape (a sync xhigh call would hang the proxy).
+  `background` / `store` are config knobs (`DANUS_CONSULT_BACKGROUND`, default on;
+  `DANUS_CONSULT_STORE`, default off — consult prompts are not server-stored). A
+  stricter gateway that rejects one of them 400s, and the endpoint's own error
+  surfaces naming the parameter; the caller then re-runs with `--background off` /
+  `--store on` / `--max-output-tokens 0` (per-call flags that override the env, like
+  `--model`; `0` omits the token cap entirely), and pins it in config only if the
+  deployment always needs it. The transport does not parse the
+  message to retry — the caller is an agent that can read the error, and guessing
+  would silently re-negotiate on every call. 400s on effort/tools use the graceful
+  step-down (`full → no-tools → no-effort → bare`); `max` instead preserves its
+  effort (`full → no-tools → no-summary → effort-only`). Cost is computed per-call.
+  Streamed output-text deltas are retained as the reply when a compatible gateway
+  returns a sparse final `response.completed` object.
 - **`claude_api`** — the native Anthropic API (per-token, BYO key; the envelope cost
   is the response's REAL usage × the per-1M rates). Streamed; adaptive thinking +
   `output_config.effort`; server-side web search; refusal-fallback param attached
@@ -96,7 +101,10 @@ documented compatibility step-down, exposed through the envelope's `attempt` fie
 ## The envelope (pinned §6 contract with the consult skill)
 
 One JSON line: `{transport, model, effort, attempt, status, seconds, usage, cost_usd,
-tool_calls, reasoning_summary, reply}` (+ `project_total_usd` when `--project` given).
+billing_basis, tool_calls, reasoning_summary, reply}` (+ `project_total_usd` when
+`--project` is given). If a transport raises, the CLI returns this same structured
+envelope with `status="failed"`, an `error`, and an empty reply instead of exposing
+a traceback. Failed and other non-completed paid calls exit `1`.
 Callers depend on `reply`, `cost_usd`, `transport`, `usage`. API/CLI replies use
 the existing master-guidance contract. A browser import is different: it has
 `trust=untrusted_strategy`, no authorities, and is not eligible for

@@ -52,6 +52,20 @@ def _first(*names: str, default: str | None = None) -> str | None:
     return default
 
 
+def _bool(*names: str, default: bool) -> bool:
+    """A boolean env knob: ``1/true/yes/on`` / ``0/false/no/off`` (case-free);
+    anything unrecognized keeps the default."""
+    raw = _first(*names)
+    if raw is None:
+        return default
+    v = raw.strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    if v in ("0", "false", "no", "off"):
+        return False
+    return default
+
+
 @dataclass(frozen=True)
 class ConsultConfig:
     """A snapshot of the consult endpoint config, resolved from the env."""
@@ -62,6 +76,13 @@ class ConsultConfig:
     price_in: float
     price_out: float
     timeout: float
+    # Transport-level Responses parameters. Defaults suit OpenAI; a stricter
+    # compatible gateway may reject one of them, and the consult then fails with
+    # that endpoint's error naming it. The caller changes it on the next call
+    # (``--background off`` / ``--store on``); these env values are the persistent
+    # default for a deployment that always needs the override.
+    background: bool = True
+    store: bool = False
 
     @property
     def has_key(self) -> bool:
@@ -89,6 +110,8 @@ def load_config() -> ConsultConfig:
         price_in=_float("DANUS_CONSULT_PRICE_IN", default=DEFAULT_PRICE_IN),
         price_out=_float("DANUS_CONSULT_PRICE_OUT", default=DEFAULT_PRICE_OUT),
         timeout=_float("DANUS_CONSULT_TIMEOUT", default=7200.0),
+        background=_bool("DANUS_CONSULT_BACKGROUND", default=True),
+        store=_bool("DANUS_CONSULT_STORE", default=False),
     )
 
 

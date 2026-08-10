@@ -76,6 +76,20 @@ new.
      are owned by `danus/strategy` — read them there; do not re-derive them here.
    - It is a **stateless gateway**: prompt in, reply out. It does **not** write the
      stores — you do, in the next step.
+   - **If the consult could not run**, the envelope comes back `status="failed"`
+     with an `error` and an empty `reply` (exit non-zero) — e.g. the endpoint
+     rejected the requested effort. There is nothing to record: do **not** publish
+     an empty `master_guidance` and do **not** invent direction. Report the `error`
+     to the operator, then either retry at a level the endpoint accepts or reason
+     on your own for this cycle — and say which you did. **If the `error` names a
+     parameter the endpoint refuses, re-run the call with that parameter changed** —
+     the error tells you which: `background` → add `--background off`; `store` →
+     `--store on`; `max_output_tokens` → `--max-output-tokens 0` (omits it entirely,
+     for an endpoint that rejects the parameter rather than the value); the
+     reasoning effort → a level it accepts. Nothing to edit, just
+     the next invocation. If the same override keeps being needed on this
+     deployment, tell the operator to pin it in `config/danus.env`
+     (`DANUS_CONSULT_BACKGROUND` / `DANUS_CONSULT_STORE`) so you stop passing it.
 
 3. **Record a normal API/CLI reply as `master_guidance`, VERBATIM.** Take the
    reply as the direction and publish it unedited. This instruction applies to

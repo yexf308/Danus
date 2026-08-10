@@ -432,6 +432,18 @@ def test_tools_for_modes():
     assert claude_api_tools_for("web") == claude_api_tools_for("auto")
 
 
+def test_zero_max_output_tokens_is_no_cap_not_one_token():
+    """`--max-output-tokens 0` is the gpt_pro lever for an endpoint that rejects the
+    parameter. Anthropic requires max_tokens, so 0 must mean the ceiling — clamping
+    it to 1 would silently return a one-token reply."""
+    _install_fake_anthropic()
+    client = _StubClient([_final()])
+    t = ClaudeApiTransport(_config(), client_factory=lambda: client)
+    env = _consult(t, max_output_tokens=0)
+    assert env["status"] == "completed"
+    assert client.calls[0]["kwargs"]["max_tokens"] == 128000
+
+
 def _main():  # standalone runner, mirroring the sibling suites
     fns = [v for k, v in sorted(globals().items())
            if k.startswith("test_") and callable(v)]

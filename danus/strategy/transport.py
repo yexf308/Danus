@@ -3,8 +3,9 @@
 A ``Transport`` takes a prompt and returns a uniform JSON envelope (see
 ``shape_envelope``). The configured default is ``off``. When explicitly
 selected, ``GptProTransport`` drives an OpenAI-compatible **Responses** API in
-streaming mode (preferring
-``background=True`` when supported) and steps its params down only on a 400.
+streaming mode. ``background`` / ``store`` are config knobs; a stricter gateway
+that rejects one is handled by changing it on the next call, not by guessing from
+the error text. Only reasoning and tool parameters step down on a 400.
 ``OffTransport`` short-circuits to a disabled result.
 
 This module is a STATELESS gateway: prompt in, envelope out. It never touches the
@@ -157,17 +158,20 @@ class GptProTransport(Transport):
             timeout=self.config.timeout,
         )
 
-    @staticmethod
-    def _run_stream(client, create_kwargs, on_progress=None):
-        """Drive ONE background+stream Responses call to its end. Returns
+    def _run_stream(self, client, create_kwargs, on_progress=None):
+        """Drive ONE streaming Responses call to its end. Returns
         (final_response_or_None, n_events, status, seconds, streamed_text).
-        Streamed events keep
-        the connection alive so a long initial reasoning gap never hangs. A
-        compatible gateway may reject ``background`` or ``max_output_tokens``;
-        retry without only the named parameter while preserving every
-        reasoning/tool parameter in those specific cases."""
-        from openai import BadRequestError
+        Streamed events keep the connection alive so a long initial reasoning gap
+        never hangs.
 
+        ``background`` / ``store`` are call parameters (``--background off`` /
+        ``--store on``, defaulting to ``DANUS_CONSULT_BACKGROUND`` /
+        ``DANUS_CONSULT_STORE``), so a gateway that rejects one of them is fixed on
+        the next call — its own 400 text says which. We do NOT parse the error and
+        retry: the caller is an agent that can read it, and guessing from the
+        message silently re-negotiates on every single call. Note the effort/tools
+        ladder above will re-send a refused transport parameter once per attempt
+        (each a $0 validation reject) before the error surfaces."""
         t0 = time.time()
         n = 0
         status: Optional[str] = None
@@ -175,29 +179,12 @@ class GptProTransport(Transport):
         text_chunks: List[str] = []
         last_hb = t0
         request_kwargs = {
-            "background": True,
+            "background": self.config.background,
             "stream": True,
-            "store": False,
+            "store": self.config.store,
             **create_kwargs,
         }
-        while True:
-            try:
-                stream = client.responses.create(**request_kwargs)
-                break
-            except BadRequestError as exc:
-                message = str(exc).lower()
-                background_rejected = "background" in message and (
-                    "unsupported" in message
-                    or ("store" in message and "true" in message)
-                )
-                if background_rejected and "background" in request_kwargs:
-                    request_kwargs.pop("background")
-                    continue
-                if "unsupported" in message and "max_output_tokens" in message \
-                        and "max_output_tokens" in request_kwargs:
-                    request_kwargs.pop("max_output_tokens")
-                    continue
-                raise
+        stream = client.responses.create(**request_kwargs)
         for ev in stream:
             n += 1
             et = getattr(ev, "type", "?")
@@ -222,9 +209,9 @@ class GptProTransport(Transport):
         return final, n, status, time.time() - t0, "".join(text_chunks)
 
     def consult(self, prompt, *, effort, tools, max_output_tokens, on_progress=None):
-        """Streaming consult; prefer background and step params down ONLY on a
-        400 (param rejected), never on a timeout/connection error (those must
-        surface)."""
+        """Streaming consult; step reasoning/tool params down ONLY on a 400,
+        while keeping transport params fixed for this call. Timeout and connection
+        errors surface to the CLI's structured failure envelope."""
         from openai import BadRequestError
 
         client = self._client_factory()
@@ -255,11 +242,13 @@ class GptProTransport(Transport):
         last: Optional[Exception] = None
         for name, extra in attempts:
             try:
+                create_kwargs = dict(model=self.config.model, input=input_items, **extra)
+                # 0 = do NOT send max_output_tokens at all — the lever for a gateway
+                # that rejects the parameter itself (no value would satisfy it).
+                if max_output_tokens:
+                    create_kwargs["max_output_tokens"] = max_output_tokens
                 final, n, status, dt, streamed_text = self._run_stream(
-                    client,
-                    dict(model=self.config.model, input=input_items,
-                         max_output_tokens=max_output_tokens, **extra),
-                    on_progress=on_progress,
+                    client, create_kwargs, on_progress=on_progress,
                 )
                 return shape_envelope(
                     final,
@@ -638,7 +627,11 @@ class ClaudeApiTransport(Transport):
             ("no-thinking", dict(output_config={"effort": eff}, tools=tool_list)),
             ("bare", dict()),
         ]
-        max_tokens = max(1, min(int(max_output_tokens), 128000))
+        # 0 means "no explicit cap" (the gpt_pro lever for an endpoint that
+        # rejects the parameter); Anthropic requires max_tokens, so use the
+        # ceiling rather than clamping to 1 and returning a one-token reply.
+        mo = int(max_output_tokens) or 128000
+        max_tokens = max(1, min(mo, 128000))
         last: Optional[Exception] = None
         for name, extra in attempts:
             if not extra.get("tools"):

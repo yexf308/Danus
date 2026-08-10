@@ -16,6 +16,7 @@ import sys
 import tempfile
 import types
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -191,52 +192,44 @@ def test_api_transport_forwards_max_effort():
     assert env["effort"] == "max"
 
 
-def test_unsupported_gateway_params_retry_without_dropping_max():
-    calls = []
-    resp = _Response(output_text="hi", usage={"input_tokens": 10, "output_tokens": 20})
+def test_transport_params_come_from_config_not_error_guessing():
+    """``background`` / ``store`` are config knobs. A gateway that rejects one is
+    fixed by flipping that knob — the transport never parses the 400 to guess."""
+    seen = []
+    resp = _Response(output_text="hi", usage={"input_tokens": 1, "output_tokens": 2})
 
     def create(**kw):
-        calls.append(kw)
-        assert kw["reasoning"]["effort"] == "max"
-        assert kw["store"] is False and kw["stream"] is True
-        if kw.get("background") is True:
-            raise _FakeBadRequest("Unsupported parameter: background")
-        if "max_output_tokens" in kw:
-            raise _FakeBadRequest("Unsupported parameter: max_output_tokens")
+        seen.append(kw)
         return iter([_Event("response.completed", response=resp)])
 
     factory = _install_fake_openai(create)
-    env = GptProTransport(_CFG, client_factory=factory).consult(
-        "prompt", effort="max", tools="none", max_output_tokens=100)
-    assert len(calls) == 3
-    assert "background" not in calls[1]
-    assert "background" not in calls[2]
-    assert "max_output_tokens" not in calls[2]
-    assert env["status"] == "completed"
-    assert env["attempt"] == "full"
-    assert env["effort"] == "max"
+    strict = replace(_CFG, background=False, store=True)
+    env = GptProTransport(strict, client_factory=factory).consult(
+        "p", effort="max", tools="none", max_output_tokens=100)
+    assert env["status"] == "completed" and env["effort"] == "max"
+    assert seen[0]["background"] is False and seen[0]["store"] is True
+    assert seen[0]["stream"] is True
 
 
-def test_background_store_requirement_retries_without_dropping_max():
-    calls = []
-    resp = _Response(output_text="hi", usage={"input_tokens": 10, "output_tokens": 20})
+def test_rejected_transport_param_surfaces_the_endpoint_error():
+    """A rejected transport parameter is NOT retried away: the endpoint's own 400
+    reaches the caller (which is an agent that can read it and re-run with the
+    right knob), after the effort/tools step-down has been tried."""
+    seen = []
 
     def create(**kw):
-        calls.append(kw)
-        assert kw["reasoning"]["effort"] == "max"
-        assert kw["store"] is False and kw["stream"] is True
-        if kw.get("background") is True:
-            raise _FakeBadRequest("Background mode requires store=true")
-        return iter([_Event("response.completed", response=resp)])
+        seen.append(kw)
+        raise _FakeBadRequest("parameter 'background' cannot be used with this endpoint")
 
     factory = _install_fake_openai(create)
-    env = GptProTransport(_CFG, client_factory=factory).consult(
-        "prompt", effort="max", tools="none", max_output_tokens=100)
-    assert len(calls) == 2
-    assert "background" not in calls[1]
-    assert env["status"] == "completed"
-    assert env["attempt"] == "full"
-    assert env["effort"] == "max"
+    try:
+        GptProTransport(_CFG, client_factory=factory).consult(
+            "p", effort="max", tools="none", max_output_tokens=100)
+        assert False, "a rejected transport param must surface, not be guessed away"
+    except _FakeBadRequest as e:
+        assert "background" in str(e)
+    # every attempt kept background=True (from config) — no message-driven mutation
+    assert seen and all(kw["background"] is True for kw in seen)
 
 
 def test_max_effort_is_never_silently_removed_on_400():
@@ -808,6 +801,144 @@ def test_claude_default_runner_runs_local_subprocess():
     proc = ClaudeCodeTransport._default_runner(
         [echo, "hi there"], input=None, cwd=None, env=None, timeout=10)
     assert proc.returncode == 0 and "hi there" in proc.stdout
+
+
+# ---- gateway phrasing + CLI failure envelope --------------------------------
+
+
+def test_cli_emits_failure_envelope_instead_of_traceback():
+    """When every attempt is rejected (a `max` request has no effort-dropping
+    fallback), the CLI must still print ONE envelope and exit non-zero — never a
+    traceback, so the main agent always has a parseable result."""
+    def create(**kw):
+        raise _FakeBadRequest("Unsupported value: reasoning.effort 'max'")
+
+    factory = _install_fake_openai(create)
+    orig = cli.GptProTransport
+    cli.GptProTransport = lambda cfg: orig(cfg, client_factory=factory)
+    try:
+        with _env(DANUS_CONSULT_API_KEY="k", DANUS_CONSULT_TRANSPORT="gpt_pro"):
+            code, env = _run_cli_gpt(["--effort", "max", "--quiet"])
+    finally:
+        cli.GptProTransport = orig
+    assert code == 1
+    assert env["status"] == "failed" and env["attempt"] == "failed"
+    assert env["reply"] == "" and env["cost_usd"] == 0.0
+    assert env["billing_basis"] == "metered_api"
+    assert "reasoning.effort" in env["error"]
+
+
+def test_failure_envelope_preserves_transport_billing_basis():
+    err = RuntimeError("transport failed")
+    assert cli._failure_envelope("gpt_pro", "m", "high", err)[
+        "billing_basis"
+    ] == "metered_api"
+    assert cli._failure_envelope("claude_api", "m", "high", err)[
+        "billing_basis"
+    ] == "metered_api"
+    assert cli._failure_envelope("claude_code", "m", "high", err)[
+        "billing_basis"
+    ] == "subscription_estimate"
+
+
+def _run_cli_gpt(argv):
+    """Run cli.main over a temp prompt file; return (exit_code, last stdout JSON)."""
+    import io
+    from contextlib import redirect_stdout
+    with tempfile.TemporaryDirectory() as td:
+        f = Path(td) / "p.md"
+        f.write_text("the elaboration", encoding="utf-8")
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = cli.main(["--file", str(f), *argv])
+        lines = [l for l in buf.getvalue().splitlines() if l.strip()]
+        return code, (json.loads(lines[-1]) if lines else None)
+
+
+def test_cli_flags_override_transport_params_per_call():
+    """The caller recovers from a refused transport param on the NEXT call, with a
+    flag — no config edit. `--background off` / `--store on` override the env."""
+    seen = []
+    resp = _Response(output_text="ok", usage={"input_tokens": 1, "output_tokens": 1})
+
+    def create(**kw):
+        seen.append(kw)
+        if kw.get("background") is True:  # the strict gateway
+            raise _FakeBadRequest("parameter 'background' cannot be used with this endpoint")
+        return iter([_Event("response.completed", response=resp)])
+
+    factory = _install_fake_openai(create)
+    orig = cli.GptProTransport
+    cli.GptProTransport = lambda cfg: orig(cfg, client_factory=factory)
+    try:
+        with _env(DANUS_CONSULT_API_KEY="k", DANUS_CONSULT_TRANSPORT="gpt_pro",
+                  DANUS_CONSULT_BACKGROUND=None, DANUS_CONSULT_STORE=None):
+            # 1st call: default background=on -> the endpoint's error comes back
+            code, env = _run_cli_gpt(["--effort", "max", "--quiet"])
+            assert code == 1 and env["status"] == "failed"
+            assert "background" in env["error"]
+            # 2nd call: the caller reads the error and flips that one flag
+            code, env = _run_cli_gpt(["--effort", "max", "--quiet", "--background", "off"])
+            assert code == 0 and env["status"] == "completed" and env["reply"] == "ok"
+            assert seen[-1]["background"] is False
+            # --store on is honored the same way
+            code, env = _run_cli_gpt(["--quiet", "--background", "off", "--store", "on"])
+            assert code == 0 and seen[-1]["store"] is True
+    finally:
+        cli.GptProTransport = orig
+
+
+def test_max_output_tokens_zero_omits_the_parameter():
+    """A gateway can reject the max_output_tokens PARAMETER (no value satisfies it).
+    `--max-output-tokens 0` is the lever: the parameter is not sent at all."""
+    seen = []
+    resp = _Response(output_text="ok", usage={"input_tokens": 1, "output_tokens": 1})
+
+    def create(**kw):
+        seen.append(kw)
+        if "max_output_tokens" in kw:  # the strict gateway
+            raise _FakeBadRequest("max_output_tokens is not supported; use max_tokens")
+        return iter([_Event("response.completed", response=resp)])
+
+    factory = _install_fake_openai(create)
+    orig = cli.GptProTransport
+    cli.GptProTransport = lambda cfg: orig(cfg, client_factory=factory)
+    try:
+        with _env(DANUS_CONSULT_API_KEY="k", DANUS_CONSULT_TRANSPORT="gpt_pro",
+                  DANUS_CONSULT_BACKGROUND=None, DANUS_CONSULT_STORE=None):
+            code, env = _run_cli_gpt(["--quiet"])            # default cap -> refused
+            assert code == 1 and "max_output_tokens" in env["error"]
+            code, env = _run_cli_gpt(["--quiet", "--max-output-tokens", "0"])
+            assert code == 0 and env["status"] == "completed"
+            assert "max_output_tokens" not in seen[-1]
+    finally:
+        cli.GptProTransport = orig
+
+
+def test_failed_consult_out_file_shows_the_error():
+    """`--out` is what an operator reads; on failure it must carry the error, not
+    an empty reply section."""
+    def create(**kw):
+        raise _FakeBadRequest("Unsupported value: reasoning.effort 'max'")
+
+    factory = _install_fake_openai(create)
+    orig = cli.GptProTransport
+    cli.GptProTransport = lambda cfg: orig(cfg, client_factory=factory)
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            pf = Path(td) / "p.md"; pf.write_text("elab", encoding="utf-8")
+            out = Path(td) / "reply.md"
+            with _env(DANUS_CONSULT_API_KEY="k", DANUS_CONSULT_TRANSPORT="gpt_pro"):
+                import io
+                from contextlib import redirect_stdout
+                with redirect_stdout(io.StringIO()):
+                    code = cli.main(["--file", str(pf), "--effort", "max", "--quiet",
+                                     "--out", str(out)])
+            assert code == 1
+            body = out.read_text(encoding="utf-8")
+            assert "FAILED" in body and "reasoning.effort" in body
+    finally:
+        cli.GptProTransport = orig
 
 
 def main() -> None:
