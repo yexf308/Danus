@@ -1,9 +1,12 @@
 """danus.strategy — the stateless strategic-consult gateway.
 
-Feeds an elaboration to a strong model (default gpt-5.5-pro) over an
-OpenAI-compatible Responses API and returns a uniform JSON envelope
+Optionally feeds an elaboration to an explicitly selected strong-model
+transport and returns a uniform JSON envelope
 (``reply`` + ``cost_usd`` + ``usage`` + ``transport``). It touches no truth
 stores — the only file it writes is the per-project spend ledger.
+
+The safe default transport is ``off``. Paid API/CLI transports are explicit
+opt-ins; the Chrome-only ChatGPT Pro handoff remains separately owner-gated.
 
 Run as ``python -m danus.strategy`` (bin/consult wraps it).
 """

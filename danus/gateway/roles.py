@@ -24,6 +24,7 @@ from typing import Dict, List, Tuple
 # server.py). Kept here so the role table and the implementation can't drift.
 ALL_TOOLS: Tuple[str, ...] = (
     "gm_add",
+    "gm_get",
     "gm_search",
     "fact_submit",
     "fact_search",
@@ -34,11 +35,11 @@ ALL_TOOLS: Tuple[str, ...] = (
 
 ROLE_TOOLS: Dict[str, Tuple[str, ...]] = {
     "worker": (
-        "gm_add", "gm_search", "fact_submit", "fact_search", "fact_context",
+        "gm_add", "gm_get", "gm_search", "fact_submit", "fact_search", "fact_context",
         "search_arxiv_theorems",
     ),
     "main": (
-        "gm_add", "gm_search", "fact_search", "fact_context", "fact_revoke",
+        "gm_add", "gm_get", "gm_search", "fact_search", "fact_context", "fact_revoke",
         "search_arxiv_theorems",
     ),
     "verifier": ("search_arxiv_theorems",),

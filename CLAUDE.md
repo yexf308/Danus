@@ -50,7 +50,7 @@ decision to its home immediately:
 | operator profile & standing prefs | `OPERATOR.md` (auto-loaded via `@OPERATOR.md`) |
 | a project's problem / goal (verbatim) | `runtime/projects/<p>/PROBLEM.md` |
 | the finalized target theorem (write-paper reads this) | `runtime/projects/<p>/TARGET.md` — the default paper; a non-default paper → `papers/<paper_id>/TARGET.md` (via `danus finalize [--paper <id>]`) |
-| evolving strategy | global memory `master_guidance` / `elaboration` (`gm_add`) |
+| evolving strategy | global memory `master_guidance` / `elaboration` / bounded late `advisor_checkpoint` (`gm_add`) |
 | secrets (tokens, API keys) | `config/*.env` (gitignored) — never anywhere else |
 
 ## Orchestrate
@@ -59,25 +59,56 @@ A project is the unit of work: its own problem, workers, `global_memory/`, and
 `fact_graph/`, isolated under `runtime/projects/<p>/`. Run several at once; every
 memory or fact op names a project (there is no default).
 
-**Control surface** — danus MCP (role=main): `gm_add` · `gm_search` · `fact_search`
-· `fact_context` · `fact_revoke` · `search_arxiv_theorems` (first five take `project=`; you have no
+**Control surface** — danus MCP (role=main): `gm_add` · `gm_get` · `gm_search` · `fact_search`
+· `fact_context` · `fact_revoke` · `search_arxiv_theorems` (first six take `project=`; you have no
 `fact_submit`, so you never write facts). `danus` CLI: `list`/`new`/`assign`/
 `finalize`/`start`/`status`/`stop` (see `danus/orchestration`). Skills (`.claude/skills/`): `elaboration` ·
 `consult` · `human-summary` · `write-paper`. Dashboard: `scripts/services.sh up
 dashboard <p>` + port-forward.
 
 **Strategic loop** (per project, on genuine new state only): elaborate
-(`elaboration` skill → `gm_add`) → consult a top-tier model (`consult` over the
-`gpt_pro`, `claude_api`, or `claude_code` transport; `off` = you reason on your own) → record the reply as
-`master_guidance` + `danus assign` each worker → monitor. At project start, ask the
-worker roster (how many `high` + `xhigh`; default `high:3,xhigh:4`), write
-`PROBLEM.md`, then `danus new <project> --roles high:N,xhigh:M`.
+(`elaboration` skill → `gm_add`) → optionally consult (`off` is the default;
+`gpt_pro`, `claude_api`, and `claude_code` are explicit opt-ins) → record an
+actual consult reply as `master_guidance`, or dispatch directly from the
+elaboration when off → assign the fixed root/critic lanes → monitor. At project start, ask the
+worker roster if the operator wants to override it; reasoning-first defaults to
+`max:2,high:5` (two paid deep lanes and five dormant observers), while explicit
+legacy defaults to `high:3,xhigh:4`. Write `PROBLEM.md`, then run
+`danus new <project>` with `--roles ...` only for an explicit override.
+
+**Late ChatGPT Pro intervention is event-driven and attended.** It requires the
+exact current coordinator recommendation derived from the fixed root obstruction
+and independent critic confirmation. Broad evidence that routes are blocked,
+dead-ended, slow, expensive, or near exhaustion is insufficient. Only then write
+one bounded `advisor_checkpoint` (verified fact ids, failed routes/evidence, one
+bottleneck, one decision question). You may create a local browser `prepared`
+receipt, then stop and ask the owner to authorize that exact question. A timer,
+unattended loop, cost gate, worker, or verifier never triggers/authorizes it; no
+Chrome/Send occurs before the owner approves. Browser import is untrusted until
+you explicitly review, synthesize, and adopt it before new `master_guidance` or
+dispatch. Import/adopt records strategy but does not unlock the coordinator:
+an audited owner-only resolution of the exact recommendation is required before
+generation work can resume. Publish guidance with the exact
+`links.recommendation_id`, then use `danus resolve-recommendation` with matching
+recommendation-id and paid-resume acknowledgements. Browser conversation context
+remains stable across a verified continuation, but every intervention uses the
+new current recommendation. See the `consult` skill and
+`docs/browser-advisor.md`.
 
 ## Operating mode (single, attended)
 
-While your session is active you are the main agent: periodic summary (~1h), consult
-(~2h), coordination, and live plan adjustment (use `/loop` to self-pace). While
-inactive, only the workers keep looping. Run only one main agent at a time.
+While your session is active you are the main agent: summarize, consult, and
+adjust the plan when durable new evidence warrants it (use `/loop` to self-pace),
+never merely because an hour counter elapsed. The browser checkpoint above is
+always a separate owner-gated event. While inactive, only worker loops and their
+deterministic reasoning-first admission continue; no strategy model or browser
+advisor starts automatically. Run only one main agent at a time.
+
+In `reasoning_first_v1`, the selected root and critic remain fixed; dormant
+observers are not an automatic rotation/failover pool. Every new terminal
+coordination slot gets a fresh app-server thread. Only recovery of that same
+pinned slot resumes its exact thread. The 2700-second limit applies to each paid
+turn, not to completion of the whole phase.
 
 **Completion:** the moment every target of a project is a verified fact **and** the
 route is credible, `danus stop <project>` the swarm yourself (graceful) — act, then

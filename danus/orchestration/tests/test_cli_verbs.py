@@ -24,18 +24,27 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from contextlib import contextmanager, redirect_stdout
 from pathlib import Path
 
+import pytest
+
+from danus.coordination import CoordinationStore
+from danus.core import FactGraph, GlobalMemory
 from danus.execution import layout as L
+from danus.gateway import server as gateway_server
 from danus.hotjoin import HotJoinStore
 from danus.orchestration import cli
+from danus.strategy import browser_advisor as browser_advisor_module
+from danus.strategy.browser_advisor import BrowserAdvisorBroker, BrowserAdvisorConflict
 
 
 # --------------------------------------------------------------------------- #
 # env / project helpers (mirrors test_orchestration.py so styles match)        #
 # --------------------------------------------------------------------------- #
+
 
 @contextmanager
 def _env(**kw):
@@ -61,9 +70,11 @@ def _project_env(tmp: Path, **extra):
     contract.write_text("# worker contract (stub)\n", encoding="utf-8")
     skills = tmp / "skills"
     skills.mkdir(exist_ok=True)
-    env = {"DANUS_AGENTS_ROOT": str(tmp / "agents"),
-           "DANUS_WORKER_CONTRACT": str(contract),
-           "DANUS_WORKER_SKILLS": str(skills)}
+    env = {
+        "DANUS_AGENTS_ROOT": str(tmp / "agents"),
+        "DANUS_WORKER_CONTRACT": str(contract),
+        "DANUS_WORKER_SKILLS": str(skills),
+    }
     env.update(extra)
     with _env(**env):
         yield
@@ -135,6 +146,76 @@ def _write_pid_record(
     return record
 
 
+def _terminal_recommendation(project: str) -> tuple[CoordinationStore, str]:
+    project_dir = L.project_dir(project)
+    store = CoordinationStore.open_existing(project_dir)
+    assert store is not None
+    generation = int(store.project_status()["generation"])
+    root = store.admit("xhigh")
+    critic = store.admit("xhigh2")
+    assert root is not None and critic is not None
+    for admission in (root, critic):
+        store.pin_prompt(admission.slot_id, admission.directive)
+        store.activate(admission.slot_id)
+    evidence = store.record_root_evidence(
+        "xhigh",
+        "obstacle",
+        entry_id=f"cli_root_obstacle_g{generation}",
+        slot_id=root.slot_id,
+    )
+    store.complete(root.slot_id, outcome="terminal_rc_0")
+    store.complete(critic.slot_id, outcome="terminal_rc_0")
+    review = store.admit("xhigh2")
+    assert review is not None
+    store.pin_prompt(review.slot_id, review.directive)
+    store.activate(review.slot_id)
+    confirmation = store.confirm_root_evidence(
+        "xhigh2",
+        str(evidence["entry_id"]),
+        entry_id=f"cli_critic_confirmation_g{generation}",
+        slot_id=review.slot_id,
+    )
+    store.complete(review.slot_id, outcome="terminal_rc_0")
+    recommendation_id = confirmation["recommendation_id"]
+    assert isinstance(recommendation_id, str)
+    return store, recommendation_id
+
+
+def _gateway_recommendation_checkpoint(
+    project: str,
+    recommendation_id: str,
+    question: str,
+    *,
+    fact_ids: list[str] | None = None,
+) -> tuple[str, dict]:
+    prompt = (
+        "## Verified facts\n"
+        "- The exact active fact ids are bound in the checkpoint links.\n\n"
+        "## Failed routes and evidence\n"
+        "- The designated critic confirmed the root obstruction.\n\n"
+        "## Unresolved bottleneck\n"
+        "A bounded next route still requires owner-reviewed advice.\n\n"
+        "## Candidate decision question\n"
+        f"{question}"
+    )
+    with _env(
+        DANUS_PROJECT_DIR=None,
+        DANUS_AUTHOR="main_agent",
+        DANUS_ROLE="main",
+    ):
+        checkpoint = gateway_server.gm_add(
+            "advisor_checkpoint",
+            claim="Exact coordinator recommendation checkpoint",
+            evidence=prompt,
+            links={
+                "fact_ids": list(fact_ids or []),
+                "recommendation_id": recommendation_id,
+            },
+            project=project,
+        )
+    return prompt, checkpoint
+
+
 @contextmanager
 def _fake_process_identity(pid: int, *, token: str = "test-birth", state: str = "R"):
     original = cli._process_identity
@@ -185,9 +266,7 @@ def test_darwin_libproc_birth_token_uses_microseconds_and_fails_closed():
             self.proc_pidinfo = call
 
     call = FakeProcPidInfo()
-    identity = cli._darwin_process_birth(
-        os.getpid(), libproc=FakeLibProc(call)
-    )
+    identity = cli._darwin_process_birth(os.getpid(), libproc=FakeLibProc(call))
     assert identity == {
         "pgid": pgid,
         "start_token": "darwin-libproc:1786252097:012345",
@@ -220,6 +299,7 @@ def _expect_exit(fn, *a, **kw):
 # --------------------------------------------------------------------------- #
 # read helpers: _read_pid / _alive / _read_status                              #
 # --------------------------------------------------------------------------- #
+
 
 def test_read_pid_missing_and_garbage(tmp: Path):
     with _project_env(tmp):
@@ -301,9 +381,11 @@ def test_stop_one_force_sigkill_killpg_raises(tmp: Path):
         signals = []
 
         cli._pid_record_is_live = lambda record: True
+
         def boom_killpg(pgid, sig):
             signals.append((pgid, sig))
             raise AssertionError("cooperative stop must not signal")
+
         cli.os.killpg = boom_killpg
         try:
             assert cli._stop_one(wl, force=True) == "stopping (cooperative force)"
@@ -326,12 +408,13 @@ def test_alive_proc_read_failure_defaults_alive(tmp: Path):
     class _BoomPath:
         def __init__(self, *a, **k):
             pass
+
         def read_text(self, *a, **k):
             raise OSError("simulated /proc read failure")
 
     cli.Path = _BoomPath
     try:
-        assert cli._alive(os.getpid()) is True        # kill ok, /proc read boom -> True
+        assert cli._alive(os.getpid()) is True  # kill ok, /proc read boom -> True
     finally:
         cli.Path = real_Path
 
@@ -420,9 +503,7 @@ def test_worker_status_exposes_canonical_unfinished_paid_intent_and_recovery_arg
                 "turn_id": f"turn-{index}" if state == "started" else None,
                 "requested_model": "offline-model",
                 "requested_effort": "low",
-                "prompt_sha256": hashlib.sha256(
-                    f"prompt-{index}".encode()
-                ).hexdigest(),
+                "prompt_sha256": hashlib.sha256(f"prompt-{index}".encode()).hexdigest(),
             }
             assert status["intent_ledger_error"] is None
             recovery = status["recovery_required"]
@@ -430,9 +511,7 @@ def test_worker_status_exposes_canonical_unfinished_paid_intent_and_recovery_arg
                 assert recovery["action"] == "resume_or_cancel_prepared_intent"
                 assert recovery["paid_dispatch_state"] == "not_dispatched"
                 assert recovery["paid_outcome_unknown"] is False
-                assert recovery["argv"] == [
-                    "bin/danus", "start", f"{project}/high"
-                ]
+                assert recovery["argv"] == ["bin/danus", "start", f"{project}/high"]
                 assert recovery["cancel_argv"] == [
                     "bin/danus",
                     "cancel-prepared-intent",
@@ -492,6 +571,7 @@ def test_alive_zombie_is_dead():
     and do NOT wait() it, so it lingers as a zombie we own."""
     import subprocess
     import time
+
     if not Path("/proc").is_dir():
         return  # the implementation's /proc zombie-state check is Linux-specific
     # 'true' exits at once; without wait() it becomes a zombie child of us.
@@ -499,24 +579,27 @@ def test_alive_zombie_is_dead():
     try:
         # wait for the kernel to mark it Z (exited, unreaped)
         pid = proc.pid
+
         def is_zombie():
             try:
                 stat = Path(f"/proc/{pid}/stat").read_text()
                 return stat.rsplit(")", 1)[1].split()[0] == "Z"
             except (OSError, IndexError):
                 return False
+
         end = time.time() + 5
         while time.time() < end and not is_zombie():
             time.sleep(0.02)
         assert is_zombie(), "child did not become a zombie"
-        assert cli._alive(pid) is False              # /proc state 'Z' => dead
+        assert cli._alive(pid) is False  # /proc state 'Z' => dead
     finally:
-        proc.wait()                                   # reap it
+        proc.wait()  # reap it
 
 
 # --------------------------------------------------------------------------- #
 # worker_status labels                                                          #
 # --------------------------------------------------------------------------- #
+
 
 def test_worker_status_stuck_label(tmp: Path):
     """alive + state=running + round_started_at far in the past -> 'stuck?'."""
@@ -524,10 +607,18 @@ def test_worker_status_stuck_label(tmp: Path):
         cli.do_new("P", roles="high:1")
         wl = _wl("P", "high")
         _write_pid_record(wl, os.getpid())
-        old = 1.0                                     # epoch ~1970 => hugely stale
-        wl.status.write_text(json.dumps(
-            {"state": "running", "round": 5, "round_started_at": old,
-             "last_round_at": old, "last_fact_id": "F9"}))
+        old = 1.0  # epoch ~1970 => hugely stale
+        wl.status.write_text(
+            json.dumps(
+                {
+                    "state": "running",
+                    "round": 5,
+                    "round_started_at": old,
+                    "last_round_at": old,
+                    "last_fact_id": "F9",
+                }
+            )
+        )
         with _fake_process_identity(os.getpid()):
             s = cli.worker_status(wl)
         assert s["alive"] is True and s["label"] == "stuck?"
@@ -540,9 +631,13 @@ def test_worker_status_working_and_dead_labels(tmp: Path):
         wl = _wl("P", "high")
         # alive + running but fresh => 'working'
         import time
+
         _write_pid_record(wl, os.getpid())
-        wl.status.write_text(json.dumps(
-            {"state": "running", "round": 2, "round_started_at": time.time()}))
+        wl.status.write_text(
+            json.dumps(
+                {"state": "running", "round": 2, "round_started_at": time.time()}
+            )
+        )
         with _fake_process_identity(os.getpid()):
             assert cli.worker_status(wl)["label"] == "working"
         # not alive + unknown terminal state => 'dead'
@@ -559,7 +654,27 @@ def test_worker_status_json_exposes_layered_paid_and_recovery_outcomes(tmp: Path
     with _project_env(tmp):
         cli.do_new("P", roles="high:1")
         wl = _wl("P", "high")
-        paid = {"round": 2, "rc": 124, "terminal_status": "interrupted"}
+        reasoning = {
+            "schema": "danus_reasoning_bandwidth_v1",
+            "scope": "root_thread_only",
+            "finality": "unavailable",
+            "finality_reasons": ["exec_transport_has_no_attested_item_telemetry"],
+        }
+        token_usage = {
+            "last": {"reasoningOutputTokens": 11, "outputTokens": 17},
+            "total": {"reasoningOutputTokens": 11, "outputTokens": 17},
+        }
+        paid = {
+            "round": 2,
+            "rc": 124,
+            "terminal_status": "interrupted",
+            "token_usage": token_usage,
+            "token_usage_observed": True,
+            "token_usage_finality": "observed_not_schema_attested_final",
+            "reasoning_bandwidth": reasoning,
+            "model": "gpt-5.4",
+            "effort": "xhigh",
+        }
         attempt = {
             "round": 3,
             "rc": 123,
@@ -577,6 +692,16 @@ def test_worker_status_json_exposes_layered_paid_and_recovery_outcomes(tmp: Path
                     "round": 3,
                     "error": "bounded resume failed",
                     "last_paid_turn": paid,
+                    "last_turn_reasoning_bandwidth": reasoning,
+                    "last_turn_token_usage": token_usage,
+                    "last_turn_token_usage_observed": True,
+                    "last_turn_token_usage_finality": (
+                        "observed_not_schema_attested_final"
+                    ),
+                    "last_turn_status": "interrupted",
+                    "last_turn_model": "gpt-5.4",
+                    "last_turn_effort": "xhigh",
+                    "last_turn_model_rerouted": False,
                     "last_attempt": attempt,
                     "recovery_required": recovery,
                 }
@@ -586,13 +711,51 @@ def test_worker_status_json_exposes_layered_paid_and_recovery_outcomes(tmp: Path
         status = cli.worker_status(wl)
     assert status["error"] == "bounded resume failed"
     assert status["last_paid_turn"] == paid
+    assert status["last_turn_reasoning_bandwidth"] == reasoning
+    assert status["last_turn_token_usage"] == token_usage
+    assert status["last_turn_token_usage_observed"] is True
+    assert status["last_turn_token_usage_finality"] == (
+        "observed_not_schema_attested_final"
+    )
+    assert status["last_turn_status"] == "interrupted"
+    assert status["last_turn_model"] == "gpt-5.4"
+    assert status["last_turn_effort"] == "xhigh"
+    assert status["last_turn_model_rerouted"] is False
     assert status["last_attempt"] == attempt
     assert status["recovery_required"] == recovery
+
+
+def test_status_telemetry_is_bounded_and_project_list_stays_compact(tmp: Path):
+    with _project_env(tmp):
+        cli.do_new("P", roles="high:1")
+        wl = _wl("P", "high")
+        oversized = {"schema": "danus_reasoning_bandwidth_v1", "x": "y" * 200_000}
+        wl.status.write_text(
+            json.dumps(
+                {
+                    "state": "stopped",
+                    "last_turn_reasoning_bandwidth": oversized,
+                    "last_paid_turn": {"reasoning_bandwidth": oversized},
+                }
+            ),
+            encoding="utf-8",
+        )
+        status = cli.worker_status(wl)
+        listed = cli.do_list()[0]
+
+    assert status["last_turn_reasoning_bandwidth"]["omitted"] is True
+    assert status["last_turn_reasoning_bandwidth"]["bytes"] > 131_072
+    assert len(status["last_turn_reasoning_bandwidth"]["sha256"]) == 64
+    assert status["last_paid_turn"]["reasoning_bandwidth"] == oversized
+    assert "last_paid_turn" not in listed
+    assert "last_turn_reasoning_bandwidth" not in listed
+    assert len(json.dumps(listed).encode("utf-8")) < 16_384
 
 
 # --------------------------------------------------------------------------- #
 # do_start: mocked spawn, locked path, no-workers, project-wide + stagger       #
 # --------------------------------------------------------------------------- #
+
 
 def test_do_start_calls_spawn_with_worker_dir(tmp: Path):
     with _project_env(tmp), _patch_spawn() as fake:
@@ -601,15 +764,16 @@ def test_do_start_calls_spawn_with_worker_dir(tmp: Path):
         assert res == [{"worker": "high", "result": "started"}]
         assert fake.calls == [_wl("P", "high").dir]
         wl = _wl("P", "high")
-        assert cli._read_pid(wl) == os.getpid()      # pid file written from fake pid
+        assert cli._read_pid(wl) == os.getpid()  # pid file written from fake pid
         # second start sees our-own-pid as alive => idempotent already-running
         res2 = cli.do_start("P/high")
         assert res2 == [{"worker": "high", "result": "already-running"}]
-        assert len(fake.calls) == 1                   # spawn NOT called again
+        assert len(fake.calls) == 1  # spawn NOT called again
 
 
 def test_do_start_locked_returns_locked(tmp: Path):
     import fcntl
+
     with _project_env(tmp), _patch_spawn():
         cli.do_new("P", roles="high:1")
         wl = _wl("P", "high")
@@ -630,7 +794,7 @@ def test_do_start_clears_stale_stop(tmp: Path):
         wl.dir.mkdir(parents=True, exist_ok=True)
         wl.stop.touch()
         assert cli._start_one(wl) == "started"
-        assert not wl.stop.exists()                   # stale stop cleared
+        assert not wl.stop.exists()  # stale stop cleared
 
 
 def test_start_and_stop_fail_closed_on_legacy_pid_without_side_effects(tmp: Path):
@@ -922,7 +1086,7 @@ def test_do_start_no_workers_raises(tmp: Path):
 def test_do_start_project_wide_stagger(tmp: Path):
     with _project_env(tmp), _patch_spawn() as fake:
         cli.do_new("P", roles="high:2")
-        res = cli.do_start("P", stagger=0)            # stagger 0 => no sleep
+        res = cli.do_start("P", stagger=0)  # stagger 0 => no sleep
         assert {r["worker"] for r in res} == {"high", "high2"}
         assert {r["result"] for r in res} == {"started"}
         assert {c.name for c in fake.calls} == {"high", "high2"}
@@ -931,6 +1095,7 @@ def test_do_start_project_wide_stagger(tmp: Path):
 # --------------------------------------------------------------------------- #
 # do_status / do_stop no-workers                                                #
 # --------------------------------------------------------------------------- #
+
 
 def test_do_status_no_workers_raises(tmp: Path):
     with _project_env(tmp):
@@ -946,6 +1111,7 @@ def test_do_stop_no_workers_raises(tmp: Path):
 # _stop_one: not-running (graceful + force), graceful touch, force kill path     #
 # --------------------------------------------------------------------------- #
 
+
 def test_stop_one_not_running_graceful(tmp: Path):
     with _project_env(tmp):
         cli.do_new("P", roles="high:1")
@@ -959,7 +1125,7 @@ def test_stop_one_not_running_force_cleans_pid(tmp: Path):
         wl = _wl("P", "high")
         _write_pid_record(wl, 2_000_000_000)
         assert cli._stop_one(wl, force=True) == "not-running"
-        assert not wl.pid.exists()                     # stale pid removed
+        assert not wl.pid.exists()  # stale pid removed
 
 
 def test_stop_one_graceful_touches_stop(tmp: Path):
@@ -970,7 +1136,7 @@ def test_stop_one_graceful_touches_stop(tmp: Path):
         with _fake_process_identity(os.getpid()):
             assert cli._stop_one(wl, force=False) == "stopping (graceful)"
         assert wl.stop.exists()
-        wl.stop.unlink()                               # don't leave a stop flag on us
+        wl.stop.unlink()  # don't leave a stop flag on us
 
 
 def test_stop_one_force_kills_a_real_child(tmp: Path):
@@ -1000,13 +1166,20 @@ def test_stop_one_force_kills_a_real_child(tmp: Path):
 # do_finalize: validate + write / reject unknown / suggestion mode             #
 # --------------------------------------------------------------------------- #
 
+
 def _add_fact(project: str, statement: str = "S", proof: str = "P", preds=None) -> str:
     """Add a verified fact to a project's fact graph (test helper — writes via the
     core FactGraph, the same path fact_submit uses on accept)."""
     from danus.core import FactGraph
+
     fg = FactGraph(L.project_dir(project))
-    return fg.add(problem_id="p", author="a", statement=statement, proof=proof,
-                  predecessors=preds or [])
+    return fg.add(
+        problem_id="p",
+        author="a",
+        statement=statement,
+        proof=proof,
+        predecessors=preds or [],
+    )
 
 
 def test_finalize_validates_and_writes(tmp: Path):
@@ -1019,6 +1192,7 @@ def test_finalize_validates_and_writes(tmp: Path):
         assert target.exists() and fid in target.read_text(encoding="utf-8")
         # write-paper's reader sees the same id
         from danus.write_paper import assemble
+
         assert assemble.target_fact_ids(L.project_dir("P")) == [fid]
 
 
@@ -1049,12 +1223,14 @@ def test_finalize_suggestion_mode_writes_nothing(tmp: Path):
     with _project_env(tmp):
         cli.do_new("P", roles="high:1")
         leaf = _add_fact("P", statement="leaf")
-        top = _add_fact("P", statement="top", preds=[leaf])   # leaf is a predecessor
-        r = cli.do_finalize("P", [])                          # suggestion mode
+        top = _add_fact("P", statement="top", preds=[leaf])  # leaf is a predecessor
+        r = cli.do_finalize("P", [])  # suggestion mode
         assert "suggested" in r
         assert r["suggested"] == [top], "only the terminal fact is suggested"
         assert leaf not in r["suggested"]
-        assert not (L.project_dir("P") / "TARGET.md").exists(), "suggestion writes nothing"
+        assert not (L.project_dir("P") / "TARGET.md").exists(), (
+            "suggestion writes nothing"
+        )
 
 
 def test_main_finalize_write_and_suggest(tmp: Path):
@@ -1072,12 +1248,13 @@ def test_main_finalize_write_and_suggest(tmp: Path):
 # do_list: bad project.json, formatting                                         #
 # --------------------------------------------------------------------------- #
 
+
 def test_do_list_bad_project_json(tmp: Path):
     with _project_env(tmp):
         cli.do_new("P", roles="high:1", model="gpt-5.5")
         (L.project_dir("P") / "project.json").write_text("{ broken", encoding="utf-8")
         rows = {r["project"]: r for r in cli.do_list()}
-        assert rows["P"]["model"] == "—"               # unparseable meta => dash
+        assert rows["P"]["model"] == "—"  # unparseable meta => dash
 
 
 def test_do_list_missing_project_json(tmp: Path):
@@ -1092,6 +1269,7 @@ def test_do_list_missing_project_json(tmp: Path):
 # text formatters _fmt_list / _fmt_status                                       #
 # --------------------------------------------------------------------------- #
 
+
 def test_fmt_list_empty_and_rows():
     assert cli._fmt_list([]) == "(no projects under the agents root)"
     rows = [{"project": "Proj", "workers": 3, "live": 1, "model": "gpt-5.5"}]
@@ -1101,20 +1279,33 @@ def test_fmt_list_empty_and_rows():
 
 def test_fmt_status_rows():
     rows = [
-        {"worker": "high", "label": "working", "state": "running", "round": 4,
-         "age_s": 12.4, "last_fact_id": "F7"},
-        {"worker": "xhigh", "label": "dead", "state": "created", "round": 0,
-         "age_s": None, "last_fact_id": None},
+        {
+            "worker": "high",
+            "label": "working",
+            "state": "running",
+            "round": 4,
+            "age_s": 12.4,
+            "last_fact_id": "F7",
+        },
+        {
+            "worker": "xhigh",
+            "label": "dead",
+            "state": "created",
+            "round": 0,
+            "age_s": None,
+            "last_fact_id": None,
+        },
     ]
     out = cli._fmt_status(rows)
     assert "WORKER" in out and "high" in out and "xhigh" in out
-    assert "12s" in out                                # age rendered from float
-    assert "—" in out                                  # None age / fact => dash
+    assert "12s" in out  # age rendered from float
+    assert "—" in out  # None age / fact => dash
 
 
 # --------------------------------------------------------------------------- #
 # _task_from_args: --task / --file / --stdin / none                             #
 # --------------------------------------------------------------------------- #
+
 
 class _Args:
     def __init__(self, task=None, file=None, stdin=False):
@@ -1135,6 +1326,7 @@ def test_task_from_args_file(tmp: Path):
 
 def test_task_from_args_stdin(monkeypatch=None):
     import sys
+
     old = sys.stdin
     sys.stdin = io.StringIO("piped task\n")
     try:
@@ -1147,26 +1339,805 @@ def test_task_from_args_none_raises():
     assert "one of --task" in str(_expect_exit(cli._task_from_args, _Args()))
 
 
+def test_resolve_recommendation_continue_requires_exact_owner_ack(
+    tmp: Path,
+    monkeypatch,
+):
+    with _project_env(tmp):
+        cli.do_new("P", roles="xhigh:2")
+        store, recommendation_id = _terminal_recommendation("P")
+        failure = _expect_exit(
+            cli.do_resolve_recommendation,
+            "P",
+            recommendation_id,
+            resolution="continue-without-advisor",
+            acknowledge_recommendation_id="different_recommendation",
+            acknowledge_resume_paid_reasoning=True,
+            master_guidance_entry_id=None,
+        )
+        assert "must exactly equal" in str(failure)
+        assert store.project_status()["phase"] == "owner_action_required"
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                cli,
+                "load_project_metadata",
+                lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                    AssertionError("missing owner acknowledgement read coordinator state")
+                ),
+            )
+            failure = _expect_exit(
+                cli.do_resolve_recommendation,
+                "P",
+                recommendation_id,
+                resolution="continue-without-advisor",
+                acknowledge_recommendation_id=recommendation_id,
+                acknowledge_resume_paid_reasoning=False,
+                master_guidance_entry_id=None,
+            )
+        assert "--acknowledge-resume-paid-reasoning" in str(failure)
+        assert store.project_status()["phase"] == "owner_action_required"
+
+        resolved = cli.do_resolve_recommendation(
+            "P",
+            recommendation_id,
+            resolution="continue-without-advisor",
+            acknowledge_recommendation_id=recommendation_id,
+            acknowledge_resume_paid_reasoning=True,
+            master_guidance_entry_id=None,
+        )
+        assert resolved["resolution"] == "continue_without_advisor"
+        assert store.project_status()["generation"] == 2
+        assert (
+            cli.do_resolve_recommendation(
+                "P",
+                recommendation_id,
+                resolution="continue-without-advisor",
+                acknowledge_recommendation_id=recommendation_id,
+                acknowledge_resume_paid_reasoning=True,
+                master_guidance_entry_id=None,
+            )
+            == resolved
+        )
+
+
+def test_checkpoint_prepare_abandon_continue_is_one_no_send_e2e(
+    tmp: Path,
+    monkeypatch,
+):
+    control_root = tmp / "checkpoint-no-send-control"
+    monkeypatch.setattr(
+        browser_advisor_module,
+        "_canonical_control_root",
+        lambda: control_root,
+    )
+    with _project_env(tmp):
+        cli.do_new("P", roles="xhigh:2")
+        store, recommendation_id = _terminal_recommendation("P")
+        project_dir = L.project_dir("P")
+        fact_id = FactGraph(project_dir).add(
+            problem_id="P",
+            author="xhigh",
+            statement="A verified premise for the advisor handoff.",
+            proof="Direct verification.",
+        )
+        prompt = (
+            "## Verified facts\n"
+            f"- {fact_id}: verified handoff premise.\n\n"
+            "## Failed routes and evidence\n"
+            "- The direct route is blocked by the reviewed obstruction.\n\n"
+            "## Unresolved bottleneck\n"
+            "A uniform estimate remains unavailable.\n\n"
+            "## Candidate decision question\n"
+            "Which bounded route should the next paid generation prioritize?"
+        )
+        with _env(
+            DANUS_PROJECT_DIR=None,
+            DANUS_AUTHOR="main_agent",
+            DANUS_ROLE="main",
+        ):
+            checkpoint = gateway_server.gm_add(
+                "advisor_checkpoint",
+                claim="Reviewed late-intervention checkpoint",
+                evidence=prompt,
+                links={
+                    "fact_ids": [fact_id],
+                    "recommendation_id": recommendation_id,
+                },
+                project="P",
+            )
+        assert checkpoint["checkpoint_id"] == checkpoint["id"]
+        assert checkpoint["recommendation_id"] == recommendation_id
+
+        broker = BrowserAdvisorBroker(project_dir)
+        prepared = broker.prepare(
+            prompt,
+            context_id="stable-math-conversation",
+            recommendation_id=recommendation_id,
+            checkpoint_id=checkpoint["checkpoint_id"],
+            checkpoint_sha256=checkpoint["checkpoint_sha256"],
+            checkpoint_bytes=checkpoint["checkpoint_bytes"],
+        )
+        assert prepared["state"] == "prepared"
+        assert prepared["checkpoint_id"] == checkpoint["checkpoint_id"]
+        assert prepared["click_authorized"] is False
+        assert [event["state"] for event in broker.events(prepared["request_id"])] == [
+            "prepared"
+        ]
+
+        blocked = _expect_exit(
+            cli.do_resolve_recommendation,
+            "P",
+            recommendation_id,
+            resolution="continue-without-advisor",
+            acknowledge_recommendation_id=recommendation_id,
+            acknowledge_resume_paid_reasoning=True,
+            master_guidance_entry_id=None,
+        )
+        assert "explicit release-safe state" in str(blocked)
+        assert store.project_status()["phase"] == "owner_action_required"
+
+        abandoned = broker.abandon(
+            prepared["request_id"],
+            reason="owner declined this exact unsent advisor question",
+        )
+        assert abandoned["state"] == "abandoned"
+        resolved = cli.do_resolve_recommendation(
+            "P",
+            recommendation_id,
+            resolution="continue-without-advisor",
+            acknowledge_recommendation_id=recommendation_id,
+            acknowledge_resume_paid_reasoning=True,
+            master_guidance_entry_id=None,
+        )
+        assert resolved["resolution"] == "continue_without_advisor"
+        assert store.project_status()["generation"] == 2
+        assert [event["state"] for event in broker.events(prepared["request_id"])] == [
+            "prepared",
+            "abandoned",
+        ]
+
+
+def test_resolve_recommendation_adopted_guidance_binds_entry_link_and_digest(
+    tmp: Path,
+):
+    with _project_env(tmp):
+        cli.do_new("P", roles="xhigh:2")
+        store, recommendation_id = _terminal_recommendation("P")
+        memory = GlobalMemory(L.project_dir("P"))
+        wrong_entry_id = memory.append(
+            "master_guidance",
+            claim="Reviewed direction",
+            evidence="Use a bounded decomposition.",
+            author="main",
+            links={"recommendation_id": "wrong_recommendation"},
+        )
+        failure = _expect_exit(
+            cli.do_resolve_recommendation,
+            "P",
+            recommendation_id,
+            resolution="adopted-master-guidance",
+            acknowledge_recommendation_id=recommendation_id,
+            acknowledge_resume_paid_reasoning=True,
+            master_guidance_entry_id=wrong_entry_id,
+        )
+        assert "exact recommendation id" in str(failure)
+        assert store.project_status()["phase"] == "owner_action_required"
+
+        entry_id = memory.append(
+            "master_guidance",
+            claim="Reviewed direction",
+            evidence="Use a bounded decomposition.",
+            author="main",
+            links={"recommendation_id": recommendation_id},
+        )
+        # GM publication alone carries no coordinator authority.
+        assert store.project_status()["generation"] == 1
+        resolved = cli.do_resolve_recommendation(
+            "P",
+            recommendation_id,
+            resolution="adopted-master-guidance",
+            acknowledge_recommendation_id=recommendation_id,
+            acknowledge_resume_paid_reasoning=True,
+            master_guidance_entry_id=entry_id,
+        )
+        exact = memory.get(entry_id)
+        canonical = json.dumps(
+            exact,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        assert resolved["master_guidance_entry_id"] == entry_id
+        assert resolved["master_guidance_record_sha256"] == hashlib.sha256(
+            canonical
+        ).hexdigest()
+        assert resolved["browser_request_id"] is None
+        assert store.project_status()["generation"] == 2
+        memory.set_status(entry_id, "supported")
+        # Durable exact replay does not depend on a later folded GM status.
+        assert (
+            cli.do_resolve_recommendation(
+                "P",
+                recommendation_id,
+                resolution="adopted-master-guidance",
+                acknowledge_recommendation_id=recommendation_id,
+                acknowledge_resume_paid_reasoning=True,
+                master_guidance_entry_id=entry_id,
+            )
+            == resolved
+        )
+
+
+def test_resolve_recommendation_browser_receipt_must_bind_recommendation(
+    tmp: Path,
+):
+    with _project_env(tmp):
+        cli.do_new("P", roles="xhigh:2")
+        store, recommendation_id = _terminal_recommendation("P")
+        provenance = {
+            "schema_version": 1,
+            "transport": "chatgpt_pro_browser",
+            "request_id": "00000000-0000-0000-0000-000000000001",
+            "elaboration_id": None,
+            "context_id": "stable_math_conversation",
+            "recommendation_id": "different_recommendation",
+            "binding_sha256": "a" * 64,
+            "receipt_sha256": "b" * 64,
+            "prompt_sha256": "c" * 64,
+            "reply_sha256": "d" * 64,
+            "adopted_strategy_sha256": "e" * 64,
+            "trust": "adopted_strategy",
+            "billing_basis": "subscription",
+            "model": None,
+            "ui_mode": "Pro",
+            "input_tokens": None,
+            "output_tokens": None,
+            "cost_usd": None,
+        }
+        entry_id = GlobalMemory(L.project_dir("P")).append(
+            "master_guidance",
+            claim="Browser reviewed direction",
+            evidence="Adopted synthesis",
+            author="main",
+            links={"recommendation_id": recommendation_id},
+            consult_provenance=provenance,
+        )
+        failure = _expect_exit(
+            cli.do_resolve_recommendation,
+            "P",
+            recommendation_id,
+            resolution="adopted-master-guidance",
+            acknowledge_recommendation_id=recommendation_id,
+            acknowledge_resume_paid_reasoning=True,
+            master_guidance_entry_id=entry_id,
+        )
+        assert "bind the exact recommendation id" in str(failure)
+        assert store.project_status()["phase"] == "owner_action_required"
+
+
+def test_continue_recommendation_rejects_live_browser_request_until_released(
+    tmp: Path,
+    monkeypatch,
+):
+    control_root = tmp / "continue-advisor-control"
+    monkeypatch.setattr(
+        browser_advisor_module,
+        "_canonical_control_root",
+        lambda: control_root,
+    )
+    with _project_env(tmp):
+        cli.do_new("P", roles="xhigh:2")
+        store, recommendation_id = _terminal_recommendation("P")
+        prompt, checkpoint = _gateway_recommendation_checkpoint(
+            "P", recommendation_id, "Review the exact designated obstacle."
+        )
+        broker = BrowserAdvisorBroker(L.project_dir("P"))
+        request = broker.prepare(
+            prompt,
+            context_id="stable_math_conversation",
+            recommendation_id=recommendation_id,
+            checkpoint_id=checkpoint["checkpoint_id"],
+            checkpoint_sha256=checkpoint["checkpoint_sha256"],
+            checkpoint_bytes=checkpoint["checkpoint_bytes"],
+        )
+
+        failure = _expect_exit(
+            cli.do_resolve_recommendation,
+            "P",
+            recommendation_id,
+            resolution="continue-without-advisor",
+            acknowledge_recommendation_id=recommendation_id,
+            acknowledge_resume_paid_reasoning=True,
+            master_guidance_entry_id=None,
+        )
+        assert "explicit release-safe state" in str(failure)
+        assert store.project_status()["phase"] == "owner_action_required"
+
+        broker.abandon(request["request_id"], reason="owner declined advisor request")
+        resolved = cli.do_resolve_recommendation(
+            "P",
+            recommendation_id,
+            resolution="continue-without-advisor",
+            acknowledge_recommendation_id=recommendation_id,
+            acknowledge_resume_paid_reasoning=True,
+            master_guidance_entry_id=None,
+        )
+        assert resolved["resolution"] == "continue_without_advisor"
+        assert store.project_status()["generation"] == 2
+
+
+def test_recommendation_prepare_wins_fence_before_continue_resolution(
+    tmp: Path,
+    monkeypatch,
+):
+    control_root = tmp / "prepare-wins-control"
+    monkeypatch.setattr(
+        browser_advisor_module,
+        "_canonical_control_root",
+        lambda: control_root,
+    )
+    with _project_env(tmp):
+        cli.do_new("P", roles="xhigh:2")
+        store, recommendation_id = _terminal_recommendation("P")
+        prompt, checkpoint = _gateway_recommendation_checkpoint(
+            "P", recommendation_id, "Review the exact designated obstacle."
+        )
+        broker = BrowserAdvisorBroker(L.project_dir("P"))
+        entered = threading.Event()
+        release = threading.Event()
+        original_validate = browser_advisor_module._validate_prepare_recommendation
+
+        def paused_validate(project_dir, observed_recommendation_id):
+            entered.set()
+            assert release.wait(timeout=5)
+            return original_validate(project_dir, observed_recommendation_id)
+
+        monkeypatch.setattr(
+            browser_advisor_module,
+            "_validate_prepare_recommendation",
+            paused_validate,
+        )
+        outcomes: dict[str, object] = {}
+
+        def prepare() -> None:
+            try:
+                outcomes["prepare"] = broker.prepare(
+                    prompt,
+                    context_id="stable_math_conversation",
+                    recommendation_id=recommendation_id,
+                    checkpoint_id=checkpoint["checkpoint_id"],
+                    checkpoint_sha256=checkpoint["checkpoint_sha256"],
+                    checkpoint_bytes=checkpoint["checkpoint_bytes"],
+                )
+            except BaseException as exc:  # pragma: no cover - asserted below
+                outcomes["prepare_error"] = exc
+
+        def resolve() -> None:
+            try:
+                outcomes["resolve"] = cli.do_resolve_recommendation(
+                    "P",
+                    recommendation_id,
+                    resolution="continue-without-advisor",
+                    acknowledge_recommendation_id=recommendation_id,
+                    acknowledge_resume_paid_reasoning=True,
+                    master_guidance_entry_id=None,
+                )
+            except BaseException as exc:
+                outcomes["resolve_error"] = exc
+
+        prepare_thread = threading.Thread(target=prepare)
+        resolve_thread = threading.Thread(target=resolve)
+        prepare_thread.start()
+        assert entered.wait(timeout=5)
+        resolve_thread.start()
+        release.set()
+        prepare_thread.join(timeout=5)
+        resolve_thread.join(timeout=5)
+        assert not prepare_thread.is_alive() and not resolve_thread.is_alive()
+        assert "prepare_error" not in outcomes
+        assert outcomes["prepare"]["recommendation_id"] == recommendation_id
+        assert isinstance(outcomes.get("resolve_error"), SystemExit)
+        assert "explicit release-safe state" in str(outcomes["resolve_error"])
+        assert store.project_status()["phase"] == "owner_action_required"
+
+
+def test_recommendation_continue_resolution_wins_fence_before_prepare(
+    tmp: Path,
+    monkeypatch,
+):
+    control_root = tmp / "resolve-wins-control"
+    monkeypatch.setattr(
+        browser_advisor_module,
+        "_canonical_control_root",
+        lambda: control_root,
+    )
+    with _project_env(tmp):
+        cli.do_new("P", roles="xhigh:2")
+        store, recommendation_id = _terminal_recommendation("P")
+        project_dir = L.project_dir("P")
+        prompt, checkpoint = _gateway_recommendation_checkpoint(
+            "P", recommendation_id, "Review the exact designated obstacle."
+        )
+        broker = BrowserAdvisorBroker(project_dir)
+        entered = threading.Event()
+        release = threading.Event()
+        original_releasable = BrowserAdvisorBroker.assert_recommendation_releasable
+
+        def paused_releasable(cls, observed_project_dir, *, recommendation_id):
+            entered.set()
+            assert release.wait(timeout=5)
+            return original_releasable(
+                observed_project_dir,
+                recommendation_id=recommendation_id,
+            )
+
+        monkeypatch.setattr(
+            BrowserAdvisorBroker,
+            "assert_recommendation_releasable",
+            classmethod(paused_releasable),
+        )
+        outcomes: dict[str, object] = {}
+
+        def resolve() -> None:
+            try:
+                outcomes["resolve"] = cli.do_resolve_recommendation(
+                    "P",
+                    recommendation_id,
+                    resolution="continue-without-advisor",
+                    acknowledge_recommendation_id=recommendation_id,
+                    acknowledge_resume_paid_reasoning=True,
+                    master_guidance_entry_id=None,
+                )
+            except BaseException as exc:  # pragma: no cover - asserted below
+                outcomes["resolve_error"] = exc
+
+        def prepare() -> None:
+            try:
+                outcomes["prepare"] = broker.prepare(
+                    prompt,
+                    context_id="stable_math_conversation",
+                    recommendation_id=recommendation_id,
+                    checkpoint_id=checkpoint["checkpoint_id"],
+                    checkpoint_sha256=checkpoint["checkpoint_sha256"],
+                    checkpoint_bytes=checkpoint["checkpoint_bytes"],
+                )
+            except BaseException as exc:
+                outcomes["prepare_error"] = exc
+
+        resolve_thread = threading.Thread(target=resolve)
+        prepare_thread = threading.Thread(target=prepare)
+        resolve_thread.start()
+        assert entered.wait(timeout=5)
+        prepare_thread.start()
+        release.set()
+        resolve_thread.join(timeout=5)
+        prepare_thread.join(timeout=5)
+        assert not resolve_thread.is_alive() and not prepare_thread.is_alive()
+        assert "resolve_error" not in outcomes
+        assert outcomes["resolve"]["recommendation_id"] == recommendation_id
+        assert isinstance(
+            outcomes.get("prepare_error"),
+            browser_advisor_module.BrowserAdvisorStateError,
+        )
+        assert BrowserAdvisorBroker.recommendation_request(
+            project_dir,
+            recommendation_id=recommendation_id,
+        ) is None
+        assert store.project_status()["generation"] == 2
+
+
+def test_resolve_recommendation_accepts_exact_same_project_adopted_browser_receipt(
+    tmp: Path,
+    monkeypatch,
+):
+    control_root = tmp / "owner-advisor-control"
+    monkeypatch.setattr(
+        browser_advisor_module,
+        "_canonical_control_root",
+        lambda: control_root,
+    )
+    with _project_env(tmp):
+        cli.do_new("P", roles="xhigh:2")
+        store, recommendation_id = _terminal_recommendation("P")
+        project_dir = L.project_dir("P")
+        fact_id = FactGraph(project_dir).add(
+            problem_id="P",
+            author="xhigh",
+            statement="The advisor handoff premise is verified.",
+            proof="Direct verification.",
+        )
+        prompt, checkpoint = _gateway_recommendation_checkpoint(
+            "P",
+            recommendation_id,
+            "Which route should the next paid generation prioritize?",
+            fact_ids=[fact_id],
+        )
+        broker = BrowserAdvisorBroker(project_dir)
+        request = broker.prepare(
+            prompt,
+            context_id="stable_math_conversation",
+            recommendation_id=recommendation_id,
+            checkpoint_id=checkpoint["checkpoint_id"],
+            checkpoint_sha256=checkpoint["checkpoint_sha256"],
+            checkpoint_bytes=checkpoint["checkpoint_bytes"],
+        )
+        broker.authorize(
+            request["request_id"],
+            prompt_sha256=request["prompt_sha256"],
+            authorization_scope="Owner approved this exact offline test prompt.",
+            acknowledge_external_transmission=True,
+        )
+        broker.dispatch_started(request["request_id"])
+        broker.submitted(
+            request["request_id"],
+            observed_prompt_sha256=request["prompt_sha256"],
+            ui_mode="Pro",
+            full_prompt_observed=True,
+            conversation_url="https://chatgpt.com/c/offline-owner-resolution",
+        )
+        raw = "Raw advisor response for offline receipt validation."
+        broker.complete(
+            request["request_id"],
+            response=raw,
+            observed_prompt_sha256=request["prompt_sha256"],
+            ui_mode="Pro",
+            conversation_url="https://chatgpt.com/c/offline-owner-resolution",
+            stable_snapshots=2,
+            completion_actions_observed=True,
+            composer_available=True,
+            working_indicator_absent=True,
+        )
+        broker.import_result(request["request_id"], response=raw)
+        adopted = broker.adopt(
+            request["request_id"],
+            strategy="Test the exact bottleneck under the reduced invariant.",
+            acknowledge_untrusted_review=True,
+        )
+        assert adopted["authorities"] == []
+        assert adopted["consult_provenance"]["schema_version"] == 2
+        assert adopted["consult_provenance"]["checkpoint_id"] == checkpoint[
+            "checkpoint_id"
+        ]
+        with _env(
+            DANUS_PROJECT_DIR=None,
+            DANUS_AUTHOR="main_agent",
+            DANUS_ROLE="main",
+        ):
+            guidance = gateway_server.gm_add(
+                "master_guidance",
+                claim="Owner-adopted advisor direction",
+                evidence=adopted["reply"],
+                links={"recommendation_id": recommendation_id},
+                consult_provenance=adopted["consult_provenance"],
+                project="P",
+            )
+        entry_id = guidance["id"]
+        assert all(
+            raw.encode("utf-8") not in path.read_bytes()
+            for path in (project_dir / "global_memory").glob("*.jsonl")
+        )
+
+        resolved = cli.do_resolve_recommendation(
+            "P",
+            recommendation_id,
+            resolution="adopted-master-guidance",
+            acknowledge_recommendation_id=recommendation_id,
+            acknowledge_resume_paid_reasoning=True,
+            master_guidance_entry_id=entry_id,
+        )
+        assert resolved["browser_request_id"] == request["request_id"]
+        assert (
+            resolved["browser_receipt_sha256"]
+            == adopted["consult_provenance"]["receipt_sha256"]
+        )
+        assert resolved["master_guidance_entry_id"] == entry_id
+        stored = GlobalMemory(project_dir).get(entry_id)
+        assert stored["consult_provenance"]["checkpoint_sha256"] == checkpoint[
+            "checkpoint_sha256"
+        ]
+        assert store.project_status()["generation"] == 2
+
+
+def test_v5_recommendation_continuation_keeps_context_and_rotates_exact_identity(
+    tmp: Path,
+    monkeypatch,
+):
+    control_root = tmp / "continuation-v5-control"
+    monkeypatch.setattr(
+        browser_advisor_module,
+        "_canonical_control_root",
+        lambda: control_root,
+    )
+    with _project_env(tmp):
+        cli.do_new("P", roles="xhigh:2")
+        store, recommendation1 = _terminal_recommendation("P")
+        project_dir = L.project_dir("P")
+        prompt1, checkpoint1 = _gateway_recommendation_checkpoint(
+            "P", recommendation1, "Which first intervention route is best?"
+        )
+        broker = BrowserAdvisorBroker(project_dir)
+        request1 = broker.prepare(
+            prompt1,
+            context_id="stable_pro_conversation",
+            recommendation_id=recommendation1,
+            checkpoint_id=checkpoint1["checkpoint_id"],
+            checkpoint_sha256=checkpoint1["checkpoint_sha256"],
+            checkpoint_bytes=checkpoint1["checkpoint_bytes"],
+        )
+        broker.authorize(
+            request1["request_id"],
+            prompt_sha256=request1["prompt_sha256"],
+            authorization_scope="Owner approved the exact first intervention.",
+            acknowledge_external_transmission=True,
+        )
+        broker.dispatch_started(request1["request_id"])
+        url = "https://chatgpt.com/c/offline-v5-continuation"
+        broker.submitted(
+            request1["request_id"],
+            observed_prompt_sha256=request1["prompt_sha256"],
+            ui_mode="Pro",
+            full_prompt_observed=True,
+            conversation_url=url,
+        )
+        raw1 = "First untrusted advisor response."
+        broker.complete(
+            request1["request_id"],
+            response=raw1,
+            observed_prompt_sha256=request1["prompt_sha256"],
+            ui_mode="Pro",
+            conversation_url=url,
+            stable_snapshots=2,
+            completion_actions_observed=True,
+            composer_available=True,
+            working_indicator_absent=True,
+        )
+        broker.import_result(request1["request_id"], response=raw1)
+        adopted1 = broker.adopt(
+            request1["request_id"],
+            strategy="Use the first reviewed reduction before the next checkpoint.",
+            acknowledge_untrusted_review=True,
+        )
+        with _env(
+            DANUS_PROJECT_DIR=None,
+            DANUS_AUTHOR="main_agent",
+            DANUS_ROLE="main",
+        ):
+            guidance1 = gateway_server.gm_add(
+                "master_guidance",
+                claim="First owner-adopted intervention",
+                evidence=adopted1["reply"],
+                links={"recommendation_id": recommendation1},
+                consult_provenance=adopted1["consult_provenance"],
+                project="P",
+            )
+        cli.do_resolve_recommendation(
+            "P",
+            recommendation1,
+            resolution="adopted-master-guidance",
+            acknowledge_recommendation_id=recommendation1,
+            acknowledge_resume_paid_reasoning=True,
+            master_guidance_entry_id=guidance1["id"],
+        )
+        assert store.project_status()["generation"] == 2
+
+        _store2, recommendation2 = _terminal_recommendation("P")
+        prompt2, checkpoint2 = _gateway_recommendation_checkpoint(
+            "P", recommendation2, "Which revised route follows the new obstruction?"
+        )
+        with pytest.raises(BrowserAdvisorConflict):
+            broker.prepare(
+                prompt2,
+                context_id="stable_pro_conversation",
+                recommendation_id=recommendation2,
+                checkpoint_id=checkpoint1["checkpoint_id"],
+                checkpoint_sha256=checkpoint1["checkpoint_sha256"],
+                checkpoint_bytes=checkpoint1["checkpoint_bytes"],
+                predecessor_request_id=request1["request_id"],
+                predecessor_conversation_url=url,
+            )
+        assert BrowserAdvisorBroker.recommendation_request(
+            project_dir, recommendation_id=recommendation2
+        ) is None
+
+        request2 = broker.prepare(
+            prompt2,
+            context_id="stable_pro_conversation",
+            recommendation_id=recommendation2,
+            checkpoint_id=checkpoint2["checkpoint_id"],
+            checkpoint_sha256=checkpoint2["checkpoint_sha256"],
+            checkpoint_bytes=checkpoint2["checkpoint_bytes"],
+            predecessor_request_id=request1["request_id"],
+            predecessor_conversation_url=url,
+        )
+        assert request2["request_id"] != request1["request_id"]
+        assert recommendation2 != recommendation1
+        assert request2["checkpoint_id"] != request1["checkpoint_id"]
+        assert request2["prompt_sha256"] != request1["prompt_sha256"]
+        assert request2["context_id"] == request1["context_id"]
+        assert request2["lineage"]["predecessor_request_id"] == request1[
+            "request_id"
+        ]
+        assert request2["lineage"]["conversation_url_sha256"] == (
+            hashlib.sha256(url.encode("utf-8")).hexdigest()
+        )
+        assert request2["state"] == "prepared"
+        assert request2["click_authorized"] is False
+        assert [event["state"] for event in broker.events(request2["request_id"])] == [
+            "prepared"
+        ]
+        with pytest.raises(BrowserAdvisorConflict):
+            broker.prepare(
+                prompt2,
+                context_id="forked_context",
+                recommendation_id=recommendation2,
+                checkpoint_id=checkpoint2["checkpoint_id"],
+                checkpoint_sha256=checkpoint2["checkpoint_sha256"],
+                checkpoint_bytes=checkpoint2["checkpoint_bytes"],
+                predecessor_request_id=request1["request_id"],
+                predecessor_conversation_url=url,
+            )
+        with broker._connect() as db:
+            assert db.execute("SELECT COUNT(*) FROM advisor_requests").fetchone()[0] == 2
+
+
 # --------------------------------------------------------------------------- #
 # build_parser                                                                  #
 # --------------------------------------------------------------------------- #
+
 
 def test_build_parser_all_verbs():
     p = cli.build_parser()
     assert p.parse_args(["list", "--json"]).cmd == "list"
     a = p.parse_args(["new", "P", "--roles", "high:2", "--model", "m"])
-    assert a.cmd == "new" and a.project == "P" and a.roles == "high:2" and a.model == "m"
+    assert (
+        a.cmd == "new" and a.project == "P" and a.roles == "high:2" and a.model == "m"
+    )
+    assert a.coordination == "reasoning-first"
+    default_new = p.parse_args(["new", "D"])
+    assert default_new.roles is None and default_new.coordination == "reasoning-first"
+    legacy_new = p.parse_args(["new", "L", "--coordination", "legacy"])
+    assert legacy_new.roles is None and legacy_new.coordination == "legacy"
+    a = p.parse_args(
+        [
+            "resolve-candidate",
+            "P",
+            "--receipt",
+            "a" * 64,
+            "--outcome",
+            "known-no-promotion",
+            "--acknowledge-paid-outcome-unknown",
+        ]
+    )
+    assert a.cmd == "resolve-candidate" and a.acknowledge_paid_outcome_unknown
+    a = p.parse_args(
+        [
+            "resolve-recommendation",
+            "P",
+            "--recommendation-id",
+            "recommendation_abc",
+            "--resolution",
+            "continue-without-advisor",
+            "--acknowledge-recommendation-id",
+            "recommendation_abc",
+            "--acknowledge-resume-paid-reasoning",
+        ]
+    )
+    assert a.cmd == "resolve-recommendation"
+    assert a.acknowledge_recommendation_id == "recommendation_abc"
+    assert a.acknowledge_resume_paid_reasoning is True
+    assert a.master_guidance_entry_id is None
     a = p.parse_args(["assign", "P/high", "--task", "t"])
     assert a.cmd == "assign" and a.target == "P/high" and a.task == "t"
     a = p.parse_args(["finalize", "P", "fact_a", "fact_b"])
-    assert a.cmd == "finalize" and a.project == "P" and a.fact_ids == ["fact_a", "fact_b"]
-    assert p.parse_args(["finalize", "P"]).fact_ids == []      # suggestion mode
+    assert (
+        a.cmd == "finalize" and a.project == "P" and a.fact_ids == ["fact_a", "fact_b"]
+    )
+    assert p.parse_args(["finalize", "P"]).fact_ids == []  # suggestion mode
     assert p.parse_args(["start", "P"]).cmd == "start"
     assert p.parse_args(["status", "P", "--json"]).json is True
     assert p.parse_args(["stop", "P", "--force"]).force is True
-    a = p.parse_args(
-        ["reset-thread", "P/high", "--expected-thread-id", "thread-lost"]
-    )
+    a = p.parse_args(["reset-thread", "P/high", "--expected-thread-id", "thread-lost"])
     assert a.cmd == "reset-thread" and a.expected_thread_id == "thread-lost"
     a = p.parse_args(
         [
@@ -1229,6 +2200,7 @@ def test_build_parser_all_verbs():
 # main dispatch — every verb, text + json branches                             #
 # --------------------------------------------------------------------------- #
 
+
 def _run_main(argv):
     buf = io.StringIO()
     with redirect_stdout(buf):
@@ -1245,6 +2217,36 @@ def test_main_new_then_list_text_and_json(tmp: Path):
         rc, out = _run_main(["list", "--json"])
         rows = json.loads(out)
         assert rc == 0 and rows[0]["project"] == "P" and rows[0]["workers"] == 2
+        assert rows[0]["coordination_mode"] == "reasoning_first_v1"
+
+
+def test_main_new_mode_specific_default_roles(tmp: Path):
+    with _project_env(tmp), _patch_spawn():
+        rc, out = _run_main(["new", "R"])
+        assert rc == 0 and "created R with 7 workers" in out
+        reasoning = json.loads(
+            (L.project_dir("R") / "project.json").read_text(encoding="utf-8")
+        )
+        assert reasoning["roles"] == "max:2,high:5"
+        rc, out = _run_main(["new", "L", "--coordination", "legacy"])
+        assert rc == 0 and "created L with 7 workers" in out
+        legacy = json.loads(
+            (L.project_dir("L") / "project.json").read_text(encoding="utf-8")
+        )
+        assert legacy["roles"] == "high:3,xhigh:4"
+
+
+def test_main_new_explicit_legacy_coordination(tmp: Path):
+    with _project_env(tmp), _patch_spawn():
+        rc, _out = _run_main(
+            ["new", "L", "--roles", "high:1", "--coordination", "legacy"]
+        )
+        assert rc == 0
+        metadata = json.loads(
+            (L.project_dir("L") / "project.json").read_text(encoding="utf-8")
+        )
+        assert metadata["coordination"] == {"mode": "legacy"}
+        assert not (L.project_dir("L") / ".coordination").exists()
 
 
 def test_main_assign(tmp: Path):
@@ -1253,6 +2255,27 @@ def test_main_assign(tmp: Path):
         rc, out = _run_main(["assign", "P/high", "--task", "prove lemma 4"])
         assert rc == 0 and "assigned P/high" in out
         assert _wl("P", "high").task.read_text() == "prove lemma 4\n"
+
+
+def test_main_resolve_recommendation_dispatch(tmp: Path):
+    with _project_env(tmp):
+        cli.do_new("P", roles="xhigh:2")
+        _store, recommendation_id = _terminal_recommendation("P")
+        rc, out = _run_main(
+            [
+                "resolve-recommendation",
+                "P",
+                "--recommendation-id",
+                recommendation_id,
+                "--resolution",
+                "continue-without-advisor",
+                "--acknowledge-recommendation-id",
+                recommendation_id,
+                "--acknowledge-resume-paid-reasoning",
+            ]
+        )
+        assert rc == 0
+        assert f"owner-resolved recommendation {recommendation_id}" in out
 
 
 def test_main_start_status_stop(tmp: Path):
@@ -1283,6 +2306,7 @@ def test_main_stop_force_not_running(tmp: Path):
 # python -m danus.orchestration  (the __main__ entry point)                     #
 # --------------------------------------------------------------------------- #
 
+
 def test_dunder_main_entrypoint(tmp: Path):
     """Exercise ``__main__.py`` via runpy with a mocked ``main`` so no real verb
     runs. Asserts it calls ``sys.exit`` with main()'s return code."""
@@ -1299,6 +2323,7 @@ def test_dunder_main_entrypoint(tmp: Path):
     old_argv = None
     try:
         import sys
+
         old_argv = sys.argv[:]
         sys.argv = ["danus", "list"]
         try:
@@ -1310,6 +2335,7 @@ def test_dunder_main_entrypoint(tmp: Path):
         climod.main = orig
         if old_argv is not None:
             import sys
+
             sys.argv = old_argv
 
 
@@ -1317,12 +2343,17 @@ def test_dunder_main_entrypoint(tmp: Path):
 # runner (standalone parity with test_orchestration.py)                         #
 # --------------------------------------------------------------------------- #
 
+
 def main() -> None:
     no_arg = [
-        test_fmt_list_empty_and_rows, test_fmt_status_rows,
-        test_task_from_args_task, test_task_from_args_stdin,
-        test_task_from_args_none_raises, test_build_parser_all_verbs,
-        test_alive_permission_error_means_alive, test_alive_zombie_is_dead,
+        test_fmt_list_empty_and_rows,
+        test_fmt_status_rows,
+        test_task_from_args_task,
+        test_task_from_args_stdin,
+        test_task_from_args_none_raises,
+        test_build_parser_all_verbs,
+        test_alive_permission_error_means_alive,
+        test_alive_zombie_is_dead,
         test_darwin_libproc_birth_token_uses_microseconds_and_fails_closed,
         test_cleanup_unregistered_child_kills_and_waitpid_reaps,
     ]
@@ -1333,24 +2364,38 @@ def main() -> None:
         test_stop_one_force_sigkill_killpg_raises,
         test_alive_proc_read_failure_defaults_alive,
         test_stop_one_pid_reuse_mismatch_never_signals,
-        test_read_pid_missing_and_garbage, test_read_status_missing_and_bad_json,
-        test_worker_status_stuck_label, test_worker_status_working_and_dead_labels,
-        test_do_start_calls_spawn_with_worker_dir, test_do_start_locked_returns_locked,
-        test_do_start_clears_stale_stop, test_do_start_no_workers_raises,
+        test_read_pid_missing_and_garbage,
+        test_read_status_missing_and_bad_json,
+        test_worker_status_stuck_label,
+        test_worker_status_working_and_dead_labels,
+        test_do_start_calls_spawn_with_worker_dir,
+        test_do_start_locked_returns_locked,
+        test_do_start_clears_stale_stop,
+        test_do_start_no_workers_raises,
         test_start_and_stop_fail_closed_on_legacy_pid_without_side_effects,
         test_legacy_pid_status_is_explicit_and_public_lifecycle_is_actionable,
         test_pid_record_write_failure_cleans_unregistered_child,
         test_fast_child_exit_after_pid_write_removes_matching_record_and_reaps,
-        test_do_start_project_wide_stagger, test_do_status_no_workers_raises,
-        test_do_stop_no_workers_raises, test_stop_one_not_running_graceful,
-        test_stop_one_not_running_force_cleans_pid, test_stop_one_graceful_touches_stop,
-        test_stop_one_force_kills_a_real_child, test_do_list_bad_project_json,
-        test_do_list_missing_project_json, test_task_from_args_file,
-        test_finalize_validates_and_writes, test_finalize_dedups_preserving_order,
-        test_finalize_rejects_unknown_fact_id, test_finalize_rejects_unknown_project,
-        test_finalize_suggestion_mode_writes_nothing, test_main_finalize_write_and_suggest,
-        test_main_new_then_list_text_and_json, test_main_assign,
-        test_main_start_status_stop, test_main_stop_force_not_running,
+        test_do_start_project_wide_stagger,
+        test_do_status_no_workers_raises,
+        test_do_stop_no_workers_raises,
+        test_stop_one_not_running_graceful,
+        test_stop_one_not_running_force_cleans_pid,
+        test_stop_one_graceful_touches_stop,
+        test_stop_one_force_kills_a_real_child,
+        test_do_list_bad_project_json,
+        test_do_list_missing_project_json,
+        test_task_from_args_file,
+        test_finalize_validates_and_writes,
+        test_finalize_dedups_preserving_order,
+        test_finalize_rejects_unknown_fact_id,
+        test_finalize_rejects_unknown_project,
+        test_finalize_suggestion_mode_writes_nothing,
+        test_main_finalize_write_and_suggest,
+        test_main_new_then_list_text_and_json,
+        test_main_assign,
+        test_main_start_status_stop,
+        test_main_stop_force_not_running,
         test_dunder_main_entrypoint,
     ]
     for t in no_arg:

@@ -39,6 +39,10 @@ from danus.owned_child import (
     stop_owned_child,
 )
 from danus.redaction import redact_external_error
+from danus.reasoning_telemetry import (
+    TurnReasoningBandwidth,
+    token_usage_cumulative_total_changed,
+)
 
 
 MAX_JSONL_BYTES = 8 * 1024 * 1024
@@ -49,10 +53,43 @@ MAX_RETAINED_NOTIFICATIONS = 20_000
 MAX_ROUND_AUDIT_BYTES = 8 * 1024 * 1024
 MAX_MODEL_REROUTES_PER_TURN = 8
 MAX_MODEL_REROUTE_FIELD_BYTES = 2048
+# One app-server client belongs to one worker round and therefore one legal paid
+# turn.  A small allowance preserves bounded stale-notification/recovery
+# diagnostics without letting arbitrary provider-supplied thread/turn identities
+# grow the client-owned state maps without limit.
+MAX_TRACKED_TURN_IDENTITIES_PER_CLIENT = 16
+MAX_OBSERVED_CLIENT_IDS_PER_CLIENT = 4096
 MAX_FRONTIER_VISIBLE_IDS = 128
 DEFAULT_RPC_TIMEOUT = 30.0
 HOST_LIVENESS_POLL_SECONDS = 0.1
 _TARGET_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+_COORDINATION_SLOT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")
+_COORDINATION_LANES = {"root", "critic"}
+_COORDINATION_TERMINAL_DISPOSITIONS = {
+    0: "completed",
+    123: "protocol_failure",
+    124: "hard_timeout",
+    125: "model_rerouted_or_unattested",
+    130: "owner_stop",
+}
+_COORDINATION_OPERATOR_DISPOSITIONS = {
+    "cancelled_not_dispatched": {
+        "terminal_status": "owner_cancelled_not_dispatched",
+        "coordination_outcome": "operator_cancelled_not_dispatched",
+        "effective_adapter_rc": 126,
+        "disposition": "owner_cancelled_not_dispatched",
+        "prior_states": {"prepared"},
+        "acknowledged_paid_outcome_unknown": 0,
+    },
+    "abandoned_outcome_unknown": {
+        "terminal_status": "owner_abandoned_outcome_unknown",
+        "coordination_outcome": "operator_abandoned_outcome_unknown",
+        "effective_adapter_rc": 126,
+        "disposition": "owner_abandoned_outcome_unknown",
+        "prior_states": {"dispatching", "started", "delivery_unknown"},
+        "acknowledged_paid_outcome_unknown": 1,
+    },
+}
 _LEDGER_LOCK_REGISTRY_GUARD = threading.Lock()
 _LEDGER_PROCESS_LOCKS: dict[str, Any] = {}
 
@@ -216,8 +253,11 @@ class AppServerClient:
         self._notification_seq = 0
         self._closed: Optional[BaseException] = None
         self._active_turns: dict[str, str] = {}
+        self._thread_turn_bindings: dict[str, str] = {}
+        self._tracked_turn_identities: set[tuple[str, str]] = set()
         self._terminal_turns: dict[tuple[str, str], dict[str, Any]] = {}
         self._token_usage: dict[tuple[str, str], dict[str, Any]] = {}
+        self._reasoning_bandwidth: dict[tuple[str, str], TurnReasoningBandwidth] = {}
         self._model_reroutes: dict[tuple[str, str], dict[str, Any]] = {}
         self._observed_client_ids: set[str] = set()
 
@@ -302,9 +342,7 @@ class AppServerClient:
         if not terminal:
             return
 
-        failure = OwnedChildHostLost(
-            "app-server owned-child host exited unexpectedly"
-        )
+        failure = OwnedChildHostLost("app-server owned-child host exited unexpectedly")
         self._mark_closed(failure)
         cleanup_error: Optional[BaseException] = None
         with self._host_shutdown_lock:
@@ -325,9 +363,12 @@ class AppServerClient:
         proc = self._proc
         if proc is None or proc.stdin is None:
             raise AppServerClosed("app-server is not running")
-        encoded = json.dumps(
-            payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
-        ).encode("utf-8") + b"\n"
+        encoded = (
+            json.dumps(
+                payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+            ).encode("utf-8")
+            + b"\n"
+        )
         if len(encoded) > self.max_line_bytes:
             raise ProtocolError("outgoing app-server JSONL exceeds hard limit")
         with self._write_lock:
@@ -411,7 +452,9 @@ class AppServerClient:
                 )
             request_id = message.get("id")
             if isinstance(request_id, bool) or not isinstance(request_id, int):
-                raise ProtocolError("app-server response id is not a non-boolean integer")
+                raise ProtocolError(
+                    "app-server response id is not a non-boolean integer"
+                )
             with self._state:
                 pending = self._pending.pop(request_id, None)
                 if pending is None:
@@ -500,10 +543,17 @@ class AppServerClient:
             thread_id = self._exact_identity(thread_id, "turn/started threadId")
             turn_id = self._exact_identity(turn.get("id"), "turn/started turn.id")
             if turn.get("status") != "inProgress":
+                raise ProtocolError("turn/started notification has a non-active status")
+            prior_active = self._active_turns.get(thread_id)
+            if prior_active is not None and prior_active != turn_id:
                 raise ProtocolError(
-                    "turn/started notification has a non-active status"
+                    "turn/started conflicts with another active turn for this thread"
                 )
+            self._track_turn_identity_unlocked(thread_id, turn_id, bind_thread=True)
             self._active_turns[thread_id] = turn_id
+            self._reasoning_bandwidth.setdefault(
+                (thread_id, turn_id), TurnReasoningBandwidth()
+            )
         elif method == "turn/completed":
             turn = params.get("turn")
             if not isinstance(turn, dict):
@@ -514,19 +564,60 @@ class AppServerClient:
                 raise ProtocolError(
                     "turn/completed notification has a non-terminal status"
                 )
+            self._track_turn_identity_unlocked(thread_id, turn_id)
             self._terminal_turns[(thread_id, turn_id)] = dict(turn)
+            telemetry = self._reasoning_bandwidth.setdefault(
+                (thread_id, turn_id), TurnReasoningBandwidth()
+            )
+            try:
+                telemetry.reconcile_terminal_items(turn.get("items"))
+            except Exception:
+                telemetry.degrade("internal_terminal_telemetry_error")
             if self._active_turns.get(thread_id) == turn_id:
                 self._active_turns.pop(thread_id, None)
         elif method == "thread/tokenUsage/updated":
             turn_id = params.get("turnId")
             usage = params.get("tokenUsage")
-            thread_id = self._exact_identity(thread_id, "token usage threadId")
-            turn_id = self._exact_identity(turn_id, "token usage turnId")
-            canonical = self._canonical_token_usage(usage)
-            # Mutate the retained notification to the allowlisted projection;
-            # arbitrary provider extras can never enter later audit paths.
-            params["tokenUsage"] = canonical
-            self._token_usage[(thread_id, turn_id)] = canonical
+            telemetry: Optional[TurnReasoningBandwidth] = None
+            try:
+                exact_thread_id = self._exact_identity(
+                    thread_id, "token usage threadId"
+                )
+                exact_turn_id = self._exact_identity(turn_id, "token usage turnId")
+            except Exception:
+                exact_thread_id = None
+                exact_turn_id = None
+            if exact_thread_id is not None and exact_turn_id is not None:
+                # A valid new identity is lifecycle state, not optional
+                # observability.  Overflow must escape the telemetry-degradation
+                # path so the reader fail-stops the malformed provider stream.
+                self._track_turn_identity_unlocked(exact_thread_id, exact_turn_id)
+                telemetry = self._reasoning_bandwidth.setdefault(
+                    (exact_thread_id, exact_turn_id), TurnReasoningBandwidth()
+                )
+            try:
+                if exact_thread_id is None or exact_turn_id is None:
+                    raise ProtocolError(
+                        "token usage notification identity is malformed"
+                    )
+                canonical = self._canonical_token_usage(usage)
+                previous = self._token_usage.get((exact_thread_id, exact_turn_id))
+                changed = token_usage_cumulative_total_changed(previous, canonical)
+                if changed:
+                    telemetry.observe_usage_growth(canonical["last"])
+                # Mutate the retained notification to the allowlisted projection;
+                # arbitrary provider extras can never enter later audit paths.
+                params["tokenUsage"] = canonical
+                self._token_usage[(exact_thread_id, exact_turn_id)] = canonical
+            except Exception:
+                # Token notifications are observability, never proof-state
+                # causality.  Drop all raw provider fields and mark the exact
+                # turn partial when it can be identified.
+                params["tokenUsage"] = {"unavailable": True}
+                if telemetry is None:
+                    telemetry = self._active_reasoning_bandwidth_unlocked(thread_id)
+                if telemetry is not None:
+                    telemetry.degrade("token_usage_notification_unavailable")
         elif method == "model/rerouted":
             required = ("fromModel", "reason", "threadId", "toModel", "turnId")
             if any(not isinstance(params.get(name), str) for name in required):
@@ -535,27 +626,127 @@ class AppServerClient:
                 raise ProtocolError("model/rerouted notification has an empty field")
             if params["reason"] != "highRiskCyberActivity":
                 raise ProtocolError("model/rerouted notification has an unknown reason")
-            turn_id = self._exact_identity(
-                params["turnId"], "model/rerouted turnId"
-            )
+            turn_id = self._exact_identity(params["turnId"], "model/rerouted turnId")
             thread_id = self._exact_identity(
                 params["threadId"], "model/rerouted threadId"
             )
+            self._track_turn_identity_unlocked(thread_id, turn_id)
             self._record_model_reroute_unlocked(thread_id, turn_id, params)
             # Retained notification snapshots are observability projections,
             # not a raw provider-metadata channel.
             for name in ("fromModel", "reason", "toModel"):
                 params[name] = redact_external_error(params[name])
-        elif method == "item/completed":
-            self._exact_identity(thread_id, "item/completed threadId")
-            self._exact_identity(params.get("turnId"), "item/completed turnId")
+        elif method in {"item/completed", "item/started"}:
+            turn_id = params.get("turnId")
             item = params.get("item")
-            if isinstance(item, dict) and item.get("type") == "userMessage":
+            # Delivery reconciliation for owner userMessage items remains a
+            # strict protocol path.  Timing/type telemetry around every other
+            # item is diagnostic and degrades rather than killing the turn.
+            if (
+                method == "item/completed"
+                and isinstance(item, dict)
+                and item.get("type") == "userMessage"
+            ):
+                self._exact_identity(thread_id, "item/completed threadId")
+                self._exact_identity(turn_id, "item/completed turnId")
                 client_id = item.get("clientId")
                 if client_id is not None:
-                    self._observed_client_ids.add(
+                    self._observe_client_id_unlocked(
                         self._exact_identity(client_id, "userMessage clientId")
                     )
+            telemetry = None
+            try:
+                exact_thread = self._exact_identity(thread_id, f"{method} threadId")
+                exact_turn = self._exact_identity(turn_id, f"{method} turnId")
+            except Exception:
+                exact_thread = None
+                exact_turn = None
+            if exact_thread is not None and exact_turn is not None:
+                # As for token usage, a valid identity that exceeds the global
+                # client cap is a protocol failure rather than degradable timing
+                # telemetry.
+                self._track_turn_identity_unlocked(exact_thread, exact_turn)
+                telemetry = self._reasoning_bandwidth.setdefault(
+                    (exact_thread, exact_turn), TurnReasoningBandwidth()
+                )
+            try:
+                if exact_thread is None or exact_turn is None:
+                    raise ProtocolError(f"{method} identity is malformed")
+                if method == "item/started":
+                    telemetry.observe_start(item, params.get("startedAtMs"))
+                else:
+                    telemetry.observe_completion(
+                        item,
+                        params.get("completedAtMs"),
+                        source="notification",
+                    )
+            except Exception:
+                if telemetry is None:
+                    telemetry = self._active_reasoning_bandwidth_unlocked(thread_id)
+                if telemetry is not None:
+                    telemetry.malformed_notification_count += 1
+                    telemetry.degrade("internal_item_telemetry_error")
+
+    def _track_turn_identity_unlocked(
+        self, thread_id: str, turn_id: str, *, bind_thread: bool = False
+    ) -> None:
+        """Admit one provider identity into all client-owned turn state.
+
+        ``_state`` must be held by the caller.  Overflow is deliberately fatal:
+        silently evicting an active or just-terminal paid turn could retarget a
+        HotJoin delivery or erase the only local recovery evidence.  Only an
+        authoritative ``turn/started`` or explicit recovery adoption binds a
+        thread permanently for this client/worker round. Late terminal and
+        telemetry identities remain auditable under the total cap without
+        changing that routing provenance.
+        """
+
+        bound_turn_id = self._thread_turn_bindings.get(thread_id)
+        if bind_thread and bound_turn_id is not None and bound_turn_id != turn_id:
+            raise ProtocolError(
+                "app-server thread is already bound to another turn identity"
+            )
+        identity = (thread_id, turn_id)
+        if bind_thread and identity in self._terminal_turns:
+            raise ProtocolError(
+                "app-server terminal turn identity cannot be reactivated"
+            )
+        if (
+            identity not in self._tracked_turn_identities
+            and len(self._tracked_turn_identities)
+            >= MAX_TRACKED_TURN_IDENTITIES_PER_CLIENT
+        ):
+            raise ProtocolError("app-server turn identity tracking exceeds hard limit")
+        if bind_thread and bound_turn_id is None:
+            self._thread_turn_bindings[thread_id] = turn_id
+        self._tracked_turn_identities.add(identity)
+
+    def _observe_client_id_unlocked(self, client_id: str) -> None:
+        """Retain one exact owner-message identity under a client-wide cap."""
+
+        if client_id in self._observed_client_ids:
+            return
+        if len(self._observed_client_ids) >= MAX_OBSERVED_CLIENT_IDS_PER_CLIENT:
+            raise ProtocolError(
+                "app-server observed client-id tracking exceeds hard limit"
+            )
+        self._observed_client_ids.add(client_id)
+
+    def _active_reasoning_bandwidth_unlocked(
+        self, thread_id: object
+    ) -> Optional[TurnReasoningBandwidth]:
+        if isinstance(thread_id, str):
+            turn_id = self._active_turns.get(thread_id)
+            if turn_id is not None:
+                return self._reasoning_bandwidth.setdefault(
+                    (thread_id, turn_id), TurnReasoningBandwidth()
+                )
+        if len(self._active_turns) == 1:
+            active_thread, active_turn = next(iter(self._active_turns.items()))
+            return self._reasoning_bandwidth.setdefault(
+                (active_thread, active_turn), TurnReasoningBandwidth()
+            )
+        return None
 
     @staticmethod
     def _exact_identity(value: object, label: str) -> str:
@@ -670,10 +861,19 @@ class AppServerClient:
 
     def adopt_active_turn(self, thread_id: str, turn_id: str) -> None:
         """Seed state from an authoritative thread/resume response after crash."""
-        if not thread_id or not turn_id:
-            raise ValueError("thread and turn ids must be non-empty")
         with self._state:
+            thread_id = self._exact_identity(thread_id, "adopted active thread id")
+            turn_id = self._exact_identity(turn_id, "adopted active turn id")
+            prior_active = self._active_turns.get(thread_id)
+            if prior_active is not None and prior_active != turn_id:
+                raise ProtocolError(
+                    "adopted active turn conflicts with another active turn"
+                )
+            self._track_turn_identity_unlocked(thread_id, turn_id, bind_thread=True)
             self._active_turns[thread_id] = turn_id
+            self._reasoning_bandwidth.setdefault(
+                (thread_id, turn_id), TurnReasoningBandwidth()
+            )
             self._state.notify_all()
 
     def observed_client_id(self, client_id: str) -> bool:
@@ -684,6 +884,37 @@ class AppServerClient:
         with self._state:
             usage = self._token_usage.get((thread_id, turn_id))
             return dict(usage) if usage is not None else None
+
+    def reasoning_bandwidth(
+        self,
+        thread_id: str,
+        turn_id: str,
+        terminal: Optional[Mapping[str, Any]] = None,
+    ) -> dict[str, Any]:
+        """Return one bounded, content-free diagnostic snapshot."""
+        with self._state:
+            telemetry = self._reasoning_bandwidth.get((thread_id, turn_id))
+            if telemetry is None:
+                telemetry = TurnReasoningBandwidth()
+                telemetry.degrade("reasoning_telemetry_unavailable")
+            if terminal is not None:
+                try:
+                    telemetry.reconcile_terminal_items(terminal.get("items"))
+                except Exception:
+                    telemetry.degrade("internal_terminal_telemetry_error")
+                duration_ms = terminal.get("durationMs")
+            else:
+                duration_ms = None
+            try:
+                return telemetry.summary(duration_ms)
+            except Exception:
+                return {
+                    "schema": "danus_reasoning_bandwidth_v1",
+                    "scope": "root_thread_only",
+                    "finality": "partial",
+                    "finality_reasons": ["internal_reasoning_telemetry_error"],
+                    "growth_samples_are_not_schema_attested_inferences": True,
+                }
 
     def model_reroutes(self, thread_id: str, turn_id: str) -> dict[str, Any]:
         """Return a bounded snapshot scoped to one exact thread and turn."""
@@ -790,9 +1021,7 @@ class AppServerClient:
                         raise TimeoutError(
                             "timed out waiting for app-server notification"
                         )
-                    self._state.wait(
-                        min(HOST_LIVENESS_POLL_SECONDS, remaining)
-                    )
+                    self._state.wait(min(HOST_LIVENESS_POLL_SECONDS, remaining))
             if found is not None:
                 self.ensure_owned_host_alive()
                 return found
@@ -853,9 +1082,7 @@ class AppServerClient:
                     deadline = time.monotonic() + max(0.0, grace)
                     while time.monotonic() < deadline:
                         if owned_child_exited_no_reap(proc):
-                            stop_owned_child(
-                                proc, grace=max(5.0, grace + 4.0)
-                            )
+                            stop_owned_child(proc, grace=max(5.0, grace + 4.0))
                             break
                         time.sleep(0.02)
                     if proc.returncode is None:
@@ -863,7 +1090,10 @@ class AppServerClient:
                 else:
                     request_owned_child_stop(proc)
         finally:
-            if self._reader is not None and self._reader is not threading.current_thread():
+            if (
+                self._reader is not None
+                and self._reader is not threading.current_thread()
+            ):
                 self._reader.join(timeout=grace)
             if self._stderr_handle is not None:
                 self._stderr_handle.close()
@@ -889,7 +1119,9 @@ def _validate_schema_bundle(root: Path) -> None:
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
-            raise ProtocolError(f"missing/invalid app-server schema {relative}: {exc}") from exc
+            raise ProtocolError(
+                f"missing/invalid app-server schema {relative}: {exc}"
+            ) from exc
         if not isinstance(data, dict):
             raise ProtocolError(f"app-server schema {relative} is not an object")
         return data
@@ -901,9 +1133,9 @@ def _validate_schema_bundle(root: Path) -> None:
         properties: set[str],
     ) -> dict[str, Any]:
         data = load(relative)
-        if not required.issubset(set(data.get("required", []))) or not properties.issubset(
-            set(data.get("properties", {}))
-        ):
+        if not required.issubset(
+            set(data.get("required", []))
+        ) or not properties.issubset(set(data.get("properties", {}))):
             raise ProtocolError(f"Codex app-server {relative} contract is incompatible")
         return data
 
@@ -915,7 +1147,9 @@ def _validate_schema_bundle(root: Path) -> None:
             data.get("definitions", {}).get("TurnStatus", {}).get("enum", [])
         )
         if statuses != {"completed", "interrupted", "failed", "inProgress"}:
-            raise ProtocolError(f"Codex app-server {relative} has incompatible turn states")
+            raise ProtocolError(
+                f"Codex app-server {relative} has incompatible turn states"
+            )
 
     def require_thread(data: dict[str, Any], relative: str) -> None:
         thread = data.get("definitions", {}).get("Thread", {})
@@ -944,9 +1178,7 @@ def _validate_schema_bundle(root: Path) -> None:
             (
                 variant
                 for variant in sandbox_variants
-                if variant.get("properties", {})
-                .get("type", {})
-                .get("enum")
+                if variant.get("properties", {}).get("type", {}).get("enum")
                 == ["workspaceWrite"]
             ),
             None,
@@ -973,7 +1205,9 @@ def _validate_schema_bundle(root: Path) -> None:
             for variant in variants
         )
         if not supported:
-            raise ProtocolError(f"Codex app-server {relative} lacks userMessage.clientId")
+            raise ProtocolError(
+                f"Codex app-server {relative} lacks userMessage.clientId"
+            )
 
     thread_start = load("v2/ThreadStartParams.json")
     if not {
@@ -992,7 +1226,10 @@ def _validate_schema_bundle(root: Path) -> None:
         .get("$ref")
     )
     sandbox_def = thread_start.get("definitions", {}).get("SandboxMode", {})
-    if sandbox != "#/definitions/SandboxMode" or "workspace-write" not in sandbox_def.get("enum", []):
+    if (
+        sandbox != "#/definitions/SandboxMode"
+        or "workspace-write" not in sandbox_def.get("enum", [])
+    ):
         raise ProtocolError("Codex thread/start lacks workspace-write sandbox support")
     require_thread_runtime_response("v2/ThreadStartResponse.json")
 
@@ -1060,9 +1297,10 @@ def _validate_schema_bundle(root: Path) -> None:
     )
     read_params = load("v2/ThreadReadParams.json")
     include_turns = read_params.get("properties", {}).get("includeTurns", {})
-    if include_turns.get("type") != "boolean" or "include turns" not in str(
-        include_turns.get("description", "")
-    ).lower():
+    if (
+        include_turns.get("type") != "boolean"
+        or "include turns" not in str(include_turns.get("description", "")).lower()
+    ):
         raise ProtocolError("Codex thread/read lacks bounded includeTurns control")
     read_response = require_shape(
         "v2/ThreadReadResponse.json", required={"thread"}, properties={"thread"}
@@ -1097,17 +1335,22 @@ def _validate_schema_bundle(root: Path) -> None:
         )
         require_turn(notification, relative)
     require_shape(
+        "v2/ItemStartedNotification.json",
+        required={"threadId", "turnId", "item", "startedAtMs"},
+        properties={"threadId", "turnId", "item", "startedAtMs"},
+    )
+    require_shape(
         "v2/ItemCompletedNotification.json",
-        required={"threadId", "turnId", "item"},
-        properties={"threadId", "turnId", "item"},
+        required={"threadId", "turnId", "item", "completedAtMs"},
+        properties={"threadId", "turnId", "item", "completedAtMs"},
     )
     token_notification = require_shape(
         "v2/ThreadTokenUsageUpdatedNotification.json",
         required={"threadId", "turnId", "tokenUsage"},
         properties={"threadId", "turnId", "tokenUsage"},
     )
-    token_ref = token_notification.get("properties", {}).get("tokenUsage", {}).get(
-        "$ref"
+    token_ref = (
+        token_notification.get("properties", {}).get("tokenUsage", {}).get("$ref")
     )
     if not isinstance(token_ref, str) or not token_ref.startswith("#/definitions/"):
         raise ProtocolError("Codex token usage schema lacks a local definition")
@@ -1140,9 +1383,10 @@ def _validate_schema_bundle(root: Path) -> None:
         "totalTokens",
     }
     allowed_counts = required_counts | {"cacheWriteInputTokens"}
-    if set(breakdown.get("required", [])) != required_counts or set(
-        breakdown.get("properties", {})
-    ) != allowed_counts:
+    if (
+        set(breakdown.get("required", [])) != required_counts
+        or set(breakdown.get("properties", {})) != allowed_counts
+    ):
         raise ProtocolError("Codex token usage breakdown fields are incompatible")
     if any(
         breakdown["properties"][name].get("type") != "integer"
@@ -1159,8 +1403,7 @@ def _validate_schema_bundle(root: Path) -> None:
         raise ProtocolError("Codex model/rerouted contract is incompatible")
     rerouted_properties = rerouted["properties"]
     if not all(
-        isinstance(rerouted_properties.get(name), dict)
-        for name in rerouted_fields
+        isinstance(rerouted_properties.get(name), dict) for name in rerouted_fields
     ) or any(
         rerouted_properties[name].get("type") != "string"
         for name in ("fromModel", "threadId", "toModel", "turnId")
@@ -1194,6 +1437,7 @@ def _validate_schema_bundle(root: Path) -> None:
     for method in (
         "turn/started",
         "turn/completed",
+        "item/started",
         "item/completed",
         "thread/tokenUsage/updated",
         "model/rerouted",
@@ -1381,7 +1625,8 @@ class HotJoinStore:
                 CREATE TABLE IF NOT EXISTS worker_thread_events (
                     seq INTEGER PRIMARY KEY AUTOINCREMENT,
                     target TEXT NOT NULL,
-                    action TEXT NOT NULL CHECK(action IN ('set','cleared','rotated')),
+                    action TEXT NOT NULL CHECK(action IN
+                        ('set','cleared','rotated','retired_coordination_terminal')),
                     thread_id TEXT NOT NULL,
                     detail TEXT,
                     created_ns INTEGER NOT NULL
@@ -1393,6 +1638,9 @@ class HotJoinStore:
                     prompt_sha256 TEXT NOT NULL,
                     requested_model TEXT NOT NULL,
                     requested_effort TEXT NOT NULL,
+                    coordination_slot_id TEXT,
+                    coordination_generation INTEGER,
+                    coordination_lane TEXT,
                     turn_id TEXT,
                     state TEXT NOT NULL CHECK(state IN
                         ('prepared','dispatching','started','completed','failed',
@@ -1424,6 +1672,26 @@ class HotJoinStore:
                     payload_sha256 TEXT NOT NULL,
                     created_ns INTEGER NOT NULL,
                     UNIQUE(client_id,kind,payload_sha256)
+                );
+                CREATE TABLE IF NOT EXISTS round_terminal_receipts (
+                    receipt_sha256 TEXT PRIMARY KEY,
+                    coordination_slot_id TEXT NOT NULL UNIQUE,
+                    client_id TEXT NOT NULL UNIQUE
+                        REFERENCES round_intents(client_id),
+                    target TEXT NOT NULL,
+                    coordination_generation INTEGER NOT NULL,
+                    coordination_lane TEXT NOT NULL,
+                    thread_id TEXT NOT NULL,
+                    turn_id TEXT NOT NULL,
+                    prompt_sha256 TEXT NOT NULL,
+                    requested_model TEXT NOT NULL,
+                    requested_effort TEXT NOT NULL,
+                    effective_adapter_rc INTEGER NOT NULL,
+                    disposition TEXT NOT NULL,
+                    terminal_status TEXT NOT NULL,
+                    audit_payload_sha256 TEXT NOT NULL,
+                    thread_retirement_event_seq INTEGER NOT NULL UNIQUE,
+                    created_ns INTEGER NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS round_operator_events (
                     seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1458,14 +1726,49 @@ class HotJoinStore:
                 str(row["name"])
                 for row in db.execute("PRAGMA table_info(round_intents)").fetchall()
             }
-            for name in ("prompt_sha256", "requested_model", "requested_effort"):
+            legacy_columns = {
+                "prompt_sha256": "TEXT",
+                "requested_model": "TEXT",
+                "requested_effort": "TEXT",
+                "coordination_slot_id": "TEXT",
+                "coordination_generation": "INTEGER",
+                "coordination_lane": "TEXT",
+            }
+            for name, column_type in legacy_columns.items():
                 if name not in columns:
-                    db.execute(f"ALTER TABLE round_intents ADD COLUMN {name} TEXT")
+                    db.execute(
+                        f"ALTER TABLE round_intents ADD COLUMN {name} {column_type}"
+                    )
+            terminal_receipt_columns = {
+                str(row["name"])
+                for row in db.execute(
+                    "PRAGMA table_info(round_terminal_receipts)"
+                ).fetchall()
+            }
+            if "thread_retirement_event_seq" not in terminal_receipt_columns:
+                db.execute(
+                    "ALTER TABLE round_terminal_receipts ADD COLUMN "
+                    "thread_retirement_event_seq INTEGER"
+                )
+            db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "one_terminal_receipt_per_thread_retirement "
+                "ON round_terminal_receipts(thread_retirement_event_seq) "
+                "WHERE thread_retirement_event_seq IS NOT NULL"
+            )
+            db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "one_round_intent_per_coordination_slot "
+                "ON round_intents(coordination_slot_id) "
+                "WHERE coordination_slot_id IS NOT NULL"
+            )
             event_schema = db.execute(
                 "SELECT sql FROM sqlite_master WHERE type='table' "
                 "AND name='worker_thread_events'"
             ).fetchone()
-            if event_schema is None or "'rotated'" not in str(event_schema["sql"]):
+            if event_schema is None or "'retired_coordination_terminal'" not in str(
+                event_schema["sql"]
+            ):
                 # This protected table is append-only and has no inbound foreign
                 # keys. Rebuild it transactionally so existing ledgers gain the
                 # explicit rotation action without losing event sequence ids.
@@ -1478,7 +1781,7 @@ class HotJoinStore:
                     "seq INTEGER PRIMARY KEY AUTOINCREMENT,"
                     "target TEXT NOT NULL,"
                     "action TEXT NOT NULL CHECK(action IN "
-                    "('set','cleared','rotated')),"
+                    "('set','cleared','rotated','retired_coordination_terminal')),"
                     "thread_id TEXT NOT NULL,detail TEXT,created_ns INTEGER NOT NULL)"
                 )
                 db.execute(
@@ -1488,13 +1791,62 @@ class HotJoinStore:
                     "FROM worker_thread_events_before_rotation ORDER BY seq"
                 )
                 db.execute("DROP TABLE worker_thread_events_before_rotation")
+            operator_receipt_columns = (
+                "(receipt_sha256 TEXT PRIMARY KEY,"
+                "coordination_slot_id TEXT NOT NULL UNIQUE,"
+                "client_id TEXT NOT NULL UNIQUE REFERENCES round_intents(client_id),"
+                "target TEXT NOT NULL,coordination_generation INTEGER NOT NULL,"
+                "coordination_lane TEXT NOT NULL,thread_id TEXT NOT NULL,turn_id TEXT,"
+                "prompt_sha256 TEXT NOT NULL,requested_model TEXT NOT NULL,"
+                "requested_effort TEXT NOT NULL,operator_event_seq INTEGER NOT NULL "
+                "UNIQUE REFERENCES round_operator_events(seq),"
+                "operator_action TEXT NOT NULL,prior_state TEXT NOT NULL,"
+                "acknowledged_paid_outcome_unknown INTEGER NOT NULL,"
+                "reason_sha256 TEXT NOT NULL,terminal_status TEXT NOT NULL,"
+                "coordination_outcome TEXT NOT NULL,effective_adapter_rc INTEGER NOT NULL,"
+                "disposition TEXT NOT NULL,created_ns INTEGER NOT NULL)"
+            )
+            operator_receipt_table = "round_coordination_operator_receipts"
+            receipt_columns = (
+                "receipt_sha256,coordination_slot_id,client_id,target,"
+                "coordination_generation,coordination_lane,thread_id,turn_id,"
+                "prompt_sha256,requested_model,requested_effort,"
+                "operator_event_seq,operator_action,prior_state,"
+                "acknowledged_paid_outcome_unknown,reason_sha256,"
+                "terminal_status,coordination_outcome,effective_adapter_rc,"
+                "disposition,created_ns"
+            )
+
+            def rebuild_operator_receipt_table(stale_table: str) -> None:
+                if (
+                    db.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                        (stale_table,),
+                    ).fetchone()
+                    is not None
+                ):
+                    db.rollback()
+                    raise HotJoinError(
+                        "coordination operator receipt FK repair is ambiguous"
+                    )
+                db.execute(
+                    f"ALTER TABLE {operator_receipt_table} RENAME TO {stale_table}"
+                )
+                db.execute(
+                    f"CREATE TABLE {operator_receipt_table} {operator_receipt_columns}"
+                )
+                db.execute(
+                    f"INSERT INTO {operator_receipt_table}({receipt_columns}) "
+                    f"SELECT {receipt_columns} FROM {stale_table}"
+                )
+                db.execute(f"DROP TABLE {stale_table}")
+
             operator_schema = db.execute(
                 "SELECT sql FROM sqlite_master WHERE type='table' "
                 "AND name='round_operator_events'"
             ).fetchone()
-            if (
-                operator_schema is None
-                or "cancelled_not_dispatched" not in str(operator_schema["sql"])
+            if operator_schema is None or "cancelled_not_dispatched" not in str(
+                operator_schema["sql"]
             ):
                 db.execute(
                     "ALTER TABLE round_operator_events RENAME TO "
@@ -1522,16 +1874,66 @@ class HotJoinStore:
                     "acknowledged_paid_outcome_unknown,created_ns FROM "
                     "round_operator_events_before_prepared_cancel ORDER BY seq"
                 )
+                if (
+                    db.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                        (operator_receipt_table,),
+                    ).fetchone()
+                    is not None
+                ):
+                    # The parent rename above rewrites a populated child's FK to
+                    # the temporary parent. Rebind/copy the child before dropping
+                    # that parent or SQLite correctly rejects the destructive drop.
+                    rebuild_operator_receipt_table(
+                        "round_coordination_operator_receipts_before_parent_migration"
+                    )
                 db.execute("DROP TABLE round_operator_events_before_prepared_cancel")
+
+            # This child must be created only after the operator-event parent
+            # migration. SQLite rewrites inbound FK targets when a parent is
+            # renamed, so creating the child first would bind it permanently to
+            # ``round_operator_events_before_prepared_cancel`` and then drop that
+            # parent. Repair ledgers initialized by that short-lived buggy order
+            # while preserving any rows whose copied parent sequence still exists.
+            existing_operator_receipt = db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (operator_receipt_table,),
+            ).fetchone()
+            if existing_operator_receipt is None:
+                db.execute(
+                    f"CREATE TABLE {operator_receipt_table} {operator_receipt_columns}"
+                )
+            else:
+                operator_receipt_foreign_keys = {
+                    (str(row["from"]), str(row["table"]), str(row["to"]))
+                    for row in db.execute(
+                        "PRAGMA foreign_key_list(round_coordination_operator_receipts)"
+                    ).fetchall()
+                }
+                expected_operator_receipt_foreign_keys = {
+                    ("client_id", "round_intents", "client_id"),
+                    ("operator_event_seq", "round_operator_events", "seq"),
+                }
+                if (
+                    operator_receipt_foreign_keys
+                    != expected_operator_receipt_foreign_keys
+                ):
+                    rebuild_operator_receipt_table(
+                        "round_coordination_operator_receipts_before_fk_repair"
+                    )
+            foreign_key_violations = db.execute(
+                "PRAGMA foreign_key_check(round_coordination_operator_receipts)"
+            ).fetchall()
+            if foreign_key_violations:
+                db.rollback()
+                raise HotJoinError(
+                    "coordination operator receipt foreign keys are inconsistent"
+                )
             db.commit()
 
     @staticmethod
     def _validate_target(target: str) -> str:
-        if (
-            not target
-            or len(target) > 128
-            or _TARGET_RE.fullmatch(target) is None
-        ):
+        if not target or len(target) > 128 or _TARGET_RE.fullmatch(target) is None:
             raise ValueError(
                 "target must be one safe worker name matching "
                 "[A-Za-z0-9][A-Za-z0-9._-]*"
@@ -1539,6 +1941,223 @@ class HotJoinStore:
         if target in {".", "..", "verifier", "verification"}:
             raise ValueError("invalid or forbidden hot-join target")
         return target
+
+    @staticmethod
+    def _validate_coordination_binding(
+        *,
+        slot_id: Optional[str],
+        generation: Optional[int],
+        lane: Optional[str],
+    ) -> tuple[Optional[str], Optional[int], Optional[str]]:
+        values = (slot_id, generation, lane)
+        if values == (None, None, None):
+            return values
+        if (
+            not isinstance(slot_id, str)
+            or _COORDINATION_SLOT_RE.fullmatch(slot_id) is None
+            or isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or generation < 1
+            or lane not in _COORDINATION_LANES
+        ):
+            raise ValueError(
+                "coordination slot, generation, and lane must be supplied exactly"
+            )
+        return slot_id, generation, lane
+
+    @staticmethod
+    def _validate_terminal_disposition(
+        effective_adapter_rc: int, disposition: str
+    ) -> tuple[int, str]:
+        if isinstance(effective_adapter_rc, bool) or not isinstance(
+            effective_adapter_rc, int
+        ):
+            raise ValueError("effective adapter rc must be an integer")
+        expected = _COORDINATION_TERMINAL_DISPOSITIONS.get(effective_adapter_rc)
+        if expected is None or disposition != expected:
+            raise ValueError("terminal disposition does not match the adapter rc")
+        return effective_adapter_rc, disposition
+
+    @staticmethod
+    def _validate_coordination_terminal_audit_header(
+        payload: str,
+        *,
+        thread_id: str,
+        turn_id: str,
+        terminal_status: str,
+        requested_model: str,
+        requested_effort: str,
+        effective_adapter_rc: int,
+        disposition: str,
+    ) -> dict[str, Any]:
+        """Attest the exact terminal header before or after durable publish."""
+
+        lines = payload.encode("utf-8").splitlines()
+        if not lines:
+            raise HotJoinError("terminal coordination audit has no header")
+        header = _strict_json(lines[0])
+        expected = {
+            "event": "turn_completed",
+            "thread_id": thread_id,
+            "turn_id": turn_id,
+            "status": terminal_status,
+            "requested_model": requested_model,
+            "requested_effort": requested_effort,
+            "effective_adapter_rc": effective_adapter_rc,
+            "coordination_disposition": disposition,
+        }
+        if header.get("terminal_observed") is not True or any(
+            header.get(key) != value for key, value in expected.items()
+        ):
+            raise HotJoinError("terminal coordination audit binding conflicts")
+        return header
+
+    @staticmethod
+    def _terminal_receipt_material(fields: Mapping[str, Any]) -> tuple[str, str]:
+        material = {
+            "schema": "danus.coordination-terminal-receipt.v1",
+            **{
+                key: fields[key]
+                for key in (
+                    "coordination_slot_id",
+                    "client_id",
+                    "target",
+                    "coordination_generation",
+                    "coordination_lane",
+                    "thread_id",
+                    "turn_id",
+                    "prompt_sha256",
+                    "requested_model",
+                    "requested_effort",
+                    "effective_adapter_rc",
+                    "disposition",
+                    "terminal_status",
+                    "audit_payload_sha256",
+                    "thread_retirement_event_seq",
+                )
+            },
+        }
+        encoded = json.dumps(
+            material,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        return encoded, hashlib.sha256(encoded.encode("ascii")).hexdigest()
+
+    @staticmethod
+    def _coordination_operator_receipt_material(
+        fields: Mapping[str, Any],
+    ) -> tuple[str, str]:
+        material = {
+            "schema": "danus.coordination-operator-receipt.v1",
+            **{
+                key: fields[key]
+                for key in (
+                    "coordination_slot_id",
+                    "client_id",
+                    "target",
+                    "coordination_generation",
+                    "coordination_lane",
+                    "thread_id",
+                    "turn_id",
+                    "prompt_sha256",
+                    "requested_model",
+                    "requested_effort",
+                    "operator_event_seq",
+                    "operator_action",
+                    "prior_state",
+                    "acknowledged_paid_outcome_unknown",
+                    "reason_sha256",
+                    "terminal_status",
+                    "coordination_outcome",
+                    "effective_adapter_rc",
+                    "disposition",
+                )
+            },
+        }
+        encoded = json.dumps(
+            material,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        return encoded, hashlib.sha256(encoded.encode("ascii")).hexdigest()
+
+    def _record_coordination_operator_receipt_in_tx(
+        self,
+        db: sqlite3.Connection,
+        *,
+        intent: sqlite3.Row,
+        operator_event_seq: int,
+        operator_action: str,
+        prior_state: str,
+        acknowledged_paid_outcome_unknown: int,
+        reason: str,
+        terminal_status: str,
+        now: int,
+    ) -> None:
+        binding = self._validate_coordination_binding(
+            slot_id=intent["coordination_slot_id"],
+            generation=intent["coordination_generation"],
+            lane=intent["coordination_lane"],
+        )
+        if binding[0] is None:
+            return
+        policy = _COORDINATION_OPERATOR_DISPOSITIONS.get(operator_action)
+        if (
+            policy is None
+            or prior_state not in policy["prior_states"]
+            or acknowledged_paid_outcome_unknown
+            != policy["acknowledged_paid_outcome_unknown"]
+            or terminal_status != policy["terminal_status"]
+            or intent["state"] != "failed"
+            or intent["terminal_status"] != terminal_status
+        ):
+            raise HotJoinError(
+                "coordination operator receipt conflicts with its terminal event"
+            )
+        reason_sha256 = hashlib.sha256(reason.encode("utf-8")).hexdigest()
+        fields = {
+            "coordination_slot_id": str(binding[0]),
+            "client_id": str(intent["client_id"]),
+            "target": str(intent["target"]),
+            "coordination_generation": int(binding[1]),
+            "coordination_lane": str(binding[2]),
+            "thread_id": str(intent["thread_id"]),
+            "turn_id": (
+                str(intent["turn_id"]) if intent["turn_id"] is not None else None
+            ),
+            "prompt_sha256": str(intent["prompt_sha256"]),
+            "requested_model": str(intent["requested_model"]),
+            "requested_effort": str(intent["requested_effort"]),
+            "operator_event_seq": operator_event_seq,
+            "operator_action": operator_action,
+            "prior_state": prior_state,
+            "acknowledged_paid_outcome_unknown": (acknowledged_paid_outcome_unknown),
+            "reason_sha256": reason_sha256,
+            "terminal_status": terminal_status,
+            "coordination_outcome": str(policy["coordination_outcome"]),
+            "effective_adapter_rc": int(policy["effective_adapter_rc"]),
+            "disposition": str(policy["disposition"]),
+        }
+        _material, receipt_sha256 = self._coordination_operator_receipt_material(fields)
+        db.execute(
+            """
+            INSERT INTO round_coordination_operator_receipts(
+                receipt_sha256, coordination_slot_id, client_id, target,
+                coordination_generation, coordination_lane, thread_id, turn_id,
+                prompt_sha256, requested_model, requested_effort,
+                operator_event_seq, operator_action, prior_state,
+                acknowledged_paid_outcome_unknown, reason_sha256,
+                terminal_status, coordination_outcome, effective_adapter_rc,
+                disposition, created_ns
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (receipt_sha256, *fields.values(), now),
+        )
 
     def enqueue(
         self,
@@ -1631,7 +2250,9 @@ class HotJoinStore:
             raise KeyError(message_id)
         return dict(row)
 
-    def list_messages(self, *, target: Optional[str] = None, limit: int = 100) -> list[dict[str, Any]]:
+    def list_messages(
+        self, *, target: Optional[str] = None, limit: int = 100
+    ) -> list[dict[str, Any]]:
         if not 1 <= limit <= 1000:
             raise ValueError("limit must be between 1 and 1000")
         sql = (
@@ -1983,6 +2604,9 @@ class HotJoinStore:
         prompt_sha256: str,
         requested_model: str,
         requested_effort: str,
+        coordination_slot_id: Optional[str] = None,
+        coordination_generation: Optional[int] = None,
+        coordination_lane: Optional[str] = None,
     ) -> dict[str, Any]:
         """Return/create the one unfinished paid-turn intent for a worker."""
         target = self._validate_target(target)
@@ -1992,9 +2616,42 @@ class HotJoinStore:
             raise ValueError("round prompt digest must be lowercase SHA-256")
         if not requested_model or not requested_effort:
             raise ValueError("round model and effort must be non-empty")
+        (
+            coordination_slot_id,
+            coordination_generation,
+            coordination_lane,
+        ) = self._validate_coordination_binding(
+            slot_id=coordination_slot_id,
+            generation=coordination_generation,
+            lane=coordination_lane,
+        )
         now = time.time_ns()
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            if coordination_slot_id is not None:
+                bound = db.execute(
+                    "SELECT * FROM round_intents WHERE coordination_slot_id=?",
+                    (coordination_slot_id,),
+                ).fetchone()
+                if bound is not None:
+                    expected_bound = {
+                        "target": target,
+                        "thread_id": thread_id,
+                        "prompt_sha256": prompt_sha256,
+                        "requested_model": requested_model,
+                        "requested_effort": requested_effort,
+                        "coordination_generation": coordination_generation,
+                        "coordination_lane": coordination_lane,
+                    }
+                    if any(
+                        bound[key] != value for key, value in expected_bound.items()
+                    ):
+                        db.rollback()
+                        raise HotJoinError(
+                            "coordination slot conflicts with its durable paid-turn intent"
+                        )
+                    db.commit()
+                    return dict(bound)
             row = db.execute(
                 "SELECT * FROM round_intents WHERE target=? AND state IN "
                 "('prepared','dispatching','started','delivery_unknown') "
@@ -2007,12 +2664,15 @@ class HotJoinStore:
                     "prompt_sha256": prompt_sha256,
                     "requested_model": requested_model,
                     "requested_effort": requested_effort,
+                    "coordination_slot_id": coordination_slot_id,
+                    "coordination_generation": coordination_generation,
+                    "coordination_lane": coordination_lane,
                 }
                 if any(row[key] != value for key, value in expected.items()):
                     db.rollback()
                     raise HotJoinError(
                         "unfinished paid-turn intent conflicts with current "
-                        "thread, prompt, model, or effort"
+                        "thread, prompt, model, effort, or coordination slot"
                     )
                 db.commit()
                 return dict(row)
@@ -2031,8 +2691,9 @@ class HotJoinStore:
             client_id = f"danus-round:{uuid.uuid4()}"
             db.execute(
                 "INSERT INTO round_intents(client_id,target,thread_id,prompt_sha256,"
-                "requested_model,requested_effort,state,created_ns,updated_ns) "
-                "VALUES (?,?,?,?,?,?,?,?,?)",
+                "requested_model,requested_effort,coordination_slot_id,"
+                "coordination_generation,coordination_lane,state,created_ns,updated_ns) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     client_id,
                     target,
@@ -2040,6 +2701,9 @@ class HotJoinStore:
                     prompt_sha256,
                     requested_model,
                     requested_effort,
+                    coordination_slot_id,
+                    coordination_generation,
+                    coordination_lane,
                     "prepared",
                     now,
                     now,
@@ -2062,6 +2726,268 @@ class HotJoinStore:
             raise KeyError(client_id)
         return dict(row)
 
+    def terminal_receipt_for_coordination_slot(
+        self,
+        *,
+        coordination_slot_id: str,
+        target: str,
+        coordination_generation: int,
+        coordination_lane: str,
+        prompt_sha256: str,
+        requested_model: str,
+        requested_effort: str,
+        thread_id: Optional[str],
+    ) -> Optional[dict[str, Any]]:
+        """Return one fully self-authenticated terminal coordination receipt.
+
+        An absent intent or an unfinished exact intent returns ``None``. A
+        terminal intent without its same-transaction receipt, or any binding
+        conflict, fails closed.
+        """
+
+        target = self._validate_target(target)
+        self._validate_coordination_binding(
+            slot_id=coordination_slot_id,
+            generation=coordination_generation,
+            lane=coordination_lane,
+        )
+        if re.fullmatch(r"[0-9a-f]{64}", prompt_sha256) is None:
+            raise ValueError("round prompt digest must be lowercase SHA-256")
+        if not requested_model or not requested_effort:
+            raise ValueError("round model and effort must be non-empty")
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT * FROM round_intents WHERE coordination_slot_id=?",
+                (coordination_slot_id,),
+            ).fetchall()
+            if len(rows) > 1:
+                raise HotJoinError("coordination slot has multiple paid-turn intents")
+            if not rows:
+                return None
+            intent = rows[0]
+            expected_intent = {
+                "target": target,
+                "coordination_generation": coordination_generation,
+                "coordination_lane": coordination_lane,
+                "prompt_sha256": prompt_sha256,
+                "requested_model": requested_model,
+                "requested_effort": requested_effort,
+            }
+            if any(intent[key] != value for key, value in expected_intent.items()):
+                raise HotJoinError(
+                    "coordination paid-turn intent binding conflicts with admission"
+                )
+            mapped = db.execute(
+                "SELECT thread_id FROM worker_threads WHERE target=?", (target,)
+            ).fetchone()
+            mapped_thread_id = str(mapped["thread_id"]) if mapped is not None else None
+            receipt_rows = db.execute(
+                "SELECT * FROM round_terminal_receipts WHERE coordination_slot_id=?",
+                (coordination_slot_id,),
+            ).fetchall()
+            operator_receipt_rows = db.execute(
+                "SELECT * FROM round_coordination_operator_receipts "
+                "WHERE coordination_slot_id=?",
+                (coordination_slot_id,),
+            ).fetchall()
+            if intent["state"] in {
+                "prepared",
+                "dispatching",
+                "started",
+                "delivery_unknown",
+            }:
+                if (
+                    thread_id is None
+                    or thread_id != intent["thread_id"]
+                    or mapped_thread_id != intent["thread_id"]
+                ):
+                    raise HotJoinError(
+                        "unfinished coordination turn lost its exact thread mapping"
+                    )
+                if receipt_rows or operator_receipt_rows:
+                    raise HotJoinError(
+                        "unfinished coordination turn has an impossible terminal receipt"
+                    )
+                return None
+            if intent["state"] == "failed":
+                if (
+                    thread_id is None
+                    or thread_id != intent["thread_id"]
+                    or mapped_thread_id != intent["thread_id"]
+                ):
+                    raise HotJoinError(
+                        "operator-terminal coordination turn lost its thread mapping"
+                    )
+                if receipt_rows or len(operator_receipt_rows) != 1:
+                    raise HotJoinError(
+                        "failed coordination turn is missing its exact operator receipt"
+                    )
+                operator_receipt = operator_receipt_rows[0]
+                event = db.execute(
+                    "SELECT * FROM round_operator_events WHERE seq=?",
+                    (operator_receipt["operator_event_seq"],),
+                ).fetchone()
+                if event is None:
+                    raise HotJoinError(
+                        "coordination operator receipt lost its canonical event"
+                    )
+                policy = _COORDINATION_OPERATOR_DISPOSITIONS.get(
+                    str(operator_receipt["operator_action"])
+                )
+                if policy is None:
+                    raise HotJoinError(
+                        "coordination operator receipt has an unknown disposition"
+                    )
+                reason = str(event["reason"])
+                expected_operator_receipt = {
+                    "coordination_slot_id": coordination_slot_id,
+                    "client_id": str(intent["client_id"]),
+                    "target": target,
+                    "coordination_generation": coordination_generation,
+                    "coordination_lane": coordination_lane,
+                    "thread_id": str(intent["thread_id"]),
+                    "turn_id": (
+                        str(intent["turn_id"])
+                        if intent["turn_id"] is not None
+                        else None
+                    ),
+                    "prompt_sha256": prompt_sha256,
+                    "requested_model": requested_model,
+                    "requested_effort": requested_effort,
+                    "operator_event_seq": int(event["seq"]),
+                    "operator_action": str(event["action"]),
+                    "prior_state": str(event["prior_state"]),
+                    "acknowledged_paid_outcome_unknown": int(
+                        event["acknowledged_paid_outcome_unknown"]
+                    ),
+                    "reason_sha256": hashlib.sha256(reason.encode("utf-8")).hexdigest(),
+                    "terminal_status": str(intent["terminal_status"]),
+                    "coordination_outcome": str(policy["coordination_outcome"]),
+                    "effective_adapter_rc": int(policy["effective_adapter_rc"]),
+                    "disposition": str(policy["disposition"]),
+                }
+                if any(
+                    operator_receipt[key] != value
+                    for key, value in expected_operator_receipt.items()
+                ):
+                    raise HotJoinError(
+                        "terminal coordination operator receipt binding conflicts"
+                    )
+                if (
+                    event["client_id"] != intent["client_id"]
+                    or event["target"] != intent["target"]
+                    or event["thread_id"] != intent["thread_id"]
+                    or event["prior_state"] not in policy["prior_states"]
+                    or event["acknowledged_paid_outcome_unknown"]
+                    != policy["acknowledged_paid_outcome_unknown"]
+                    or intent["terminal_status"] != policy["terminal_status"]
+                ):
+                    raise HotJoinError(
+                        "terminal coordination operator event binding conflicts"
+                    )
+                _material, expected_operator_sha256 = (
+                    self._coordination_operator_receipt_material(
+                        expected_operator_receipt
+                    )
+                )
+                if operator_receipt["receipt_sha256"] != expected_operator_sha256:
+                    raise HotJoinError(
+                        "terminal coordination operator receipt digest conflicts"
+                    )
+                result = dict(operator_receipt)
+                result["receipt_kind"] = "operator_terminal"
+                result["audit_header"] = {}
+                return result
+            if (
+                intent["state"] != "completed"
+                or len(receipt_rows) != 1
+                or operator_receipt_rows
+            ):
+                raise HotJoinError(
+                    "terminal coordination turn is missing its exact receipt"
+                )
+            if thread_id is not None or mapped_thread_id is not None:
+                raise HotJoinError(
+                    "terminal coordination turn did not retire its thread mapping"
+                )
+            receipt = receipt_rows[0]
+            expected_receipt = {
+                "coordination_slot_id": coordination_slot_id,
+                "client_id": str(intent["client_id"]),
+                "target": target,
+                "coordination_generation": coordination_generation,
+                "coordination_lane": coordination_lane,
+                "thread_id": str(intent["thread_id"]),
+                "turn_id": str(intent["turn_id"]),
+                "prompt_sha256": prompt_sha256,
+                "requested_model": requested_model,
+                "requested_effort": requested_effort,
+                "effective_adapter_rc": receipt["effective_adapter_rc"],
+                "disposition": receipt["disposition"],
+                "terminal_status": str(intent["terminal_status"]),
+                "audit_payload_sha256": receipt["audit_payload_sha256"],
+                "thread_retirement_event_seq": receipt["thread_retirement_event_seq"],
+            }
+            if any(receipt[key] != value for key, value in expected_receipt.items()):
+                raise HotJoinError("terminal coordination receipt binding conflicts")
+            self._validate_terminal_disposition(
+                int(receipt["effective_adapter_rc"]), str(receipt["disposition"])
+            )
+            _material, expected_sha256 = self._terminal_receipt_material(
+                expected_receipt
+            )
+            if receipt["receipt_sha256"] != expected_sha256:
+                raise HotJoinError("terminal coordination receipt digest conflicts")
+            retirement = db.execute(
+                "SELECT * FROM worker_thread_events WHERE seq=?",
+                (receipt["thread_retirement_event_seq"],),
+            ).fetchone()
+            if (
+                retirement is None
+                or retirement["target"] != intent["target"]
+                or retirement["thread_id"] != intent["thread_id"]
+                or retirement["action"] != "retired_coordination_terminal"
+                or retirement["detail"]
+                != f"coordination_terminal:{intent['client_id']}"
+            ):
+                raise HotJoinError(
+                    "terminal coordination receipt lacks exact thread retirement"
+                )
+            audits = db.execute(
+                "SELECT * FROM round_audit_events "
+                "WHERE client_id=? AND kind='final' ORDER BY seq",
+                (intent["client_id"],),
+            ).fetchall()
+            if len(audits) != 1:
+                raise HotJoinError(
+                    "terminal coordination receipt lacks one canonical final audit"
+                )
+            audit = audits[0]
+            payload = str(audit["payload"])
+            _encoded, audit_digest = self._audit_material(payload)
+            if (
+                audit_digest != audit["payload_sha256"]
+                or audit_digest != receipt["audit_payload_sha256"]
+            ):
+                raise HotJoinError("terminal coordination audit digest conflicts")
+            header = self._validate_coordination_terminal_audit_header(
+                payload,
+                thread_id=str(intent["thread_id"]),
+                turn_id=str(intent["turn_id"]),
+                terminal_status=str(intent["terminal_status"]),
+                requested_model=str(intent["requested_model"]),
+                requested_effort=str(intent["requested_effort"]),
+                effective_adapter_rc=int(receipt["effective_adapter_rc"]),
+                disposition=str(receipt["disposition"]),
+            )
+            result = dict(receipt)
+            result["receipt_kind"] = "terminal_audit"
+            result["coordination_outcome"] = (
+                f"terminal_rc_{int(receipt['effective_adapter_rc'])}"
+            )
+            result["audit_header"] = header
+            return result
+
     @staticmethod
     def _audit_material(payload: str) -> tuple[bytes, str]:
         encoded = payload.encode("utf-8")
@@ -2071,7 +2997,9 @@ class HotJoinStore:
             _strict_json(line)
         return encoded, hashlib.sha256(encoded).hexdigest()
 
-    def record_round_attempt_audit(self, client_id: str, payload: str) -> dict[str, Any]:
+    def record_round_attempt_audit(
+        self, client_id: str, payload: str
+    ) -> dict[str, Any]:
         """Append a nonterminal audit with delivery-aware intent state."""
         _encoded, digest = self._audit_material(payload)
         now = time.time_ns()
@@ -2089,26 +3017,33 @@ class HotJoinStore:
                 (client_id, "attempt", payload, digest, now),
             )
             if intent["state"] == "prepared":
-                # The dispatch fence is written before turn/start. A failure
-                # while still prepared is authoritatively zero-delivery, not an
-                # ambiguous paid call.
-                db.execute(
-                    "UPDATE round_intents SET state='failed',terminal_status=?,"
-                    "updated_ns=? WHERE client_id=? AND state='prepared'",
-                    ("not_dispatched", now, client_id),
+                binding = self._validate_coordination_binding(
+                    slot_id=intent["coordination_slot_id"],
+                    generation=intent["coordination_generation"],
+                    lane=intent["coordination_lane"],
                 )
-                db.execute(
-                    "INSERT INTO round_events(client_id,state,thread_id,turn_id,"
-                    "terminal_status,created_ns) VALUES (?,?,?,?,?,?)",
-                    (
-                        client_id,
-                        "failed",
-                        intent["thread_id"],
-                        None,
-                        "not_dispatched",
-                        now,
-                    ),
-                )
+                if binding[0] is None:
+                    # Legacy preserves its historical terminal projection. A
+                    # coordination-bound prepared intent instead remains the
+                    # exact safe retry/cancel point because no turn/start fence
+                    # was crossed and terminal release requires a receipt.
+                    db.execute(
+                        "UPDATE round_intents SET state='failed',terminal_status=?,"
+                        "updated_ns=? WHERE client_id=? AND state='prepared'",
+                        ("not_dispatched", now, client_id),
+                    )
+                    db.execute(
+                        "INSERT INTO round_events(client_id,state,thread_id,turn_id,"
+                        "terminal_status,created_ns) VALUES (?,?,?,?,?,?)",
+                        (
+                            client_id,
+                            "failed",
+                            intent["thread_id"],
+                            None,
+                            "not_dispatched",
+                            now,
+                        ),
+                    )
             elif intent["state"] not in {"completed", "failed", "delivery_unknown"}:
                 db.execute(
                     "UPDATE round_intents SET state='delivery_unknown',updated_ns=? "
@@ -2138,6 +3073,8 @@ class HotJoinStore:
         thread_id: str,
         turn_id: str,
         terminal_status: str,
+        effective_adapter_rc: Optional[int] = None,
+        disposition: Optional[str] = None,
     ) -> dict[str, Any]:
         """Atomically persist final audit, receipts, and paid-intent terminal."""
         _encoded, digest = self._audit_material(payload)
@@ -2150,22 +3087,74 @@ class HotJoinStore:
             if intent is None:
                 db.rollback()
                 raise KeyError(client_id)
+            binding = self._validate_coordination_binding(
+                slot_id=intent["coordination_slot_id"],
+                generation=intent["coordination_generation"],
+                lane=intent["coordination_lane"],
+            )
+            if binding[0] is not None:
+                if effective_adapter_rc is None or disposition is None:
+                    db.rollback()
+                    raise HotJoinError(
+                        "coordination-bound terminal requires an exact adapter disposition"
+                    )
+                self._validate_terminal_disposition(effective_adapter_rc, disposition)
+            elif effective_adapter_rc is not None or disposition is not None:
+                if effective_adapter_rc is None or disposition is None:
+                    db.rollback()
+                    raise HotJoinError("terminal adapter disposition is incomplete")
+                self._validate_terminal_disposition(effective_adapter_rc, disposition)
             if intent["thread_id"] != thread_id or (
                 intent["turn_id"] is not None and intent["turn_id"] != turn_id
             ):
                 db.rollback()
-                raise HotJoinError("terminal turn conflicts with durable paid-turn intent")
+                raise HotJoinError(
+                    "terminal turn conflicts with durable paid-turn intent"
+                )
+            if intent["state"] == "failed":
+                db.rollback()
+                raise HotJoinError("a failed paid-turn intent cannot be finalized")
             existing = db.execute(
                 "SELECT * FROM round_audit_events WHERE client_id=? AND kind='final' "
                 "ORDER BY seq DESC LIMIT 1",
                 (client_id,),
             ).fetchone()
+            canonical_payload = (
+                str(existing["payload"]) if existing is not None else payload
+            )
+            _canonical_encoded, computed_canonical_digest = self._audit_material(
+                canonical_payload
+            )
+            if (
+                existing is not None
+                and existing["payload_sha256"] != computed_canonical_digest
+            ):
+                db.rollback()
+                raise HotJoinError("canonical terminal audit digest conflicts")
+            if binding[0] is not None:
+                assert effective_adapter_rc is not None
+                assert disposition is not None
+                self._validate_coordination_terminal_audit_header(
+                    canonical_payload,
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                    terminal_status=terminal_status,
+                    requested_model=str(intent["requested_model"]),
+                    requested_effort=str(intent["requested_effort"]),
+                    effective_adapter_rc=effective_adapter_rc,
+                    disposition=disposition,
+                )
             if existing is None:
                 db.execute(
                     "INSERT INTO round_audit_events"
                     "(client_id,kind,payload,payload_sha256,created_ns) VALUES (?,?,?,?,?)",
                     (client_id, "final", payload, digest, now),
                 )
+            canonical_audit_digest = (
+                str(existing["payload_sha256"])
+                if existing is not None
+                else computed_canonical_digest
+            )
             # If a prior process atomically finalized, its payload is canonical;
             # missing replayed token notifications must never create a conflict.
             rows = db.execute(
@@ -2202,6 +3191,116 @@ class HotJoinStore:
                         now,
                     ),
                 )
+                if binding[0] is not None:
+                    assert effective_adapter_rc is not None
+                    assert disposition is not None
+                    mapped_thread = db.execute(
+                        "SELECT thread_id FROM worker_threads WHERE target=?",
+                        (intent["target"],),
+                    ).fetchone()
+                    if mapped_thread is None or mapped_thread["thread_id"] != thread_id:
+                        db.rollback()
+                        raise HotJoinError(
+                            "coordination terminal cannot retire a conflicting thread"
+                        )
+                    retired = db.execute(
+                        "DELETE FROM worker_threads WHERE target=? AND thread_id=?",
+                        (intent["target"], thread_id),
+                    ).rowcount
+                    if retired != 1:
+                        db.rollback()
+                        raise StaleClaim(
+                            "coordination terminal thread retirement lost its CAS"
+                        )
+                    retirement_event = db.execute(
+                        "INSERT INTO worker_thread_events"
+                        "(target,action,thread_id,detail,created_ns) VALUES (?,?,?,?,?)",
+                        (
+                            intent["target"],
+                            "retired_coordination_terminal",
+                            thread_id,
+                            f"coordination_terminal:{client_id}",
+                            now,
+                        ),
+                    )
+                    if retirement_event.lastrowid is None:
+                        db.rollback()
+                        raise HotJoinError(
+                            "coordination terminal retirement event disappeared"
+                        )
+                    receipt_fields = {
+                        "coordination_slot_id": str(binding[0]),
+                        "client_id": client_id,
+                        "target": str(intent["target"]),
+                        "coordination_generation": int(binding[1]),
+                        "coordination_lane": str(binding[2]),
+                        "thread_id": thread_id,
+                        "turn_id": turn_id,
+                        "prompt_sha256": str(intent["prompt_sha256"]),
+                        "requested_model": str(intent["requested_model"]),
+                        "requested_effort": str(intent["requested_effort"]),
+                        "effective_adapter_rc": effective_adapter_rc,
+                        "disposition": disposition,
+                        "terminal_status": terminal_status,
+                        "audit_payload_sha256": canonical_audit_digest,
+                        "thread_retirement_event_seq": int(retirement_event.lastrowid),
+                    }
+                    _material, receipt_sha256 = self._terminal_receipt_material(
+                        receipt_fields
+                    )
+                    db.execute(
+                        """
+                        INSERT INTO round_terminal_receipts(
+                            receipt_sha256, coordination_slot_id, client_id,
+                            target, coordination_generation, coordination_lane,
+                            thread_id, turn_id, prompt_sha256, requested_model,
+                            requested_effort, effective_adapter_rc, disposition,
+                            terminal_status, audit_payload_sha256,
+                            thread_retirement_event_seq, created_ns
+                        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            receipt_sha256,
+                            *receipt_fields.values(),
+                            now,
+                        ),
+                    )
+            elif binding[0] is not None:
+                receipt = db.execute(
+                    "SELECT * FROM round_terminal_receipts WHERE client_id=?",
+                    (client_id,),
+                ).fetchone()
+                if receipt is None:
+                    db.rollback()
+                    raise HotJoinError(
+                        "completed coordination turn is missing its terminal receipt"
+                    )
+                if (
+                    receipt["terminal_status"] != terminal_status
+                    or receipt["effective_adapter_rc"] != effective_adapter_rc
+                    or receipt["disposition"] != disposition
+                    or receipt["audit_payload_sha256"] != canonical_audit_digest
+                ):
+                    db.rollback()
+                    raise HotJoinError("terminal receipt replay conflicts")
+                mapping = db.execute(
+                    "SELECT thread_id FROM worker_threads WHERE target=?",
+                    (intent["target"],),
+                ).fetchone()
+                retirement = db.execute(
+                    "SELECT * FROM worker_thread_events WHERE seq=?",
+                    (receipt["thread_retirement_event_seq"],),
+                ).fetchone()
+                if (
+                    mapping is not None
+                    or retirement is None
+                    or retirement["target"] != intent["target"]
+                    or retirement["thread_id"] != intent["thread_id"]
+                    or retirement["action"] != "retired_coordination_terminal"
+                    or retirement["detail"] != f"coordination_terminal:{client_id}"
+                ):
+                    db.rollback()
+                    raise HotJoinError("terminal receipt thread retirement conflicts")
             db.commit()
         return self.latest_round_audit_event(client_id, kind="final")
 
@@ -2264,9 +3363,7 @@ class HotJoinStore:
             raise ValueError("owner abandonment reason exceeds 4096 UTF-8 bytes")
         cleaned_reason = redact_external_error(cleaned_reason, max_bytes=4096)
         if not acknowledge_paid_outcome_unknown:
-            raise ValueError(
-                "--acknowledge-paid-outcome-unknown is required"
-            )
+            raise ValueError("--acknowledge-paid-outcome-unknown is required")
 
         now = time.time_ns()
         terminal_status = "owner_abandoned_outcome_unknown"
@@ -2315,7 +3412,7 @@ class HotJoinStore:
                     now,
                 ),
             )
-            db.execute(
+            operator_event = db.execute(
                 "INSERT INTO round_operator_events"
                 "(action,client_id,target,thread_id,prior_state,reason,"
                 "acknowledged_paid_outcome_unknown,created_ns) "
@@ -2330,6 +3427,23 @@ class HotJoinStore:
                     1,
                     now,
                 ),
+            )
+            terminal_intent = db.execute(
+                "SELECT * FROM round_intents WHERE client_id=?", (client_id,)
+            ).fetchone()
+            if terminal_intent is None or operator_event.lastrowid is None:
+                db.rollback()
+                raise HotJoinError("owner abandonment receipt disappeared")
+            self._record_coordination_operator_receipt_in_tx(
+                db,
+                intent=terminal_intent,
+                operator_event_seq=int(operator_event.lastrowid),
+                operator_action="abandoned_outcome_unknown",
+                prior_state=expected_state,
+                acknowledged_paid_outcome_unknown=1,
+                reason=cleaned_reason,
+                terminal_status=terminal_status,
+                now=now,
             )
             db.commit()
         return {
@@ -2382,10 +3496,14 @@ class HotJoinStore:
                 raise KeyError(client_id)
             if row["target"] != validated_target:
                 db.rollback()
-                raise StaleClaim("prepared-intent target does not match exact owner CAS")
+                raise StaleClaim(
+                    "prepared-intent target does not match exact owner CAS"
+                )
             if row["thread_id"] != thread_id:
                 db.rollback()
-                raise StaleClaim("prepared-intent thread does not match exact owner CAS")
+                raise StaleClaim(
+                    "prepared-intent thread does not match exact owner CAS"
+                )
             if row["state"] != "prepared":
                 db.rollback()
                 raise StaleClaim("prepared intent changed before owner cancellation")
@@ -2396,13 +3514,15 @@ class HotJoinStore:
             ).rowcount
             if changed != 1:
                 db.rollback()
-                raise StaleClaim("prepared-intent cancellation lost its exact CAS fence")
+                raise StaleClaim(
+                    "prepared-intent cancellation lost its exact CAS fence"
+                )
             db.execute(
                 "INSERT INTO round_events(client_id,state,thread_id,turn_id,"
                 "terminal_status,created_ns) VALUES (?,?,?,?,?,?)",
                 (client_id, "failed", thread_id, None, terminal_status, now),
             )
-            db.execute(
+            operator_event = db.execute(
                 "INSERT INTO round_operator_events"
                 "(action,client_id,target,thread_id,prior_state,reason,"
                 "acknowledged_paid_outcome_unknown,created_ns) "
@@ -2417,6 +3537,23 @@ class HotJoinStore:
                     0,
                     now,
                 ),
+            )
+            terminal_intent = db.execute(
+                "SELECT * FROM round_intents WHERE client_id=?", (client_id,)
+            ).fetchone()
+            if terminal_intent is None or operator_event.lastrowid is None:
+                db.rollback()
+                raise HotJoinError("prepared cancellation receipt disappeared")
+            self._record_coordination_operator_receipt_in_tx(
+                db,
+                intent=terminal_intent,
+                operator_event_seq=int(operator_event.lastrowid),
+                operator_action="cancelled_not_dispatched",
+                prior_state="prepared",
+                acknowledged_paid_outcome_unknown=0,
+                reason=cleaned_reason,
+                terminal_status=terminal_status,
+                now=now,
             )
             db.commit()
         return {
@@ -2482,6 +3619,20 @@ class HotJoinStore:
             if expected_states is not None and row["state"] not in expected_states:
                 db.rollback()
                 raise StaleClaim("round intent changed concurrently")
+            binding = self._validate_coordination_binding(
+                slot_id=row["coordination_slot_id"],
+                generation=row["coordination_generation"],
+                lane=row["coordination_lane"],
+            )
+            if binding[0] is not None and state in {"completed", "failed"}:
+                db.rollback()
+                raise HotJoinError(
+                    "coordination-bound terminal intents require an exact "
+                    "finalize or operator receipt"
+                )
+            if row["state"] in {"completed", "failed"} and state != row["state"]:
+                db.rollback()
+                raise StaleClaim("terminal paid-turn intent cannot be reactivated")
             changed = db.execute(
                 "UPDATE round_intents SET state=?,turn_id=COALESCE(?,turn_id),"
                 "terminal_status=?,updated_ns=? WHERE client_id=? AND state=?",
@@ -2553,9 +3704,7 @@ class HotJoinStore:
             db.commit()
         return len(rows)
 
-    def _frontier_in_tx(
-        self, db: sqlite3.Connection, target: str
-    ) -> dict[str, Any]:
+    def _frontier_in_tx(self, db: sqlite3.Connection, target: str) -> dict[str, Any]:
         target = self._validate_target(target)
         rows = db.execute(
             "SELECT e.seq,e.message_id,m.content_sha256,m.kind,e.state,"
@@ -2581,9 +3730,9 @@ class HotJoinStore:
                 row["turn_id"],
             ]
             digest_state.update(
-                json.dumps(
-                    material, separators=(",", ":"), allow_nan=False
-                ).encode("utf-8")
+                json.dumps(material, separators=(",", ":"), allow_nan=False).encode(
+                    "utf-8"
+                )
             )
             event_count += 1
             event_seq = int(row["seq"])
@@ -2656,9 +3805,8 @@ class HotJoinStore:
             db.commit()
         return result
 
-_TURN_STATUS_VALUES = frozenset(
-    {"inProgress", "completed", "interrupted", "failed"}
-)
+
+_TURN_STATUS_VALUES = frozenset({"inProgress", "completed", "interrupted", "failed"})
 
 
 def _direct_thread_turns(
@@ -2695,9 +3843,7 @@ def _direct_thread_turns(
         items = turn.get("items")
         status = turn.get("status")
         try:
-            turn_id_bytes = (
-                turn_id.encode("utf-8") if isinstance(turn_id, str) else b""
-            )
+            turn_id_bytes = turn_id.encode("utf-8") if isinstance(turn_id, str) else b""
         except UnicodeEncodeError as exc:
             raise ProtocolError("thread/read turn id is not valid UTF-8") from exc
         if (
@@ -2721,9 +3867,7 @@ def message_turn(
 ) -> Optional[tuple[str, Optional[str]]]:
     """Locate a steered user message and its authoritative turn/status."""
     located: Optional[tuple[str, str]] = None
-    for turn in _direct_thread_turns(
-        value, expected_thread_id=expected_thread_id
-    ):
+    for turn in _direct_thread_turns(value, expected_thread_id=expected_thread_id):
         for item in turn["items"]:
             if not isinstance(item, dict) or item.get("type") != "userMessage":
                 continue
@@ -2754,9 +3898,7 @@ def message_turn(
 def _turn_status(
     value: Any, turn_id: str, *, expected_thread_id: Optional[str] = None
 ) -> Optional[str]:
-    turn = turn_snapshot(
-        value, turn_id, expected_thread_id=expected_thread_id
-    )
+    turn = turn_snapshot(value, turn_id, expected_thread_id=expected_thread_id)
     if turn is not None:
         status = turn.get("status")
         return str(status) if status is not None else None
@@ -2766,9 +3908,7 @@ def _turn_status(
 def turn_snapshot(
     value: Any, turn_id: str, *, expected_thread_id: Optional[str] = None
 ) -> Optional[dict[str, Any]]:
-    for turn in _direct_thread_turns(
-        value, expected_thread_id=expected_thread_id
-    ):
+    for turn in _direct_thread_turns(value, expected_thread_id=expected_thread_id):
         if turn.get("id") == turn_id:
             return dict(turn)
     return None
@@ -2779,9 +3919,7 @@ def in_progress_turn_id(
 ) -> Optional[str]:
     active = [
         str(turn["id"])
-        for turn in _direct_thread_turns(
-            value, expected_thread_id=expected_thread_id
-        )
+        for turn in _direct_thread_turns(value, expected_thread_id=expected_thread_id)
         if turn["status"] == "inProgress"
     ]
     if len(active) > 1:
@@ -2845,10 +3983,7 @@ class HotJoinBroker:
                         "delivery_unknown",
                         thread_id=self.thread_id,
                         turn_id=message.get("turn_id"),
-                        detail=(
-                            "reconciliation failed: "
-                            f"{redact_external_error(exc)}"
-                        ),
+                        detail=(f"reconciliation failed: {redact_external_error(exc)}"),
                         expected_owner=message.get("claim_owner"),
                     )
             return
@@ -2866,7 +4001,10 @@ class HotJoinBroker:
                             self.thread_id, stored_turn, status or "unknown"
                         )
                 continue
-            if message["state"] == "delivery_unknown" and message["kind"] == "interrupt":
+            if (
+                message["state"] == "delivery_unknown"
+                and message["kind"] == "interrupt"
+            ):
                 # Interrupt RPCs have no userMessage client id to reconcile.
                 continue
             client_id = self.client_message_id(message["message_id"])
@@ -2931,7 +4069,10 @@ class HotJoinBroker:
                     thread_id=self.thread_id,
                 )
                 if candidate is not None:
-                    if candidate["fallback"] == "fail" or candidate["kind"] == "interrupt":
+                    if (
+                        candidate["fallback"] == "fail"
+                        or candidate["kind"] == "interrupt"
+                    ):
                         self.store.record(
                             candidate["message_id"],
                             "failed",
@@ -2994,7 +4135,9 @@ class HotJoinBroker:
                 )
                 accepted = result.get("turnId") if isinstance(result, dict) else None
                 if accepted != active_turn:
-                    raise ProtocolError("turn/steer did not attest the expected turn id")
+                    raise ProtocolError(
+                        "turn/steer did not attest the expected turn id"
+                    )
                 self.store.record(
                     message_id,
                     "steer_accepted",

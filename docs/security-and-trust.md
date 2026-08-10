@@ -48,8 +48,8 @@ The role table (`danus/gateway/roles.py`):
 
 | role | tools it can see |
 |---|---|
-| **worker** | `gm_add`, `gm_search`, `fact_submit`, `fact_search`, `fact_context`, `search_arxiv_theorems` |
-| **main** (the orchestrator) | `gm_add`, `gm_search`, `fact_search`, `fact_context`, `fact_revoke`, `search_arxiv_theorems` — **no `fact_submit`** |
+| **worker** | `gm_add`, `gm_get`, `gm_search`, `fact_submit`, `fact_search`, `fact_context`, `search_arxiv_theorems` |
+| **main** (the orchestrator) | `gm_add`, `gm_get`, `gm_search`, `fact_search`, `fact_context`, `fact_revoke`, `search_arxiv_theorems` — **no `fact_submit`** |
 | **verifier** | `search_arxiv_theorems` **only** (read-only) |
 
 Load-bearing separations:
@@ -61,6 +61,10 @@ Load-bearing separations:
 - **Fail-closed.** An unknown, mis-typed, or *unset* role falls back to the
   most-restrictive (verifier) set, so a misconfiguration cannot grant write
   access. The full dev set requires the explicit `DANUS_ROLE=all`.
+- **Exact critic hydration is bounded.** `gm_get` accepts one canonical
+  16-lowercase-hex id, rejects absent or duplicate ids, and caps the serialized
+  record at 16 KiB. A designated critic uses it for the exact root checkpoint;
+  BM25 `gm_search` is discovery and cannot authorize confirmation.
 
 ## 3. The write-gate
 
@@ -88,6 +92,83 @@ state machine, not a suggestion:
 
 If the verify service is unreachable, `fact_submit` returns a clean error and
 writes nothing — nothing is silently accepted.
+
+If a crash leaves a reasoning-first candidate as `outcome_unknown`, its live
+overlay has no TTL and no elapsed-time inference. Workers must stop all retry and
+resubmission of that exact candidate. Only the owner-only `resolve-candidate`
+transition, bound to the exact receipt/source slot and checked against current
+FactGraph identity, may release it.
+
+### Browser advisor output is untrusted strategy, never control or truth
+
+`chatgpt_pro_browser` is an explicit owner-only handoff to the ChatGPT Pro web
+UI. Danus repository code only maintains a private exact-CAS receipt database;
+it never launches Chrome, calls an API/model, or lets a worker/verifier/cost gate
+trigger the handoff. The older `gpt_pro` transport remains the paid API.
+
+The active main agent may create a bounded `advisor_checkpoint` and local
+`prepared` receipt only from the exact current coordinator recommendation derived
+from the fixed root obstruction and independent critic confirmation. Broad
+evidence that routes are blocked, dead-ended, slow, expensive, or near exhaustion
+is insufficient. It then stops for the owner's exact-question authorization.
+Timers and unattended loops cannot trigger it; preparation grants no Chrome or
+transmission authority.
+
+The broker rejects secret-shaped outbound prompts, binds authorization to the
+exact prompt/project/context, and fences the click boundary durably. A lost or
+replayed dispatch acknowledgement does not authorize another click. An outcome
+that may have crossed Send is reconciled against the same visible conversation
+or owner-abandoned with an explicit risk receipt; it is never automatically
+resent. The visible `chatgpt.com` conversation URL is validated only at command
+input (prefer file/stdin, never argv/history) and persisted only as a SHA-256
+digest. Completed response and clarification plaintext is likewise never stored
+in the project: the receipt contains only SHA-256, UTF-8 size, attestations, and
+bounded control-signal names. Import requires the owner to resupply the exact
+bytes from the same conversation and returns them transiently.
+
+Same-conversation follow-up lineage is local and digest-bound: a new request
+may name only a same-project/context known-terminal Danus predecessor and must
+resupply its exact URL transiently at prepare and fresh dispatch. The ledger
+stores the predecessor receipt/state and URL hash, not the URL. Lineage grants
+no inherited authorization, so every evidence-specific follow-up needs a new
+prompt hash, owner decision, and one-shot dispatch. Unknown, stale, external, or
+wrong-URL predecessors are not represented as locally verified lineage.
+
+A completed page is imported with `trust=untrusted_strategy`, an empty authority
+set, and `eligible_for_master_guidance=false`. Page text cannot invoke
+`fact_submit`, `fact_revoke`, verifier/worker controls, shell/scripts, secrets,
+finalization, or publication. The main agent/owner must review and synthesize
+strategy-only text and record an explicit `adopt` transition. Only that adopted
+text has bounded `consult_provenance` acceptable on a `master_guidance` entry.
+The gateway permits `master_guidance`, `elaboration`, and `advisor_checkpoint`
+only for its runtime main/all role (an author string cannot spoof it). Browser
+guidance additionally must match an actual adopted same-project broker row and
+the guidance evidence hash must equal the adopted synthesis hash;
+even then it remains awareness, never FactGraph truth. Browser subscription
+telemetry is exact null (`model`, `usage`, `cost_usd`), not a fabricated estimate.
+Import, adoption, and `master_guidance` do not release a coordinator in
+`owner_action_required`. Resuming that generation requires an audited owner-only
+`resolve-recommendation` exact CAS with matching recommendation-id and explicit
+paid-resume acknowledgements. Adopted guidance must link that recommendation and
+browser provenance must bind its adopted same-project receipt. Continuing
+without guidance fails closed while the recommendation-bound browser request is
+active, ambiguous, or completed but not imported. Stable conversation context
+and per-intervention recommendation identity remain separate.
+Before every `gm_add`, the gateway also compares each durable claim/evidence and
+nested glossary/link string digest against that project's browser reply and
+clarification digests. Exact raw matches fail closed for every global-memory kind;
+only evidence already authenticated as the exact adopted synthesis is exempt.
+The gateway does not guess whether a paraphrase is semantically "close": review
+and synthesis are an explicit trusted-main responsibility. Unrelated API/manual
+guidance remains valid. Browser digest registration and every sanctioned gateway
+global-memory append share a cross-process fence under the loaded trusted Danus
+release's fixed `runtime/advisor-control`, outside all worker writable roots.
+Neither environment nor CLI/MCP input can redirect the authority root. The
+fence is keyed by canonical project path plus filesystem identity and is checked
+with no-follow, owner, mode, link-count, and inode guards. A worker-replaceable
+project-local lock is never trusted. The underlying `GlobalMemory` class remains
+a host-internal storage primitive; agent writes must go through the gateway.
+See `browser-advisor.md` for the state and recovery contract.
 
 Rolling verifier upgrades fail closed before paid work. The service captures its
 output schema, AGENTS contract, and verifier skills once at import, checks the
@@ -151,13 +232,20 @@ model and effort come from protected project metadata, not the model-writable
 runtime attestations therefore fail closed rather than guessing across protocol
 versions.
 
-The protected audit distinguishes live-stream reroute observations from
-post-crash unknown history, and labels token usage as observed rather than
-schema-attested final. A recovered prior paid turn with unavailable reroute
+Reasoning telemetry is content-free and projected only from the root app-server
+thread. It is diagnostic—not proof, correctness, liveness, admission, or browser
+authority. Missing or unsupported signals are `unavailable` or `partial`, never
+fabricated as zero. The protected audit distinguishes live-stream reroute
+observations from post-crash unknown history, and labels token usage as observed
+rather than schema-attested final. A recovered prior paid turn with unavailable reroute
 history is quarantined with automatic retry disabled; it is never silently
 accepted or duplicated.
 
-Long terminal histories have a separate fail-closed boundary. Codex 0.147
+In `reasoning_first_v1`, each new terminal coordination slot normally starts a
+fresh app-server thread; only crash recovery of that same fixed root/critic slot
+resumes its exact thread. Dormant observers are not rotation/failover. The long
+history boundary below therefore applies to same-slot recovery and explicitly
+legacy app-server continuation, not to ordinary new terminal slots. Codex 0.147
 supports a bounded `thread/read(includeTurns=false)` status check, but its
 `thread/resume` response always contains all turns. If that response exceeds the
 8 MiB JSONL limit, Danus records a pre-dispatch failure, sends no `turn/start`,

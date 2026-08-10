@@ -16,11 +16,12 @@ danus/orchestration/
 | verb | does |
 |---|---|
 | `list [--json]` | projects + live worker counts + model |
-| `new <p> [--roles high:3,xhigh:4] [--model M]` | → `execution.scaffold.do_new` |
+| `new <p> [--roles ROLE:N,...] [--model M] [--coordination reasoning-first\|legacy]` | → `execution.scaffold.do_new`; reasoning-first defaults to `max:2,high:5`, legacy to `high:3,xhigh:4` |
 | `assign <p>/<w> (--task/--file/--stdin)` | overwrite that worker's `TASK.md` |
 | `say <p>/<w> (--text/--file/--stdin)` | durable owner message; same-turn steer when app-server transport is active |
 | `messages <p>[/<w>] [--json]` | immutable message and per-delivery receipt view |
 | `interrupt-turn <p>/<w>` | explicit owner request to interrupt the current model turn |
+| `resolve-recommendation <p> ...` | exact owner resolution of the current reviewed recommendation; requires repeated-id and paid-resume acknowledgements |
 | `abandon-intent <p>/<w> --thread-id ID --client-id ID --expected-state STATE --reason TEXT --acknowledge-paid-outcome-unknown` | fail-stopped owner exact-CAS for an unreconcilable `dispatching`/`started`/`delivery_unknown` paid outcome; appends a risk receipt, never retries/deletes, and fences that thread until reset/rotation |
 | `cancel-prepared-intent <p>/<w> --thread-id ID --client-id ID --reason TEXT` | fail-stopped owner exact-CAS for an authoritatively unspent `prepared` intent; no paid-risk acknowledgement, append-only receipt, and reset/rotation remains separate |
 | `reset-thread <p>/<w> --expected-thread-id ID` | explicitly clear a server-deleted thread mapping; CAS-fenced, refused for a live/busy worker, serialized with `start` on `.pid.lock`, and refused with unfinished paid work |

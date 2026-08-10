@@ -33,9 +33,15 @@ import pytest
 from contextlib import contextmanager
 from pathlib import Path
 
+from danus.coordination import (
+    DEFAULT_COORDINATION,
+    CoordinationStore,
+    candidate_receipt_id,
+)
+from danus.core.global_memory import GlobalMemory
 from danus.execution import layout as L
 from danus.execution import loop, scaffold
-from danus.hotjoin import HotJoinError
+from danus.hotjoin import HotJoinError, HotJoinStore
 
 
 @contextmanager
@@ -76,6 +82,23 @@ def _mk_worker(tmp: Path, name: str = "high") -> L.WorkerLayout:
     return wl
 
 
+def _enable_reasoning(
+    wl: L.WorkerLayout,
+    *,
+    roles: str,
+    workers: list[str],
+) -> CoordinationStore:
+    metadata = {
+        "name": wl.project,
+        "model": "model",
+        "roles": roles,
+        "workers": workers,
+        "coordination": dict(DEFAULT_COORDINATION),
+    }
+    (wl.project_dir / "project.json").write_text(json.dumps(metadata), encoding="utf-8")
+    return CoordinationStore(wl.project_dir, metadata)
+
+
 def _write_fake_codex(tmp: Path, body: str) -> Path:
     """Write an executable python fake-codex stub and return its path. The stub
     ignores all the exec args and just does what ``body`` says."""
@@ -97,16 +120,24 @@ def _running(pid: int) -> bool:
 
 # --- run_round: chosen exit code ------------------------------------------- #
 
+
 def test_run_round_returns_codex_rc(tmp: Path):
     wl = _mk_worker(tmp)
-    fake = _write_fake_codex(tmp, "import sys\nsys.stdout.write('hello from codex\\n')\nsys.exit(3)\n")
+    fake = _write_fake_codex(
+        tmp, "import sys\nsys.stdout.write('hello from codex\\n')\nsys.exit(3)\n"
+    )
     log = wl.dir / "round.log"
     with _env(DANUS_CODEX_BIN=str(fake)):
-        rc = loop.run_round(wl, {"MODEL": "m", "REASONING_EFFORT": "high"},
-                            "prompt", log, hard_timeout=30)
+        rc = loop.run_round(
+            wl,
+            {"MODEL": "m", "REASONING_EFFORT": "high"},
+            "prompt",
+            log,
+            hard_timeout=30,
+        )
     assert rc == 3
     assert "hello from codex" in log.read_text()
-    assert loop._Child.proc is None            # cleared in finally
+    assert loop._Child.proc is None  # cleared in finally
 
 
 def test_run_round_success_rc0(tmp: Path):
@@ -114,8 +145,13 @@ def test_run_round_success_rc0(tmp: Path):
     fake = _write_fake_codex(tmp, "import sys\nsys.exit(0)\n")
     log = wl.dir / "round.log"
     with _env(DANUS_CODEX_BIN=str(fake)):
-        rc = loop.run_round(wl, {"MODEL": "m", "REASONING_EFFORT": "high"},
-                            "prompt", log, hard_timeout=0)   # 0 => no timeout (wait forever)
+        rc = loop.run_round(
+            wl,
+            {"MODEL": "m", "REASONING_EFFORT": "high"},
+            "prompt",
+            log,
+            hard_timeout=0,
+        )  # 0 => no timeout (wait forever)
     assert rc == 0
 
 
@@ -148,9 +184,7 @@ def test_run_round_normal_exit_sweeps_unreaped_owned_process_group(tmp: Path):
     assert grandchild_group == leader_group
     assert leader_group != os.getpgrp()
     deadline = time.monotonic() + 3
-    while time.monotonic() < deadline and (
-        _running(leader) or _running(grandchild)
-    ):
+    while time.monotonic() < deadline and (_running(leader) or _running(grandchild)):
         time.sleep(0.02)
     assert not _running(leader)
     assert not _running(grandchild)
@@ -210,13 +244,16 @@ def test_exec_owner_sigkill_revokes_liveness_and_kills_paid_group(tmp: Path):
         # The old host retains the same flock OFD during its TERM/KILL cleanup,
         # so an immediate replacement worker cannot begin a second paid job.
         with _env(DANUS_CODEX_BIN=str(second)):
-            assert loop.run_round(
-                wl,
-                {"MODEL": "m", "REASONING_EFFORT": "high"},
-                "prompt",
-                wl.dir / "overlap-refused.log",
-                hard_timeout=10,
-            ) == 126
+            assert (
+                loop.run_round(
+                    wl,
+                    {"MODEL": "m", "REASONING_EFFORT": "high"},
+                    "prompt",
+                    wl.dir / "overlap-refused.log",
+                    hard_timeout=10,
+                )
+                == 126
+            )
         assert not second_marker.exists()
         refused_status = json.loads(wl.status.read_text(encoding="utf-8"))
         assert refused_status["attempt_failure_code"] == (
@@ -226,13 +263,16 @@ def test_exec_owner_sigkill_revokes_liveness_and_kills_paid_group(tmp: Path):
         _wait_processes_gone(leader, grandchild, group)
         # Once the old group is terminal the same fence is released.
         with _env(DANUS_CODEX_BIN=str(second)):
-            assert loop.run_round(
-                wl,
-                {"MODEL": "m", "REASONING_EFFORT": "high"},
-                "prompt",
-                wl.dir / "overlap-after-cleanup.log",
-                hard_timeout=10,
-            ) == 0
+            assert (
+                loop.run_round(
+                    wl,
+                    {"MODEL": "m", "REASONING_EFFORT": "high"},
+                    "prompt",
+                    wl.dir / "overlap-after-cleanup.log",
+                    hard_timeout=10,
+                )
+                == 0
+            )
         assert second_marker.exists()
     finally:
         if owner.poll() is None:
@@ -332,8 +372,9 @@ def test_run_round_post_spawn_exception_revokes_host_and_paid_group(
         raise RuntimeError("injected post-spawn failure")
 
     monkeypatch.setattr(loop, "_force_stop_requested", injected_failure)
-    with _env(DANUS_CODEX_BIN=str(fake)), pytest.raises(
-        RuntimeError, match="injected post-spawn failure"
+    with (
+        _env(DANUS_CODEX_BIN=str(fake)),
+        pytest.raises(RuntimeError, match="injected post-spawn failure"),
     ):
         loop.run_round(
             wl,
@@ -410,9 +451,7 @@ def test_run_round_force_stop_removes_owned_child_process_group(tmp: Path):
     assert grandchild_group == leader_group
     assert leader_group != os.getpgrp()
     deadline = time.monotonic() + 3
-    while time.monotonic() < deadline and (
-        _running(leader) or _running(grandchild)
-    ):
+    while time.monotonic() < deadline and (_running(leader) or _running(grandchild)):
         time.sleep(0.02)
     assert not _running(leader)
     assert not _running(grandchild)
@@ -481,8 +520,7 @@ def test_run_round_injects_complete_mcp_without_project_config(tmp: Path):
     mcp_overrides = [
         (token, command[index + 1])
         for index, token in enumerate(command[:-1])
-        if token in ("--config", "-c")
-        and command[index + 1].startswith("mcp_servers=")
+        if token in ("--config", "-c") and command[index + 1].startswith("mcp_servers=")
     ]
     assert len(mcp_overrides) == 1
     assert mcp_overrides[0][0] == "--config"
@@ -509,14 +547,20 @@ def test_run_round_injects_complete_mcp_without_project_config(tmp: Path):
 
 # --- run_round: hard timeout → terminate → 124 ----------------------------- #
 
+
 def test_run_round_hard_timeout_terminates(tmp: Path):
     wl = _mk_worker(tmp)
     # sleeps far past the tiny hard_timeout; a plain terminate() ends it.
     fake = _write_fake_codex(tmp, "import time\ntime.sleep(60)\n")
     log = wl.dir / "round.log"
     with _env(DANUS_CODEX_BIN=str(fake)):
-        rc = loop.run_round(wl, {"MODEL": "m", "REASONING_EFFORT": "high"},
-                            "prompt", log, hard_timeout=1)
+        rc = loop.run_round(
+            wl,
+            {"MODEL": "m", "REASONING_EFFORT": "high"},
+            "prompt",
+            log,
+            hard_timeout=1,
+        )
     assert rc == 124
     assert "hard-timeout after 1s" in log.read_text()
     assert loop._Child.proc is None
@@ -524,13 +568,19 @@ def test_run_round_hard_timeout_terminates(tmp: Path):
 
 # --- run_round: missing binary → 127 --------------------------------------- #
 
+
 def test_run_round_missing_binary_returns_127(tmp: Path):
     wl = _mk_worker(tmp)
     missing = tmp / "does_not_exist_codex"
     log = wl.dir / "round.log"
     with _env(DANUS_CODEX_BIN=str(missing)):
-        rc = loop.run_round(wl, {"MODEL": "m", "REASONING_EFFORT": "high"},
-                            "prompt", log, hard_timeout=30)
+        rc = loop.run_round(
+            wl,
+            {"MODEL": "m", "REASONING_EFFORT": "high"},
+            "prompt",
+            log,
+            hard_timeout=30,
+        )
     assert rc == 127
     assert "owned paid child failed to exec" in log.read_text()
 
@@ -560,6 +610,7 @@ def test_run_round_gateway_preflight_failure_starts_no_codex(tmp: Path, monkeypa
 
 # --- run_round: unresponsive child → terminate times out → kill → 124 ------ #
 
+
 def test_run_round_timeout_then_kill(tmp: Path):
     """A child that ignores TERM is group-KILLed while still unreaped."""
     wl = _mk_worker(tmp)
@@ -574,8 +625,13 @@ def test_run_round_timeout_then_kill(tmp: Path):
     loop._terminate_owned_child = lambda proc: original_terminate(proc, grace=0.1)
     try:
         with _env(DANUS_CODEX_BIN=str(fake)):
-            rc = loop.run_round(wl, {"MODEL": "m", "REASONING_EFFORT": "high"},
-                                "prompt", log, hard_timeout=1)
+            rc = loop.run_round(
+                wl,
+                {"MODEL": "m", "REASONING_EFFORT": "high"},
+                "prompt",
+                log,
+                hard_timeout=1,
+            )
     finally:
         loop._terminate_owned_child = original_terminate
     assert rc == 124
@@ -584,9 +640,10 @@ def test_run_round_timeout_then_kill(tmp: Path):
 
 # --- main loop: stop flag → graceful stop ---------------------------------- #
 
+
 def test_main_stops_on_stop_flag(tmp: Path):
     wl = _mk_worker(tmp)
-    wl.stop.touch()          # stop before the first round
+    wl.stop.touch()  # stop before the first round
     with _restore_sigterm(), _env(DANUS_ROUND_BEAT="0"):
         _patch_run_round(lambda *a, **k: 0)
         try:
@@ -594,7 +651,7 @@ def test_main_stops_on_stop_flag(tmp: Path):
         finally:
             _unpatch_run_round()
     assert rc == 0
-    assert not wl.stop.exists()                       # consumed
+    assert not wl.stop.exists()  # consumed
     assert json.loads(wl.status.read_text())["state"] == "stopped"
 
 
@@ -623,9 +680,10 @@ def test_main_consumes_stop_reported_during_active_round(tmp: Path):
 
 # --- main loop: deadline → stop -------------------------------------------- #
 
+
 def test_main_stops_on_deadline(tmp: Path):
     wl = _mk_worker(tmp)
-    (wl.project_dir / L.DEADLINE_FILE).write_text("1")   # epoch 1 = long past
+    (wl.project_dir / L.DEADLINE_FILE).write_text("1")  # epoch 1 = long past
     with _restore_sigterm(), _env(DANUS_ROUND_BEAT="0"):
         _patch_run_round(lambda *a, **k: 0)
         try:
@@ -638,21 +696,726 @@ def test_main_stops_on_deadline(tmp: Path):
 
 # --- main loop: max-rounds cap --------------------------------------------- #
 
+
 def test_main_max_rounds_cap(tmp: Path):
     wl = _mk_worker(tmp)
     calls = []
-    with _restore_sigterm(), _env(DANUS_ROUND_BEAT="0", DANUS_MAX_ROUNDS="2",
-                                  DANUS_MAX_CONSEC_FAILURES="0"):
+    with (
+        _restore_sigterm(),
+        _env(DANUS_ROUND_BEAT="0", DANUS_MAX_ROUNDS="2", DANUS_MAX_CONSEC_FAILURES="0"),
+    ):
         _patch_run_round(lambda *a, **k: (calls.append(1) or 0))
         try:
             rc = loop.main(str(wl.dir))
         finally:
             _unpatch_run_round()
     assert rc == 0
-    assert len(calls) == 2                              # exactly max_rounds rounds ran
+    assert len(calls) == 2  # exactly max_rounds rounds ran
     st = json.loads(wl.status.read_text())
     assert st["state"] == "max_rounds"
     assert st["round"] == 2 and st["last_rc"] == 0
+
+
+def test_reasoning_first_root_uses_pinned_directive_and_2700_timeout(
+    tmp: Path,
+):
+    wl = _mk_worker(tmp)
+    store = _enable_reasoning(wl, roles="high:1", workers=["high"])
+    wl.status.write_text(
+        json.dumps(
+            {
+                "last_paid_turn": {"model": "stale-app-server-model"},
+                "last_turn_token_usage": {"total": {"totalTokens": 99}},
+                "last_turn_token_usage_observed": True,
+                "last_turn_token_usage_finality": "stale",
+                "last_turn_status": "completed",
+                "last_turn_model": "stale-app-server-model",
+                "last_turn_effort": "stale",
+                "last_turn_model_rerouted": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    observed = []
+    evidence_ids = []
+
+    def one_round(_worker, _role, prompt, log_path, hard_timeout):
+        observed.append((prompt, hard_timeout, log_path.name))
+        provenance = store.paid_slot_provenance("high")
+        assert provenance is not None
+        evidence_ids.append(
+            GlobalMemory(wl.project_dir).append(
+                "obstacle",
+                claim="bounded recovery probe",
+                evidence="",
+                author="high",
+                links={"coordination": provenance},
+            )
+        )
+        log_path.write_text("terminal\n", encoding="utf-8")
+        return 0
+
+    with (
+        _restore_sigterm(),
+        _env(
+            DANUS_WORKER_TRANSPORT="exec",
+            DANUS_ROUND_BEAT="0",
+            DANUS_ROUND_HARD_TIMEOUT="14400",
+            DANUS_MAX_ROUNDS="1",
+            DANUS_MAX_CONSEC_FAILURES="0",
+        ),
+    ):
+        _patch_run_round(one_round)
+        try:
+            assert loop.main(str(wl.dir)) == 0
+        finally:
+            _unpatch_run_round()
+
+    assert len(observed) == 1
+    prompt, hard_timeout, log_name = observed[0]
+    assert hard_timeout == 2700
+    assert "lane=root" in prompt and "generation=1" in prompt
+    assert log_name == "round_1.log"
+    status = json.loads(wl.status.read_text(encoding="utf-8"))
+    assert status["round"] == 1 and status["coordination_mode"] == "reasoning_first_v1"
+    assert status["last_turn_reasoning_bandwidth"]["finality"] == "unavailable"
+    assert status["last_turn_token_usage"] is None
+    assert status["last_turn_token_usage_observed"] is None
+    assert status["last_turn_token_usage_finality"] == "unavailable"
+    assert status["last_turn_status"] is None
+    assert status["last_turn_model"] is None
+    assert status["last_turn_effort"] is None
+    assert status["last_turn_model_rerouted"] is None
+    assert status["last_paid_turn"] is None
+    assert store.evidence_entry(evidence_ids[0]) is not None
+    assert store.project_status()["generation"] == 2
+
+
+def test_reasoning_first_unset_transport_defaults_to_app_server(
+    tmp: Path,
+    monkeypatch,
+):
+    wl = _mk_worker(tmp)
+    store = _enable_reasoning(wl, roles="high:1", workers=["high"])
+    calls = []
+
+    class FakeHotJoinStore:
+        def __init__(self, _project_dir):
+            pass
+
+        def latest_round_audit(self, _worker):
+            return None
+
+    def app_round(
+        _worker,
+        _role,
+        prompt,
+        log_path,
+        hard_timeout,
+        *,
+        coordination_provenance,
+    ):
+        calls.append((prompt, hard_timeout))
+        assert coordination_provenance["lane"] == "root"
+        log_path.write_text("app-server terminal\n", encoding="utf-8")
+        return 0
+
+    def reconcile(
+        coordination_store,
+        _hotjoin_store,
+        *,
+        admission,
+        expected_adapter_rc=None,
+        **_kwargs,
+    ):
+        if expected_adapter_rc is None:
+            return None
+        assert expected_adapter_rc == 0
+        coordination_store.complete(admission.slot_id, outcome="terminal_rc_0")
+        return {"effective_adapter_rc": 0}
+
+    monkeypatch.setattr(loop, "HotJoinStore", FakeHotJoinStore)
+    monkeypatch.setattr(loop, "_reconcile_coordination_terminal_receipt", reconcile)
+    monkeypatch.setattr(loop, "run_round_app_server", app_round)
+    monkeypatch.setattr(
+        loop,
+        "run_round",
+        lambda *_args, **_kwargs: pytest.fail("unset reasoning-first used exec"),
+    )
+    with (
+        _restore_sigterm(),
+        _env(
+            DANUS_WORKER_TRANSPORT=None,
+            DANUS_ROUND_BEAT="0",
+            DANUS_MAX_ROUNDS="1",
+            DANUS_MAX_CONSEC_FAILURES="0",
+        ),
+    ):
+        assert loop.main(str(wl.dir)) == 0
+
+    assert len(calls) == 1
+    assert calls[0][1] == 2700 and "lane=root" in calls[0][0]
+    assert store.project_status()["generation"] == 2
+
+
+def test_terminal_hotjoin_receipt_reconciles_before_attempt_or_transport(
+    tmp: Path,
+    monkeypatch,
+):
+    wl = _mk_worker(tmp)
+    store = _enable_reasoning(wl, roles="high:1", workers=["high"])
+    admission = store.admit("high")
+    assert admission is not None
+    prompt = loop.kickoff(wl.project, "high", admission.directive)
+    admission = store.pin_prompt(admission.slot_id, prompt)
+    admission = store.activate(admission.slot_id)
+
+    hotjoin = HotJoinStore(wl.project_dir)
+    hotjoin.set_thread_id("high", "thread-crash-cut")
+    intent = hotjoin.round_intent(
+        "high",
+        "thread-crash-cut",
+        prompt_sha256=str(admission.prompt_sha256),
+        requested_model="model",
+        requested_effort="high",
+        coordination_slot_id=admission.slot_id,
+        coordination_generation=admission.generation,
+        coordination_lane=admission.lane,
+    )
+    hotjoin.record_round_intent(
+        intent["client_id"],
+        "started",
+        turn_id="turn-crash-cut",
+        expected_states={"prepared"},
+    )
+    audit = (
+        json.dumps(
+            {
+                "event": "turn_completed",
+                "terminal_observed": True,
+                "thread_id": "thread-crash-cut",
+                "turn_id": "turn-crash-cut",
+                "status": "completed",
+                "requested_model": "model",
+                "requested_effort": "high",
+                "actual_model": "model",
+                "effective_adapter_rc": 0,
+                "coordination_disposition": "completed",
+            },
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    hotjoin.finalize_round(
+        intent["client_id"],
+        audit,
+        thread_id="thread-crash-cut",
+        turn_id="turn-crash-cut",
+        terminal_status="completed",
+        effective_adapter_rc=0,
+        disposition="completed",
+    )
+
+    original_write_status = loop.write_status
+
+    def stop_after_reconciliation(worker_layout, **fields):
+        original_write_status(worker_layout, **fields)
+        attempt = fields.get("last_attempt")
+        if (
+            isinstance(attempt, dict)
+            and attempt.get("phase") == "coordination_terminal_reconciliation"
+        ):
+            wl.stop.write_text("stop after recovery\n", encoding="utf-8")
+
+    monkeypatch.setattr(loop, "write_status", stop_after_reconciliation)
+    monkeypatch.setattr(
+        loop,
+        "run_round_app_server",
+        lambda *_args, **_kwargs: pytest.fail(
+            "terminal receipt recovery must not call app-server"
+        ),
+    )
+    with (
+        _restore_sigterm(),
+        _env(
+            DANUS_WORKER_TRANSPORT=None,
+            DANUS_ROUND_BEAT="0",
+            DANUS_MAX_ROUNDS="0",
+            DANUS_MAX_CONSEC_FAILURES="0",
+        ),
+    ):
+        assert loop.main(str(wl.dir)) == 0
+
+    status = json.loads(wl.status.read_text(encoding="utf-8"))
+    assert status["state"] == "stopped"
+    assert status["round"] == 0
+    assert status["last_attempt"]["phase"] == "coordination_terminal_reconciliation"
+    assert status["last_attempt"]["client_id"] == intent["client_id"]
+    assert list(wl.logs.glob("round_*.log")) == []
+    assert store.project_status()["generation"] == 2
+
+
+def test_critic_review_terminal_receipt_retires_thread_and_never_needs_redispatch(
+    tmp: Path,
+):
+    wl = _mk_worker(tmp)
+    store = _enable_reasoning(
+        wl,
+        roles="high:2",
+        workers=["high", "high2"],
+    )
+    root = store.admit("high")
+    critic = store.admit("high2")
+    assert root is not None and critic is not None
+    for admission in (root, critic):
+        store.pin_prompt(admission.slot_id, admission.directive)
+        store.activate(admission.slot_id)
+    store.record_root_evidence(
+        "high",
+        "obstacle",
+        entry_id="review_receipt_root",
+        slot_id=root.slot_id,
+    )
+    store.complete(root.slot_id, outcome="terminal_rc_0")
+    store.complete(critic.slot_id, outcome="terminal_rc_0")
+    review = store.admit("high2")
+    assert review is not None
+    review = store.pin_prompt(
+        review.slot_id,
+        loop.kickoff(wl.project, "high2", review.directive),
+    )
+    review = store.activate(review.slot_id)
+
+    hotjoin = HotJoinStore(wl.project_dir)
+    hotjoin.set_thread_id("high2", "thread-review-terminal")
+    intent = hotjoin.round_intent(
+        "high2",
+        "thread-review-terminal",
+        prompt_sha256=str(review.prompt_sha256),
+        requested_model="model",
+        requested_effort="high",
+        coordination_slot_id=review.slot_id,
+        coordination_generation=review.generation,
+        coordination_lane=review.lane,
+    )
+    hotjoin.record_round_intent(
+        intent["client_id"],
+        "started",
+        turn_id="turn-review-terminal",
+        expected_states={"prepared"},
+    )
+    audit = (
+        json.dumps(
+            {
+                "event": "turn_completed",
+                "terminal_observed": True,
+                "thread_id": "thread-review-terminal",
+                "turn_id": "turn-review-terminal",
+                "status": "completed",
+                "requested_model": "model",
+                "requested_effort": "high",
+                "effective_adapter_rc": 0,
+                "coordination_disposition": "completed",
+            },
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    hotjoin.finalize_round(
+        intent["client_id"],
+        audit,
+        thread_id="thread-review-terminal",
+        turn_id="turn-review-terminal",
+        terminal_status="completed",
+        effective_adapter_rc=0,
+        disposition="completed",
+    )
+    assert hotjoin.thread_id("high2") is None
+
+    receipt = loop._reconcile_coordination_terminal_receipt(
+        store,
+        hotjoin,
+        project_dir=wl.project_dir,
+        worker="high2",
+        admission=review,
+        role={"MODEL": "model", "REASONING_EFFORT": "high"},
+    )
+    assert receipt is not None
+    assert receipt["client_id"] == intent["client_id"]
+    status = store.project_status()
+    assert status["generation"] == 2
+    assert status["review"] is None
+    assert hotjoin.thread_id("high2") is None
+
+
+def test_concurrent_terminal_receipt_restarts_are_idempotent(tmp: Path):
+    wl = _mk_worker(tmp)
+    store = _enable_reasoning(wl, roles="high:1", workers=["high"])
+    admission = store.admit("high")
+    assert admission is not None
+    admission = store.pin_prompt(
+        admission.slot_id,
+        loop.kickoff(wl.project, "high", admission.directive),
+    )
+    admission = store.activate(admission.slot_id)
+
+    hotjoin = HotJoinStore(wl.project_dir)
+    hotjoin.set_thread_id("high", "thread-concurrent-cut")
+    intent = hotjoin.round_intent(
+        "high",
+        "thread-concurrent-cut",
+        prompt_sha256=str(admission.prompt_sha256),
+        requested_model="model",
+        requested_effort="high",
+        coordination_slot_id=admission.slot_id,
+        coordination_generation=admission.generation,
+        coordination_lane=admission.lane,
+    )
+    hotjoin.record_round_intent(
+        intent["client_id"],
+        "started",
+        turn_id="turn-concurrent-cut",
+        expected_states={"prepared"},
+    )
+    payload = (
+        json.dumps(
+            {
+                "event": "turn_completed",
+                "terminal_observed": True,
+                "thread_id": "thread-concurrent-cut",
+                "turn_id": "turn-concurrent-cut",
+                "status": "completed",
+                "requested_model": "model",
+                "requested_effort": "high",
+                "effective_adapter_rc": 0,
+                "coordination_disposition": "completed",
+            },
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    hotjoin.finalize_round(
+        intent["client_id"],
+        payload,
+        thread_id="thread-concurrent-cut",
+        turn_id="turn-concurrent-cut",
+        terminal_status="completed",
+        effective_adapter_rc=0,
+        disposition="completed",
+    )
+
+    barrier = threading.Barrier(2)
+    receipts: list[dict[str, object]] = []
+    errors: list[BaseException] = []
+
+    def restart_reconcile() -> None:
+        try:
+            local_coordination = CoordinationStore(
+                wl.project_dir,
+                store.metadata,
+                create=False,
+            )
+            local_hotjoin = HotJoinStore(wl.project_dir)
+            barrier.wait()
+            receipt = loop._reconcile_coordination_terminal_receipt(
+                local_coordination,
+                local_hotjoin,
+                project_dir=wl.project_dir,
+                worker="high",
+                admission=admission,
+                role={"MODEL": "model", "REASONING_EFFORT": "high"},
+            )
+            assert receipt is not None
+            receipts.append(receipt)
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=restart_reconcile) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+    assert not any(thread.is_alive() for thread in threads)
+    assert errors == []
+    assert len(receipts) == 2
+    assert receipts[0]["receipt_sha256"] == receipts[1]["receipt_sha256"]
+    assert store.project_status()["generation"] == 2
+    assert list(wl.logs.glob("round_*.log")) == []
+
+
+@pytest.mark.parametrize(
+    ("operator_action", "expected_dispatch_state"),
+    [
+        ("cancelled_not_dispatched", "none"),
+        ("abandoned_outcome_unknown", "unknown"),
+    ],
+)
+def test_operator_terminal_receipt_never_redispatches_coordination_slot(
+    tmp: Path,
+    monkeypatch,
+    operator_action: str,
+    expected_dispatch_state: str,
+):
+    wl = _mk_worker(tmp)
+    store = _enable_reasoning(wl, roles="high:1", workers=["high"])
+    admission = store.admit("high")
+    assert admission is not None
+    admission = store.pin_prompt(
+        admission.slot_id,
+        loop.kickoff(wl.project, "high", admission.directive),
+    )
+    admission = store.activate(admission.slot_id)
+
+    hotjoin = HotJoinStore(wl.project_dir)
+    hotjoin.set_thread_id("high", "thread-operator-cut")
+    intent = hotjoin.round_intent(
+        "high",
+        "thread-operator-cut",
+        prompt_sha256=str(admission.prompt_sha256),
+        requested_model="model",
+        requested_effort="high",
+        coordination_slot_id=admission.slot_id,
+        coordination_generation=admission.generation,
+        coordination_lane=admission.lane,
+    )
+    if operator_action == "cancelled_not_dispatched":
+        hotjoin.cancel_prepared_round_intent(
+            target="high",
+            thread_id="thread-operator-cut",
+            client_id=intent["client_id"],
+            reason="cancel exact prepared turn",
+        )
+    else:
+        hotjoin.record_round_intent(
+            intent["client_id"],
+            "started",
+            turn_id="turn-operator-cut",
+            expected_states={"prepared"},
+        )
+        store.mark_ambiguous(admission.slot_id)
+        hotjoin.abandon_round_intent(
+            target="high",
+            thread_id="thread-operator-cut",
+            client_id=intent["client_id"],
+            expected_state="started",
+            reason="accept exact paid outcome risk",
+            acknowledge_paid_outcome_unknown=True,
+        )
+
+    monkeypatch.setattr(
+        loop,
+        "run_round_app_server",
+        lambda *_args, **_kwargs: pytest.fail(
+            "operator receipt recovery must never call app-server"
+        ),
+    )
+    with (
+        _restore_sigterm(),
+        _env(
+            DANUS_WORKER_TRANSPORT=None,
+            DANUS_ROUND_BEAT="0",
+            DANUS_MAX_ROUNDS="0",
+            DANUS_MAX_CONSEC_FAILURES="0",
+        ),
+    ):
+        assert loop.main(str(wl.dir)) == 126
+
+    status = json.loads(wl.status.read_text(encoding="utf-8"))
+    assert status["state"] == "error" and status["round"] == 0
+    assert status["last_attempt"]["phase"] == "coordination_operator_reconciliation"
+    assert status["last_attempt"]["dispatch_state"] == expected_dispatch_state
+    assert operator_action in status["last_attempt"]["failure_code"]
+    assert list(wl.logs.glob("round_*.log")) == []
+    assert store.project_status()["generation"] == 2
+
+
+@pytest.mark.parametrize("ambiguous", [False, True])
+def test_reasoning_first_exec_restart_never_redispatches_unknown_paid_slot(
+    tmp: Path,
+    ambiguous: bool,
+):
+    wl = _mk_worker(tmp)
+    store = _enable_reasoning(wl, roles="high:1", workers=["high"])
+    prior = store.admit("high")
+    assert prior is not None
+    store.pin_prompt(prior.slot_id, "pinned before exec crash")
+    store.activate(prior.slot_id)
+    if ambiguous:
+        store.mark_ambiguous(prior.slot_id)
+    calls = []
+
+    with (
+        _restore_sigterm(),
+        _env(
+            DANUS_WORKER_TRANSPORT="exec",
+            DANUS_ROUND_BEAT="0",
+            DANUS_MAX_ROUNDS="1",
+        ),
+    ):
+        _patch_run_round(lambda *args, **kwargs: calls.append((args, kwargs)))
+        try:
+            assert loop.main(str(wl.dir)) == 126
+        finally:
+            _unpatch_run_round()
+
+    status = json.loads(wl.status.read_text(encoding="utf-8"))
+    assert status["state"] == "error" and status["round"] == 0
+    assert "prior exec paid outcome" in status["recovery_required"]
+    assert calls == [] and list(wl.logs.glob("round_*.log")) == []
+    assert store.project_status()["paid_active"] == 1
+
+
+def test_waiting_observer_honors_stop_without_attempt_round_log_or_codex(
+    tmp: Path,
+    monkeypatch,
+):
+    wl = _mk_worker(tmp, "high")
+    store = _enable_reasoning(
+        wl,
+        roles="xhigh:2,high:1",
+        workers=["xhigh", "xhigh2", "high"],
+    )
+    codex_calls = []
+
+    def stop_after_wait(_seconds):
+        wl.stop.write_text("graceful\n", encoding="utf-8")
+
+    monkeypatch.setattr(loop.time, "sleep", stop_after_wait)
+    with _restore_sigterm(), _env(DANUS_ROUND_BEAT="0"):
+        _patch_run_round(lambda *args, **kwargs: codex_calls.append((args, kwargs)))
+        try:
+            assert loop.main(str(wl.dir)) == 0
+        finally:
+            _unpatch_run_round()
+
+    status = json.loads(wl.status.read_text(encoding="utf-8"))
+    assert status["state"] == "stopped" and status["round"] == 0
+    assert codex_calls == []
+    assert list(wl.logs.glob("round_*.log")) == []
+    worker_coordination = store.project_status("high")
+    assert worker_coordination["lane"] == "observer"
+    assert worker_coordination["admission_state"] == "waiting_admission"
+
+
+def test_active_candidate_makes_new_lane_wait_without_paid_attempt(
+    tmp: Path,
+    monkeypatch,
+):
+    critic_wl = _mk_worker(tmp, "xhigh2")
+    store = _enable_reasoning(
+        critic_wl,
+        roles="xhigh:2",
+        workers=["xhigh", "xhigh2"],
+    )
+    root = store.admit("xhigh")
+    assert root is not None
+    store.pin_prompt(root.slot_id, root.directive)
+    store.activate(root.slot_id)
+    receipt = candidate_receipt_id(
+        slot_id=root.slot_id,
+        candidate_fact_id="a" * 16,
+        candidate_fact_identity="c" * 64,
+        source_id=None,
+        context_digest="b" * 64,
+    )
+    candidate = store.register_candidate(
+        "xhigh",
+        receipt,
+        slot_id=root.slot_id,
+        candidate_fact_id="a" * 16,
+        candidate_fact_identity="c" * 64,
+        source_id=None,
+        context_digest="b" * 64,
+    )
+    calls = []
+
+    def stop_after_wait(_seconds):
+        critic_wl.stop.write_text("graceful\n", encoding="utf-8")
+
+    monkeypatch.setattr(loop.time, "sleep", stop_after_wait)
+    with _restore_sigterm(), _env(DANUS_ROUND_BEAT="0"):
+        _patch_run_round(lambda *args, **kwargs: calls.append((args, kwargs)))
+        try:
+            assert loop.main(str(critic_wl.dir)) == 0
+        finally:
+            _unpatch_run_round()
+
+    status = json.loads(critic_wl.status.read_text(encoding="utf-8"))
+    assert status["round"] == 0 and status["state"] == "stopped"
+    assert status["candidate"] == candidate
+    assert calls == [] and list(critic_wl.logs.glob("round_*.log")) == []
+    assert store.project_status("xhigh2")["admission_state"] == "waiting_admission"
+
+
+def test_app_server_ambiguous_restart_reuses_exact_pinned_prompt(
+    tmp: Path,
+    monkeypatch,
+):
+    wl = _mk_worker(tmp)
+    store = _enable_reasoning(wl, roles="high:1", workers=["high"])
+    prompts: list[str] = []
+    results = [loop.APP_SERVER_PROTOCOL_FAILURE_RC, 0]
+
+    class FakeHotJoinStore:
+        def __init__(self, _project_dir):
+            pass
+
+        def latest_round_audit(self, _worker):
+            return None
+
+    def app_round(
+        _worker,
+        _role,
+        prompt,
+        _log_path,
+        hard_timeout,
+        *,
+        coordination_provenance,
+    ):
+        prompts.append(prompt)
+        assert hard_timeout == 2700
+        assert coordination_provenance["lane"] == "root"
+        return results.pop(0)
+
+    terminal_calls = 0
+
+    def reconcile(
+        coordination_store,
+        _hotjoin_store,
+        *,
+        admission,
+        expected_adapter_rc=None,
+        **_kwargs,
+    ):
+        nonlocal terminal_calls
+        if expected_adapter_rc is None:
+            return None
+        terminal_calls += 1
+        if expected_adapter_rc == loop.APP_SERVER_PROTOCOL_FAILURE_RC:
+            return None
+        coordination_store.complete(admission.slot_id, outcome="terminal_rc_0")
+        return {"effective_adapter_rc": 0}
+
+    monkeypatch.setattr(loop, "HotJoinStore", FakeHotJoinStore)
+    monkeypatch.setattr(loop, "_reconcile_coordination_terminal_receipt", reconcile)
+    monkeypatch.setattr(loop, "run_round_app_server", app_round)
+    with (
+        _restore_sigterm(),
+        _env(
+            DANUS_WORKER_TRANSPORT="app-server",
+            DANUS_ROUND_BEAT="0",
+            DANUS_MAX_ROUNDS="1",
+            DANUS_MAX_CONSEC_FAILURES="0",
+        ),
+    ):
+        assert loop.main(str(wl.dir)) == 126
+        assert store.project_status()["paid_active"] == 1
+        assert loop.main(str(wl.dir)) == 0
+
+    assert len(prompts) == 2 and prompts[0] == prompts[1]
+    assert terminal_calls == 2
+    assert "lane=root" in prompts[0]
+    assert store.project_status()["generation"] == 2
 
 
 def test_main_restart_preserves_old_logs_and_advances_round_sequence(tmp: Path):
@@ -668,10 +1431,13 @@ def test_main_restart_preserves_old_logs_and_advances_round_sequence(tmp: Path):
         log_path.write_text(f"new {log_path.name}\n", encoding="utf-8")
         return 0
 
-    with _restore_sigterm(), _env(
-        DANUS_ROUND_BEAT="0",
-        DANUS_MAX_ROUNDS="1",
-        DANUS_MAX_CONSEC_FAILURES="0",
+    with (
+        _restore_sigterm(),
+        _env(
+            DANUS_ROUND_BEAT="0",
+            DANUS_MAX_ROUNDS="1",
+            DANUS_MAX_CONSEC_FAILURES="0",
+        ),
     ):
         _patch_run_round(one_round)
         try:
@@ -691,13 +1457,18 @@ def test_main_restart_preserves_old_logs_and_advances_round_sequence(tmp: Path):
 
 # --- main loop: consecutive-failure cap → error / rc 1 --------------------- #
 
+
 def test_main_consecutive_failure_cap(tmp: Path):
     wl = _mk_worker(tmp)
-    with _restore_sigterm(), _env(DANUS_ROUND_BEAT="0", DANUS_MAX_CONSEC_FAILURES="2",
-                                  DANUS_MAX_ROUNDS="0"):
+    with (
+        _restore_sigterm(),
+        _env(DANUS_ROUND_BEAT="0", DANUS_MAX_CONSEC_FAILURES="2", DANUS_MAX_ROUNDS="0"),
+    ):
+
         def _fail(w, role, prompt, log_path, ht):
             log_path.write_text('"fact_id": "0123456789abcdef"\n')
-            return 5                                    # a failing rc (not 0/124)
+            return 5  # a failing rc (not 0/124)
+
         _patch_run_round(_fail)
         try:
             rc = loop.main(str(wl.dir))
@@ -714,8 +1485,10 @@ def test_main_timeout_rc124_does_not_count_as_failure(tmp: Path):
     """rc 124 (hard-timeout) resets the consecutive-failure counter, so a run of
     124s never trips the failure cap — it must stop via max_rounds instead."""
     wl = _mk_worker(tmp)
-    with _restore_sigterm(), _env(DANUS_ROUND_BEAT="0", DANUS_MAX_CONSEC_FAILURES="2",
-                                  DANUS_MAX_ROUNDS="3"):
+    with (
+        _restore_sigterm(),
+        _env(DANUS_ROUND_BEAT="0", DANUS_MAX_CONSEC_FAILURES="2", DANUS_MAX_ROUNDS="3"),
+    ):
         _patch_run_round(lambda *a, **k: 124)
         try:
             rc = loop.main(str(wl.dir))
@@ -726,6 +1499,7 @@ def test_main_timeout_rc124_does_not_count_as_failure(tmp: Path):
 
 
 # --- main loop: codex missing (127) short-circuits ------------------------- #
+
 
 def test_main_codex_missing_127(tmp: Path):
     wl = _mk_worker(tmp)
@@ -742,12 +1516,15 @@ def test_main_codex_missing_127(tmp: Path):
 
 # --- main: bad worker dir → rc 2 ------------------------------------------- #
 
+
 def test_main_missing_worker_dir(tmp: Path):
     rc = loop.main(str(tmp / "nope"))
     assert rc == 2
 
 
-def test_main_gateway_preflight_fails_before_any_state_or_launch(tmp: Path, monkeypatch):
+def test_main_gateway_preflight_fails_before_any_state_or_launch(
+    tmp: Path, monkeypatch
+):
     wl = _mk_worker(tmp)
     calls = {"config": 0, "status": 0, "popen": 0}
 
@@ -780,6 +1557,7 @@ def test_main_gateway_preflight_fails_before_any_state_or_launch(tmp: Path, monk
 
 # --- SIGTERM handler: terminate child, write terminated, exit 0 ------------ #
 
+
 def test_main_sigterm_handler(tmp: Path):
     wl = _mk_worker(tmp)
     fake_proc = loop.spawn_owned_child(
@@ -793,7 +1571,7 @@ def test_main_sigterm_handler(tmp: Path):
     def _round(w, role, prompt, log_path, ht):
         loop._Child.proc = fake_proc
         os.kill(os.getpid(), signal.SIGTERM)
-        time.sleep(2)                     # give the signal time to be delivered
+        time.sleep(2)  # give the signal time to be delivered
         return 0
 
     with _restore_sigterm(), _env(DANUS_ROUND_BEAT="0"):
@@ -813,9 +1591,10 @@ def test_main_sigterm_handler(tmp: Path):
 
 # --- write_status: recovers from a corrupt existing status ----------------- #
 
+
 def test_write_status_corrupt_existing_recovers(tmp: Path):
     wl = _mk_worker(tmp)
-    wl.status.write_text("{not json")            # corrupt → JSONDecodeError branch
+    wl.status.write_text("{not json")  # corrupt → JSONDecodeError branch
     loop.write_status(wl, state="running")
     st = json.loads(wl.status.read_text())
     assert st["state"] == "running" and st["worker"] == "high"
@@ -834,11 +1613,13 @@ def test_write_status_legal_nonobject_json_recovers(tmp: Path):
 
 # --- _parse_last_fact_id: unreadable path → None --------------------------- #
 
+
 def test_parse_last_fact_id_missing_file(tmp: Path):
-    assert loop._parse_last_fact_id(tmp / "no_such.log") is None   # OSError branch
+    assert loop._parse_last_fact_id(tmp / "no_such.log") is None  # OSError branch
 
 
 # --- _cleanup_pid: only removes a .pid that points at us ------------------- #
+
 
 def test_cleanup_pid_removes_own(tmp: Path):
     wl = _mk_worker(tmp)
@@ -851,18 +1632,19 @@ def test_cleanup_pid_keeps_foreign(tmp: Path):
     wl = _mk_worker(tmp)
     wl.pid.write_text(json.dumps({"schema_version": 1, "pid": 999_999_999}))
     loop._cleanup_pid(wl)
-    assert wl.pid.exists()                     # left intact
+    assert wl.pid.exists()  # left intact
 
 
 def test_cleanup_pid_swallows_oserror(tmp: Path):
     """A .pid that cannot be read (here: it is a directory) → OSError swallowed."""
     wl = _mk_worker(tmp)
-    wl.pid.mkdir()                             # read_text on a dir raises OSError
-    loop._cleanup_pid(wl)                      # must not raise
+    wl.pid.mkdir()  # read_text on a dir raises OSError
+    loop._cleanup_pid(wl)  # must not raise
     assert wl.pid.exists()
 
 
 # --- main loop: positive beat sleeps between rounds ------------------------ #
+
 
 def test_main_beat_sleep_between_rounds(tmp: Path):
     """A positive DANUS_ROUND_BEAT makes the loop sleep between rounds; we stub
@@ -872,13 +1654,19 @@ def test_main_beat_sleep_between_rounds(tmp: Path):
     orig_sleep = time.sleep
 
     def _one_then_stop(*a, **k):
-        wl.stop.touch()          # stop after the first round completes
+        wl.stop.touch()  # stop after the first round completes
         return 0
 
     time.sleep = lambda s: slept.append(s)
     try:
-        with _restore_sigterm(), _env(DANUS_ROUND_BEAT="7", DANUS_MAX_ROUNDS="0",
-                                      DANUS_MAX_CONSEC_FAILURES="0"):
+        with (
+            _restore_sigterm(),
+            _env(
+                DANUS_ROUND_BEAT="7",
+                DANUS_MAX_ROUNDS="0",
+                DANUS_MAX_CONSEC_FAILURES="0",
+            ),
+        ):
             _patch_run_round(_one_then_stop)
             try:
                 rc = loop.main(str(wl.dir))
@@ -887,10 +1675,11 @@ def test_main_beat_sleep_between_rounds(tmp: Path):
     finally:
         time.sleep = orig_sleep
     assert rc == 0
-    assert 7 in slept                          # the beat sleep fired once
+    assert 7 in slept  # the beat sleep fired once
 
 
 # --- kickoff prompt -------------------------------------------------------- #
+
 
 def test_kickoff_mentions_worker_and_project():
     p = loop.kickoff("ProjX", "wkrY")
@@ -898,6 +1687,7 @@ def test_kickoff_mentions_worker_and_project():
 
 
 # --- __main__ entry -------------------------------------------------------- #
+
 
 def test_dunder_main_dispatches(tmp: Path):
     """runpy the package as __main__ with the loop entry patched: the guard runs
@@ -927,7 +1717,7 @@ def test_dunder_main_dispatches(tmp: Path):
 def test_dunder_main_usage_guard():
     """Wrong argc → usage message + exit 2 (no dispatch)."""
     argv = sys.argv
-    sys.argv = ["prog"]                        # missing worker_dir
+    sys.argv = ["prog"]  # missing worker_dir
     try:
         try:
             runpy.run_module("danus.execution", run_name="__main__")
@@ -940,9 +1730,11 @@ def test_dunder_main_usage_guard():
 
 # --- layout defaults (no env overrides) ------------------------------------ #
 
+
 def test_layout_defaults_and_empties(tmp: Path):
-    with _env(DANUS_WORKER_CONTRACT=None, DANUS_WORKER_SKILLS=None,
-              DANUS_AGENTS_ROOT=None):
+    with _env(
+        DANUS_WORKER_CONTRACT=None, DANUS_WORKER_SKILLS=None, DANUS_AGENTS_ROOT=None
+    ):
         # repo_root / worker_md / worker_skills_dir defaults
         rr = L.repo_root()
         assert L.worker_md() == rr / "agents" / "contracts" / "worker.md"
@@ -957,11 +1749,12 @@ def test_layout_defaults_and_empties(tmp: Path):
 
 # --- scaffold.symlink branches --------------------------------------------- #
 
+
 def test_symlink_skips_existing(tmp: Path):
     target = tmp / "target"
     target.write_text("x")
     link = tmp / "link"
-    link.write_text("already here")            # link path exists → early return
+    link.write_text("already here")  # link path exists → early return
     scaffold.symlink(target, link)
     assert link.read_text() == "already here"  # untouched
 
@@ -971,8 +1764,205 @@ def test_symlink_swallows_oserror(tmp: Path):
     target.write_text("x")
     # a link path whose parent does not exist → os.symlink raises OSError, swallowed
     link = tmp / "no_parent_dir" / "link"
-    scaffold.symlink(target, link)             # must not raise
+    scaffold.symlink(target, link)  # must not raise
     assert not link.exists()
+
+
+def test_legacy_project_without_coordination_runs_real_exec_loop_without_store(
+    tmp: Path,
+):
+    wl = _mk_worker(tmp)
+    metadata = {
+        "name": wl.project,
+        "model": "legacy-model",
+        "roles": "high:1",
+        "workers": ["high"],
+    }
+    (wl.project_dir / "project.json").write_text(
+        json.dumps(metadata),
+        encoding="utf-8",
+    )
+    wl.role.write_text(
+        "MODEL=legacy-model\nREASONING_EFFORT=high\nROLE=high\nDANUS_AUTHOR=high\n",
+        encoding="utf-8",
+    )
+    marker = tmp / "legacy-exec-argv.json"
+    fake = _write_fake_codex(
+        tmp,
+        "import json, pathlib, sys\n"
+        f"pathlib.Path({str(marker)!r}).write_text(json.dumps(sys.argv[1:]))\n",
+    )
+
+    with (
+        _restore_sigterm(),
+        _env(
+            DANUS_CODEX_BIN=str(fake),
+            DANUS_WORKER_TRANSPORT=None,
+            DANUS_ROUND_BEAT="0",
+            DANUS_ROUND_HARD_TIMEOUT="30",
+            DANUS_MAX_ROUNDS="1",
+            DANUS_MAX_CONSEC_FAILURES="0",
+        ),
+    ):
+        assert loop.main(str(wl.dir)) == 0
+
+    argv = json.loads(marker.read_text(encoding="utf-8"))
+    assert argv[0] == "exec"
+    assert "--json" in argv
+    assert "--dangerously-bypass-approvals-and-sandbox" in argv
+    assert not (wl.project_dir / ".coordination").exists()
+    status = json.loads(wl.status.read_text(encoding="utf-8"))
+    assert status["coordination_mode"] == "legacy"
+    assert status["last_rc"] == 0
+    assert status["state"] == "max_rounds"
+
+
+def _runtime_attestation_response(worker_dir: Path) -> dict[str, object]:
+    return {
+        "thread": {"id": "thread-release-attestation", "cwd": str(worker_dir)},
+        "model": "release-model",
+        "reasoningEffort": "max",
+        "cwd": str(worker_dir),
+        "approvalPolicy": "never",
+        "sandbox": {
+            "type": "workspaceWrite",
+            "networkAccess": False,
+            "writableRoots": [str(worker_dir / "local_memory")],
+        },
+        "runtimeWorkspaceRoots": [str(worker_dir / "runtime-root")],
+    }
+
+
+def _weaken_runtime_attestation(response: dict[str, object], field: str) -> None:
+    thread = response["thread"]
+    sandbox = response["sandbox"]
+    assert isinstance(thread, dict) and isinstance(sandbox, dict)
+    if field == "model":
+        response["model"] = "rerouted-model"
+    elif field == "response_cwd":
+        response["cwd"] = "/tmp/outside-danus-worker"
+    elif field == "thread_cwd":
+        thread["cwd"] = "/tmp/outside-danus-worker"
+    elif field == "approval_policy":
+        response["approvalPolicy"] = "on-request"
+    elif field == "sandbox_type":
+        sandbox["type"] = "dangerFullAccess"
+    elif field == "network_access":
+        sandbox["networkAccess"] = True
+    elif field == "writable_roots_missing":
+        sandbox.pop("writableRoots")
+    elif field == "writable_root_escape":
+        sandbox["writableRoots"] = ["/tmp/outside-danus-worker"]
+    elif field == "runtime_roots_type":
+        response["runtimeWorkspaceRoots"] = "not-a-list"
+    elif field == "runtime_root_escape":
+        response["runtimeWorkspaceRoots"] = ["/tmp/outside-danus-worker"]
+    else:  # pragma: no cover - test table is the exhaustive caller
+        raise AssertionError(field)
+
+
+@pytest.mark.parametrize(
+    ("field", "error"),
+    [
+        ("model", "exact model"),
+        ("response_cwd", "exact worker cwd"),
+        ("thread_cwd", "exact worker cwd"),
+        ("approval_policy", "weakened approvalPolicy"),
+        ("sandbox_type", "weakened workspace sandbox"),
+        ("network_access", "weakened workspace sandbox"),
+        ("writable_roots_missing", "omitted writableRoots"),
+        ("writable_root_escape", "writable root escapes"),
+        ("runtime_roots_type", "attestation is malformed"),
+        ("runtime_root_escape", "workspace root escapes"),
+    ],
+)
+def test_weakened_runtime_attestation_fails_before_turn_start(
+    tmp: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    error: str,
+):
+    wl = _mk_worker(tmp)
+    response = _runtime_attestation_response(wl.dir)
+    _weaken_runtime_attestation(response, field)
+    rpc_methods: list[str] = []
+    captured_argv: list[str] = []
+
+    class FakeClient:
+        process = None
+
+        def __init__(self, argv, **_kwargs):
+            captured_argv.extend(argv)
+
+        def start(self):
+            return None
+
+        def initialize(self):
+            return None
+
+        def rpc(self, method, _params, timeout=None):
+            del timeout
+            rpc_methods.append(method)
+            if method == "model/list":
+                return {
+                    "data": [
+                        {
+                            "id": "release-model",
+                            "supportedReasoningEfforts": [
+                                {"reasoningEffort": "max"}
+                            ],
+                        }
+                    ]
+                }
+            if method == "thread/start":
+                return response
+            if method == "turn/start":
+                pytest.fail("weakened runtime attestation reached paid turn/start")
+            raise AssertionError(method)
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(loop, "require_gateway_runtime", lambda: None)
+    monkeypatch.setattr(loop.codex, "resolve_bin", lambda: "/opt/danus/codex")
+    monkeypatch.setattr(loop, "resolved_executable", lambda value: value)
+    monkeypatch.setattr(loop.codex, "subprocess_env", lambda _binary: {})
+    monkeypatch.setattr(loop, "preflight_app_server", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(loop, "_prepare_model_workspace", lambda _worker: wl.dir)
+    monkeypatch.setattr(loop, "AppServerClient", FakeClient)
+
+    log = wl.dir / f"attestation-{field}.log"
+    assert (
+        loop.run_round_app_server(
+            wl,
+            {"MODEL": "release-model", "REASONING_EFFORT": "max"},
+            "must not be dispatched",
+            log,
+            hard_timeout=1,
+        )
+        == loop.APP_SERVER_PROTOCOL_FAILURE_RC
+    )
+    assert rpc_methods == ["model/list", "thread/start"]
+    assert "turn/start" not in rpc_methods
+    assert error in log.read_text(encoding="utf-8")
+    assert captured_argv == loop.app_server_argv(
+        "/opt/danus/codex",
+        loop._worker_mcp_config_arg(wl),
+    )
+
+
+def test_app_server_argv_is_one_exact_strict_config_override() -> None:
+    override = 'mcp_servers={danus={command="/venv/python"}}'
+    assert loop.app_server_argv("/opt/danus/codex", override) == [
+        "/opt/danus/codex",
+        "app-server",
+        "--stdio",
+        "--strict-config",
+        "--config",
+        override,
+    ]
+    with pytest.raises(ValueError, match="absolute"):
+        loop.app_server_argv("codex", override)
 
 
 # --- runner ---------------------------------------------------------------- #

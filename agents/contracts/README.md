@@ -6,8 +6,8 @@ the binding operating protocol, distinct from the on-demand skills under
 
 | File | Tier | Reads / writes |
 | --- | --- | --- |
-| `main_agent.md` | main agent (Claude Code) | reads global memory + fact graph (`fact_search` / `fact_context`); writes `master_guidance` / `elaboration` (`gm_add`); `fact_revoke`; high-autonomy orchestration. NO `fact_submit`. |
-| `worker.md` | codex worker | local memory (private) · global memory (`gm_add` / `gm_search`) · fact graph (`fact_search` / `fact_context` / `fact_submit`); the adaptive proving loop. Loaded per round via the worker home's `AGENTS.md` symlink. |
+| `main_agent.md` | main agent (Claude Code) | reads global memory (`gm_search` / exact bounded `gm_get`) + fact graph (`fact_search` / `fact_context`); writes actual consulted `master_guidance` / `elaboration` / exact-recommendation bounded `advisor_checkpoint` (`gm_add`); `fact_revoke`; high-autonomy orchestration. NO `fact_submit`. |
+| `worker.md` | codex worker | local memory (private) · global memory (`gm_add` / exact bounded `gm_get` / BM25 `gm_search`) · fact graph (`fact_search` / `fact_context` / `fact_submit`); the adaptive proving loop. In reasoning-first mode, each new terminal coordination slot gets a fresh app-server thread and only same-slot crash recovery resumes. Loaded per paid turn via the worker home's `AGENTS.md` symlink. |
 | `verifier.md` | codex verifier (verify service) | judges a full candidate proof against an adaptive statement-closure context; emits either strict `final` verdict JSON or a bounded `needs_context` request for exact strict-ancestor proofs; called by `fact_submit`; read-only (only `search_arxiv_theorems`); the CLI captures its schema-constrained last message. |
 
 Claude Code, the primary main agent, also auto-loads its condensed contract from
@@ -26,6 +26,9 @@ Consistent across all three tiers:
 - **Global memory** (incl. `master_guidance`) is shared awareness/strategy, never
   a correctness source — a proof builds only on `fact_id`s.
 - **The shared stores change only through the sanctioned MCP tools**, never by hand.
+- **Reasoning-first paid work is one fixed root plus one fixed critic.** Dormant
+  observers consume no paid turns and are not an automatic rotation/failover
+  pool; 2700 seconds caps one paid turn, not the whole phase.
 
 ## Who binds to these files
 

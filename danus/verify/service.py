@@ -1,6 +1,7 @@
 """Danus verify service — the mathematical authority behind the write-gate.
 
-    POST /verify {expected_output_protocol_version,
+    POST /verify {expected_verifier_instance_nonce,
+                  expected_output_protocol_version,
                   expected_verifier_bundle_digest,
                   statement, proof, glossary_introduces?, fact_context?}
       -> {output_schema_version, verification_status, verification_report,
@@ -10,9 +11,12 @@
                                        instance_nonce: <guardian nonce>,
                                        output_protocol_version: 3,
                                        verifier_bundle_digest: <sha256>}
+    GET  /scheduler                 -> bounded counts/limits/counters only
 
 /verify runs the deterministic pre-checks (``prechecks.run_prechecks``) and, if
-they pass, cold-starts a fresh codex verifier (``launcher.run_codex_verification``)
+they pass, enters a bounded FIFO scheduler. Exact duplicates coalesce or reuse a
+nonce-bound completed-result cache; a distinct leader cold-starts a fresh codex
+verifier (``launcher.run_codex_verification``)
 whose verdict the gateway's ``fact_submit`` uses to decide whether a claim becomes
 a fact. The verifier is an LLM, NOT a formal proof assistant, with no human in the
 loop by default — see the verifier contract (``agents/contracts/verifier.md``).
@@ -25,9 +29,9 @@ import os
 import re
 import asyncio
 import threading
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Mapping, Optional
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -35,16 +39,28 @@ from danus.core import (
     VERIFICATION_OUTPUT_PROTOCOL_VERSION,
     VERIFICATION_CONTEXT_PROJECTION,
     VERIFICATION_CONTEXT_SCHEMA_VERSION,
+    validate_verification_output,
     verification_context_digest,
 )
 from danus.gateway_runtime import GatewayRuntimeUnavailable, require_gateway_runtime
 
 from .launcher import (
     VERIFIER_BUNDLE_DIGEST,
+    VerificationExecutionProfile,
     _allocate_run_id,
+    capture_execution_profile,
     run_codex_verification,
 )
 from .prechecks import run_prechecks
+from .scheduler import (
+    SCHEDULER_KEY_SCHEMA,
+    SchedulerLimits,
+    SchedulerReceipt,
+    SchedulerRejected,
+    SchedulerWorkFailed,
+    VerificationScheduler,
+    canonical_sha256,
+)
 
 
 _FACT_ID_RE = re.compile(r"^[0-9a-f]{16}$")
@@ -69,18 +85,22 @@ def _positive_int_env(name: str, default: int) -> int:
     return value
 
 
+def _condition_wait_int_env(name: str, default: int) -> int:
+    """Read one positive timeout that is safe for ``Condition.wait``."""
+
+    value = _positive_int_env(name, default)
+    if value > threading.TIMEOUT_MAX:
+        raise RuntimeError(f"{name} must not exceed threading.TIMEOUT_MAX")
+    return value
+
+
 # These checks run before FastAPI/Pydantic buffers or parses the JSON request.
-# One admitted request corresponds to at most one expensive cold Codex launch.
+# Upload admission is intentionally independent from the paid scheduler: many
+# bounded bodies may be parsed while exactly one verifier process is running.
 VERIFY_MAX_REQUEST_BYTES = _positive_int_env("DANUS_VERIFY_MAX_REQUEST_BYTES", 1_000_000)
 VERIFY_BODY_TIMEOUT_SECONDS = _positive_int_env("DANUS_VERIFY_BODY_TIMEOUT_SECONDS", 10)
-VERIFY_MAX_CONCURRENT_REQUESTS = _positive_int_env(
-    "DANUS_VERIFY_MAX_CONCURRENT_REQUESTS", 1
-)
-_ADMISSION_SLOTS = threading.BoundedSemaphore(VERIFY_MAX_CONCURRENT_REQUESTS)
-# This lease is intentionally separate from ASGI body admission.  A sync
-# endpoint continues in Starlette's thread pool after a client disconnect or
-# task cancellation; only the paid job itself may release this semaphore.
-_PAID_JOB_SLOTS = threading.BoundedSemaphore(VERIFY_MAX_CONCURRENT_REQUESTS)
+VERIFY_MAX_BODY_UPLOADS = _positive_int_env("DANUS_VERIFY_MAX_BODY_UPLOADS", 32)
+_ADMISSION_SLOTS = threading.BoundedSemaphore(VERIFY_MAX_BODY_UPLOADS)
 
 _raw_instance_nonce = os.getenv("DANUS_VERIFY_INSTANCE_NONCE")
 if _raw_instance_nonce is None:
@@ -90,6 +110,37 @@ elif re.fullmatch(r"[0-9a-f]{32}", _raw_instance_nonce):
 else:
     # Fail import/startup rather than exposing an ambiguous health identity.
     raise RuntimeError("DANUS_VERIFY_INSTANCE_NONCE must be 128-bit lowercase hex")
+
+
+def _scheduler_limits_from_env() -> SchedulerLimits:
+    return SchedulerLimits(
+        max_distinct_queue=_positive_int_env("DANUS_VERIFY_QUEUE_LIMIT", 4),
+        queue_wait_seconds=_condition_wait_int_env(
+            "DANUS_VERIFY_QUEUE_WAIT_SECONDS", 1800
+        ),
+        max_waiters_per_key=_positive_int_env(
+            "DANUS_VERIFY_MAX_WAITERS_PER_KEY", 8
+        ),
+        max_total_waiters=_positive_int_env("DANUS_VERIFY_MAX_WAITERS", 32),
+        cache_max_entries=_positive_int_env("DANUS_VERIFY_CACHE_MAX_ENTRIES", 64),
+        cache_max_bytes=_positive_int_env(
+            "DANUS_VERIFY_CACHE_MAX_BYTES", 16 * 1024 * 1024
+        ),
+        cache_ttl_seconds=_positive_int_env(
+            "DANUS_VERIFY_CACHE_TTL_SECONDS", 3600
+        ),
+    )
+
+
+_SCHEDULER = VerificationScheduler(
+    instance_nonce=VERIFY_INSTANCE_NONCE,
+    limits=_scheduler_limits_from_env(),
+)
+
+SCHEDULER_SOURCE_HEADER = "X-Danus-Verify-Scheduler"
+SCHEDULER_KEY_HEADER = "X-Danus-Verify-Key"
+SCHEDULER_WAIT_HEADER = "X-Danus-Verify-Wait-Ms"
+SCHEDULER_REJECTION_HEADER = "X-Danus-Verify-Rejection"
 
 
 def _preflight_gateway_or_500() -> None:
@@ -418,6 +469,7 @@ def _validate_fact_context(
 class VerifyRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    expected_verifier_instance_nonce: str = Field(..., min_length=1)
     expected_output_protocol_version: int = Field(..., strict=True)
     expected_verifier_bundle_digest: str = Field(
         ..., pattern=r"^[0-9a-f]{64}$"
@@ -508,36 +560,190 @@ async def health() -> Dict[str, Any]:
     }
 
 
-def _run_paid_verification(
-    request: VerifyRequest, *, fact_context: Optional[Dict[str, Any]]
+@app.get("/scheduler")
+async def scheduler_snapshot() -> Dict[str, Any]:
+    """Expose bounded counts only; request keys and proof data stay private."""
+    return _SCHEDULER.snapshot()
+
+
+def _scheduler_key(
+    request: VerifyRequest, *, execution_profile: Mapping[str, Any]
+) -> str:
+    return canonical_sha256(
+        {
+            "schema": SCHEDULER_KEY_SCHEMA,
+            "service_instance_nonce": VERIFY_INSTANCE_NONCE,
+            "output_protocol_version": VERIFICATION_OUTPUT_PROTOCOL_VERSION,
+            "verifier_bundle_digest": VERIFIER_BUNDLE_DIGEST,
+            "execution_profile": dict(execution_profile),
+            "request": {
+                "statement": request.statement,
+                "proof": request.proof,
+                "glossary_introduces": request.glossary_introduces,
+                "fact_context": request.fact_context,
+            },
+        }
+    )
+
+
+def _validated_completed_result(
+    result: Dict[str, Any],
+    *,
+    request: VerifyRequest,
+    fact_context: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    """Own the paid lease in the sync worker until Codex is truly terminal."""
-    if not _PAID_JOB_SLOTS.acquire(blocking=False):
-        # This happens before result-directory allocation and before Codex.
-        raise HTTPException(status_code=429, detail="verification service is busy")
+    """Independently validate every HTTP-200 value before it is cacheable."""
+    if not isinstance(result, dict):
+        raise HTTPException(status_code=500, detail="verifier result is not an object")
+    authority_fields = {
+        "output_schema_version",
+        "verification_status",
+        "verification_report",
+        "verdict",
+        "needs_expanded_proofs",
+        "repair_hints",
+    }
+    optional_fields = {"verification_metrics"}
+    unknown = set(result) - authority_fields - optional_fields
+    missing = authority_fields - set(result)
+    if missing or unknown:
+        raise HTTPException(
+            status_code=500,
+            detail="verifier result has an invalid service envelope",
+        )
+    authority_payload = {field: result[field] for field in authority_fields}
     try:
+        validated = validate_verification_output(
+            authority_payload,
+            statement=request.statement,
+            proof=request.proof,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"verifier result failed independent service validation: {exc}",
+        ) from exc
+    completed: Dict[str, Any] = dict(validated)
+    if "verification_metrics" in result:
+        metrics = result["verification_metrics"]
+        if not isinstance(metrics, dict):
+            raise HTTPException(
+                status_code=500,
+                detail="verification_metrics must be an object",
+            )
+        completed["verification_metrics"] = metrics
+    if fact_context is not None:
+        completed["verification_context_digest"] = fact_context["digest"]
+    return completed
+
+
+def _scheduler_headers(
+    *, source: str, key: str, wait_ms: int, rejection: Optional[str] = None
+) -> Dict[str, str]:
+    headers = {
+        SCHEDULER_SOURCE_HEADER: source,
+        SCHEDULER_KEY_HEADER: key,
+        SCHEDULER_WAIT_HEADER: str(max(0, wait_ms)),
+    }
+    if rejection is not None:
+        headers[SCHEDULER_REJECTION_HEADER] = rejection
+    return headers
+
+
+def _raise_scheduled_failure(failure: SchedulerWorkFailed) -> None:
+    headers = _scheduler_headers(
+        source=failure.source,
+        key=failure.key,
+        wait_ms=failure.wait_ms,
+    )
+    cause = failure.cause
+    if isinstance(cause, SchedulerRejected):
+        headers[SCHEDULER_REJECTION_HEADER] = cause.reason
+        raise HTTPException(
+            status_code=429,
+            detail=cause.detail,
+            headers=headers,
+        ) from cause
+    if isinstance(cause, HTTPException):
+        merged = dict(cause.headers or {})
+        merged.update(headers)
+        raise HTTPException(
+            status_code=cause.status_code,
+            detail=cause.detail,
+            headers=merged,
+        ) from cause
+    if isinstance(cause, Exception):
+        raise HTTPException(
+            status_code=500,
+            detail="verification scheduler leader failed",
+            headers=headers,
+        ) from cause
+    raise cause
+
+
+def _run_scheduled_verification(
+    request: VerifyRequest,
+    *,
+    fact_context: Optional[Dict[str, Any]],
+    execution_profile: VerificationExecutionProfile,
+) -> SchedulerReceipt:
+    key = _scheduler_key(
+        request,
+        execution_profile=execution_profile.canonical(),
+    )
+
+    def paid_leader() -> Dict[str, Any]:
+        # Only the FIFO leader reaches preflight/allocation/launch.  Its sync
+        # worker remains alive after ASGI cancellation until the owned verifier
+        # process group is terminal and this function returns or raises.
         _preflight_gateway_or_500()
         run_id = _allocate_run_id(request.statement)
         kwargs: Dict[str, Any] = {
             "run_id": run_id,
             "statement": request.statement,
             "proof": request.proof,
+            "execution_profile": execution_profile,
         }
         if fact_context is not None:
             kwargs["fact_context"] = fact_context
         if request.glossary_introduces:
             kwargs["glossary_introduces"] = request.glossary_introduces
-        return run_codex_verification(**kwargs)
-    finally:
-        _PAID_JOB_SLOTS.release()
+        result = run_codex_verification(**kwargs)
+        return _validated_completed_result(
+            result,
+            request=request,
+            fact_context=fact_context,
+        )
+
+    try:
+        return _SCHEDULER.execute(key, paid_leader)
+    except SchedulerRejected as exc:
+        raise HTTPException(
+            status_code=429,
+            detail=exc.detail,
+            headers=_scheduler_headers(
+                source="rejected",
+                key=key,
+                wait_ms=0,
+                rejection=exc.reason,
+            ),
+        ) from exc
+    except SchedulerWorkFailed as failure:
+        _raise_scheduled_failure(failure)
+        raise AssertionError("scheduled failure did not raise")
 
 
 @app.post("/verify")
-def verify(request: VerifyRequest) -> Dict[str, Any]:
+def verify(request: VerifyRequest, response: Response) -> Dict[str, Any]:
     # This is the first endpoint action: a stale caller is rejected before
     # prechecks, result-directory allocation, gateway preflight, or Codex.  The
     # digest echoed from /health also closes a service-restart race between the
     # gateway's health probe and this POST.
+    if request.expected_verifier_instance_nonce != VERIFY_INSTANCE_NONCE:
+        raise HTTPException(
+            status_code=409,
+            detail="verifier instance changed after caller health preflight",
+        )
     if (
         request.expected_output_protocol_version
         != VERIFICATION_OUTPUT_PROTOCOL_VERSION
@@ -569,7 +775,19 @@ def verify(request: VerifyRequest) -> Dict[str, Any]:
                     "internal fact_id"
                 ),
             )
-        return _run_paid_verification(request, fact_context=None)
+        execution_profile = capture_execution_profile()
+        receipt = _run_scheduled_verification(
+            request,
+            fact_context=None,
+            execution_profile=execution_profile,
+        )
+        for name, value in _scheduler_headers(
+            source=receipt.source,
+            key=receipt.key,
+            wait_ms=receipt.wait_ms,
+        ).items():
+            response.headers[name] = value
+        return receipt.value
     try:
         _validate_fact_context(
             request.fact_context,
@@ -599,11 +817,16 @@ def verify(request: VerifyRequest) -> Dict[str, Any]:
             + "; ".join(details)
             + ")",
         )
-    result = _run_paid_verification(request, fact_context=request.fact_context)
-    # Server-side attestation: the gateway requires this exact digest. An older
-    # service that silently ignores the new request field cannot accidentally
-    # authorize a context-free write during a rolling upgrade.
-    return {
-        **result,
-        "verification_context_digest": request.fact_context["digest"],
-    }
+    execution_profile = capture_execution_profile()
+    receipt = _run_scheduled_verification(
+        request,
+        fact_context=request.fact_context,
+        execution_profile=execution_profile,
+    )
+    for name, value in _scheduler_headers(
+        source=receipt.source,
+        key=receipt.key,
+        wait_ms=receipt.wait_ms,
+    ).items():
+        response.headers[name] = value
+    return receipt.value

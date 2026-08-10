@@ -26,11 +26,11 @@ The `bin/` wrappers source `env.sh` for you. Values below are the defaults from
 These live in `config/codex.env`. See `getting-started.md` §2 and
 `scripts/setup-codex.sh`.
 
-## Strategy consult (the system's brain)
+## Optional strategy consult
 
 | variable | default | meaning |
 |---|---|---|
-| `DANUS_CONSULT_TRANSPORT` | `gpt_pro` | `gpt_pro` \| `claude_api` \| `claude_code` \| `off` |
+| `DANUS_CONSULT_TRANSPORT` | `off` | optional attended transport: `off` \| `gpt_pro` \| `claude_api` \| `claude_code`; paid/API transports are explicit opt-ins |
 | `DANUS_CONSULT_API_KEY` | — | (gpt_pro) key for the OpenAI-compatible Responses API |
 | `DANUS_CONSULT_BASE_URL` | `https://api.openai.com/v1` | (gpt_pro) endpoint |
 | `DANUS_CONSULT_MODEL` | `gpt-5.5-pro` | (gpt_pro) model |
@@ -49,7 +49,14 @@ These live in `config/codex.env`. See `getting-started.md` §2 and
 - `gpt_pro` = a paid, per-token OpenAI-compatible model. `claude_api` = the
   Anthropic API via the native SDK (per-token, BYO key; cost from real usage).
   `claude_code` = your Claude subscription via the Claude Code CLI (`claude -p`).
-  `off` = the main agent reasons on its own, no consult.
+- `chatgpt_pro_browser` is a different, Chrome-only handoff and is never an
+  environment choice. The reasoning-first coordinator must first expose its exact
+  current content-free recommendation; only then may the attended main agent
+  prepare the bound question, stop, and obtain the owner's per-question
+  authorization. Broad blocked/stuck evidence alone is insufficient. Merely
+  setting the environment value fails closed and creates no request. See
+  `browser-advisor.md`.
+- `off` = the main agent reasons on its own, no consult.
 - The `claude_code` consult runs **isolated**: a throwaway cwd, no settings and no MCP
   servers loaded (`--setting-sources "" --strict-mcp-config` — needs a recent
   `claude` CLI), web-only tools, and the prompt on stdin (never argv, which is
@@ -88,7 +95,14 @@ is an independent `xhigh` default and intentionally does not inherit
 | `DANUS_VERIFY_MAX_PROMPT_BYTES` | `200000` | maximum final UTF-8 verifier prompt (candidate + escaped context + envelope); overflow returns 413 before Codex starts |
 | `DANUS_VERIFY_MAX_REQUEST_BYTES` | `1000000` | maximum `/verify` request-body bytes, enforced before JSON model parsing |
 | `DANUS_VERIFY_BODY_TIMEOUT_SECONDS` | `10` | total request-body upload deadline before HTTP 408 |
-| `DANUS_VERIFY_MAX_CONCURRENT_REQUESTS` | `1` | pre-parse verifier admission slots; excess requests get HTTP 429 |
+| `DANUS_VERIFY_MAX_BODY_UPLOADS` | `32` | bounded request-body upload/parser slots, independent of paid verification |
+| `DANUS_VERIFY_QUEUE_LIMIT` | `4` | maximum queued distinct verifier request identities; paid concurrency remains fixed at one |
+| `DANUS_VERIFY_QUEUE_WAIT_SECONDS` | `1800` | maximum FIFO wait for distinct work |
+| `DANUS_VERIFY_MAX_WAITERS_PER_KEY` | `8` | followers allowed to coalesce onto one exact in-flight request |
+| `DANUS_VERIFY_MAX_WAITERS` | `32` | total queued and coalesced waiting callers |
+| `DANUS_VERIFY_CACHE_MAX_ENTRIES` | `64` | per-process validated-success LRU entries |
+| `DANUS_VERIFY_CACHE_MAX_BYTES` | `16777216` | total canonical result bytes in the verifier cache |
+| `DANUS_VERIFY_CACHE_TTL_SECONDS` | `3600` | monotonic TTL for validated-success cache entries |
 | `VERIFY_HOST` | `127.0.0.1` | verify bind host (keep loopback — see security doc) |
 
 ## Runtime data locations (gitignored, under `runtime/`)
@@ -106,11 +120,20 @@ is an independent `xhigh` default and intentionally does not inherit
 
 | variable | default | meaning |
 |---|---|---|
-| `DANUS_ROUND_HARD_TIMEOUT` | `14400` (4h) | per-round wall-clock cap |
+| `DANUS_ROUND_HARD_TIMEOUT` | `14400` (4h) | legacy-mode per-round wall-clock cap; each reasoning-first paid turn uses its project-pinned 2700-second cap (this does not claim the whole two-lane phase finishes in 2700 seconds) |
 | `DANUS_MAX_ROUNDS` | `0` (unlimited) | round backstop |
 | `DANUS_MAX_CONSEC_FAILURES` | `5` | bail after N consecutive failed rounds |
 | `DANUS_ROUND_BEAT` | `5` | seconds between rounds |
-| `DANUS_WORKER_TRANSPORT` | `exec` | `app-server` enables durable owner same-turn hot-join; local protocol schema is checked before any paid turn |
+| `DANUS_WORKER_TRANSPORT` | context-dependent | when unset, reasoning-first projects use `app-server` and legacy projects use `exec`; an explicit `exec` remains a compatibility opt-out and reports reasoning telemetry unavailable |
+
+`danus new` defaults to `--coordination reasoning-first`, which persists
+`max_paid_workers=2` and `phase_timeout_seconds=2700` in `project.json`. A
+reasoning-first project without explicit `--roles` uses `max:2,high:5`: the two
+`max` workers are the fixed paid root/critic lanes and the five `high` workers
+are dormant observers. Explicit `--roles` is preserved. Explicit legacy without
+roles uses `high:3,xhigh:4`; a project created by an older release without a
+`coordination` field remains legacy and is never silently migrated to different
+paid-turn semantics.
 
 ## Rendering & misc
 

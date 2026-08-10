@@ -11,4 +11,4 @@ export CODEX_HOME
 export CODEX_TIMEOUT_SECONDS="${CODEX_TIMEOUT_SECONDS:-900}"
 export VERIFY_HOST="${VERIFY_HOST:-127.0.0.1}" VERIFY_PORT
 echo "[start-verify] port=$VERIFY_PORT model=${DANUS_VERIFY_MODEL:-$DANUS_CODEX_MODEL}/${DANUS_VERIFY_EFFORT:-xhigh} CODEX_HOME=$CODEX_HOME"
-exec "$DANUS_PY" -m danus.verify
+exec "$DANUS_PY" -I -B -m danus.verify

@@ -25,7 +25,8 @@ Env (all optional; tests inject these):
   DANUS_ROUND_HARD_TIMEOUT   per-round hard timeout, seconds (default 14400 = 4h)
   DANUS_MAX_ROUNDS           round backstop, 0 = unlimited (default 0)
   DANUS_MAX_CONSEC_FAILURES  bail after this many consecutive failed rounds (default 5)
-  DANUS_WORKER_TRANSPORT     exec (compatibility default) or app-server (hot-join)
+  DANUS_WORKER_TRANSPORT     explicit exec/app-server override; when unset,
+                             reasoning-first uses app-server and legacy uses exec
 """
 
 from __future__ import annotations
@@ -36,6 +37,7 @@ import fcntl
 import os
 import re
 import signal
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -46,6 +48,14 @@ from typing import Optional
 from . import layout as L
 from . import scaffold
 from danus import codex
+from danus.coordination import (
+    Admission,
+    CoordinationError,
+    CoordinationStore,
+    coordination_config,
+)
+from danus.coordination.store import load_project_metadata
+from danus.core.global_memory import GlobalMemory
 from danus.gateway_runtime import GatewayRuntimeUnavailable, require_gateway_runtime
 from danus.hotjoin import (
     AppServerClient,
@@ -81,6 +91,13 @@ APP_SERVER_MODEL_REROUTED_RC = 125
 WORKER_STOP_REQUESTED_RC = 130
 THREAD_HISTORY_OVERSIZE_CODE = "thread_history_exceeds_transport_limit"
 MAX_EXEC_LOG_EVENT_BYTES = 8 * 1024 * 1024
+_COORDINATION_TERMINAL_DISPOSITIONS = {
+    0: "completed",
+    APP_SERVER_PROTOCOL_FAILURE_RC: "protocol_failure",
+    124: "hard_timeout",
+    APP_SERVER_MODEL_REROUTED_RC: "model_rerouted_or_unattested",
+    WORKER_STOP_REQUESTED_RC: "owner_stop",
+}
 
 
 def _bounded_protocol_identity(value: str, label: str) -> str:
@@ -96,8 +113,9 @@ def _bounded_protocol_identity(value: str, label: str) -> str:
 
 # --- the per-round prompt (continuation semantics; see worker.md) ----------- #
 
-def kickoff(project: str, worker: str) -> str:
-    return (
+
+def kickoff(project: str, worker: str, directive: str | None = None) -> str:
+    prompt = (
         f"You are worker '{worker}' on project '{project}'. Continue solving the "
         f"problem (this is a continuation round, not a fresh start).\n"
         f"1. Read TASK.md — your current assignment (which direction/subgoal is yours).\n"
@@ -112,6 +130,100 @@ def kickoff(project: str, worker: str) -> str:
         f"5. Persist as you go: rough progress to local memory; shareable findings via "
         f"gm_add; any verified result via fact_submit."
     )
+    if directive is not None:
+        prompt += f"\n\nReasoning-first coordination directive:\n{directive}"
+    return prompt
+
+
+def _terminal_coordination_memory_entries(
+    project_dir: Path,
+    worker: str,
+    *,
+    slot_id: str,
+    generation: int,
+    lane: str,
+) -> list[dict[str, object]]:
+    """Read only evidence channels; the store re-attests exact slot provenance."""
+
+    memory = GlobalMemory(project_dir)
+    entries: list[dict[str, object]] = []
+    expected = {
+        "slot_id": slot_id,
+        "generation": generation,
+        "lane": lane,
+    }
+    for kind in ("obstacle", "dead_end"):
+        for entry in memory.read(kind):
+            if not isinstance(entry, dict) or entry.get("author") != worker:
+                continue
+            links = entry.get("links")
+            if isinstance(links, dict) and links.get("coordination") == expected:
+                entries.append(entry)
+    return entries
+
+
+def _reconcile_coordination_terminal_receipt(
+    coordination_store: CoordinationStore,
+    hotjoin_store: HotJoinStore,
+    *,
+    project_dir: Path,
+    worker: str,
+    admission: Admission,
+    role: dict,
+    expected_adapter_rc: Optional[int] = None,
+) -> Optional[dict[str, object]]:
+    """Close the exact HotJoin-terminal -> coordination crash gap.
+
+    This runs before activation, attempt/log counters, preflight, or transport.
+    Both memory reconciliation and the coordination terminal transition are
+    idempotent, so concurrent restarts may replay this boundary without a new
+    paid dispatch.
+    """
+
+    if admission.prompt is None or admission.prompt_sha256 is None:
+        raise CoordinationError("terminal receipt lookup requires a pinned prompt")
+    receipt = hotjoin_store.terminal_receipt_for_coordination_slot(
+        coordination_slot_id=admission.slot_id,
+        target=worker,
+        coordination_generation=admission.generation,
+        coordination_lane=admission.lane,
+        prompt_sha256=admission.prompt_sha256,
+        requested_model=role["MODEL"],
+        requested_effort=role["REASONING_EFFORT"],
+        thread_id=hotjoin_store.thread_id(worker),
+    )
+    if receipt is None:
+        return None
+    if admission.state not in {"active", "ambiguous"}:
+        raise CoordinationError(
+            "terminal HotJoin receipt conflicts with a prepared coordination slot"
+        )
+    effective_rc = receipt.get("effective_adapter_rc")
+    outcome = receipt.get("coordination_outcome")
+    if (
+        isinstance(effective_rc, bool)
+        or not isinstance(effective_rc, int)
+        or not isinstance(outcome, str)
+        or not outcome
+    ):
+        raise CoordinationError("terminal HotJoin receipt has no exact outcome")
+    if expected_adapter_rc is not None and effective_rc != expected_adapter_rc:
+        raise CoordinationError(
+            "terminal HotJoin receipt conflicts with the adapter return code"
+        )
+    coordination_store.reconcile_terminal_memory_entries(
+        admission.slot_id,
+        worker,
+        _terminal_coordination_memory_entries(
+            project_dir,
+            worker,
+            slot_id=admission.slot_id,
+            generation=admission.generation,
+            lane=admission.lane,
+        ),
+    )
+    coordination_store.complete(admission.slot_id, outcome=outcome)
+    return receipt
 
 
 # --- config (read at call time) -------------------------------------------- #
@@ -122,12 +234,15 @@ def kickoff(project: str, worker: str) -> str:
 
 # --- small helpers --------------------------------------------------------- #
 
+
 def _read_role(wl: L.WorkerLayout, *, protected: bool = False) -> dict:
     if protected:
         try:
             metadata = json.loads(_read_regular_text(wl.project_dir / "project.json"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError, HotJoinError) as exc:
-            raise HotJoinError(f"protected project role metadata unavailable: {exc}") from exc
+            raise HotJoinError(
+                f"protected project role metadata unavailable: {exc}"
+            ) from exc
         if not isinstance(metadata, dict) or not isinstance(metadata.get("model"), str):
             raise HotJoinError("protected project role metadata is malformed")
         roles = metadata.get("roles")
@@ -144,8 +259,12 @@ def _read_role(wl: L.WorkerLayout, *, protected: bool = False) -> dict:
             "ROLE": base,
             "DANUS_AUTHOR": wl.name,
         }
-    out = {"MODEL": codex.model(),
-           "REASONING_EFFORT": "high", "ROLE": "high", "DANUS_AUTHOR": wl.name}
+    out = {
+        "MODEL": codex.model(),
+        "REASONING_EFFORT": "high",
+        "ROLE": "high",
+        "DANUS_AUTHOR": wl.name,
+    }
     rp = wl.role
     try:
         role_text = _read_regular_text(rp)
@@ -164,9 +283,7 @@ def _atomic_write_real_parent(path: Path, text: str, *, mode: int = 0o600) -> No
     """Atomic write pinned to a real directory without following temp symlinks."""
     if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
         raise HotJoinError("host lacks no-follow directory operations")
-    parent_fd = os.open(
-        str(path.parent), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-    )
+    parent_fd = os.open(str(path.parent), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     temp_name = f".{path.name}.danus-{os.getpid()}-{os.urandom(12).hex()}"
     temp_fd: Optional[int] = None
     try:
@@ -242,7 +359,9 @@ def _refresh_workspace_symlink(link: Path, target: Path) -> None:
         pass
     else:
         if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
-            raise HotJoinError(f"model workspace path is an unexpected directory: {link.name}")
+            raise HotJoinError(
+                f"model workspace path is an unexpected directory: {link.name}"
+            )
         os.unlink(link)
     os.symlink(str(target), str(link), target_is_directory=target.is_dir())
 
@@ -419,8 +538,7 @@ def _fact_submit_summary(item: dict) -> Optional[dict]:
             summary[key] = value[key]
     expanded = value.get("expanded_proof_ids")
     if isinstance(expanded, list) and all(
-        isinstance(entry, str) and _FACT_ID_RE.fullmatch(entry)
-        for entry in expanded
+        isinstance(entry, str) and _FACT_ID_RE.fullmatch(entry) for entry in expanded
     ):
         summary["expanded_proof_ids"] = list(expanded)
     return summary
@@ -546,7 +664,7 @@ def _worker_mcp_config_arg(wl: L.WorkerLayout) -> str:
         + json.dumps(wl.name, ensure_ascii=False)
         + ',DANUS_ROLE="worker",DANUS_HOTJOIN_ENABLED="1",DANUS_HOTJOIN_TARGET='
         + json.dumps(wl.name, ensure_ascii=False)
-        + ',DANUS_VERIFY_URL='
+        + ",DANUS_VERIFY_URL="
         + json.dumps(scaffold._verify_url(), ensure_ascii=False)
         + "},tool_timeout_sec=3600,"
         + 'default_tools_approval_mode="approve",required=true}}'
@@ -555,8 +673,10 @@ def _worker_mcp_config_arg(wl: L.WorkerLayout) -> str:
 
 # --- one round ------------------------------------------------------------- #
 
+
 class _Child:
     """Retains the paid-child host so termination can revoke its lease."""
+
     proc: "subprocess.Popen | None" = None
 
 
@@ -614,8 +734,9 @@ def _owned_child_exited_no_reap(proc: subprocess.Popen) -> bool:
     return owned_child_exited_no_reap(proc)
 
 
-def run_round(wl: L.WorkerLayout, role: dict, prompt: str, log_path: Path,
-              hard_timeout: int) -> int:
+def run_round(
+    wl: L.WorkerLayout, role: dict, prompt: str, log_path: Path, hard_timeout: int
+) -> int:
     """Exec one ``codex exec`` continuation session. Returns codex's rc, 124 on
     hard-timeout (terminate → wait 10s → kill), or 127 if the codex binary is
     missing."""
@@ -641,12 +762,16 @@ def run_round(wl: L.WorkerLayout, role: dict, prompt: str, log_path: Path,
         return 126
     codex_bin = codex.resolve_bin()
     cmd = codex.exec_cmd(
-        codex_bin, role["MODEL"], role["REASONING_EFFORT"],
-        "-C", str(wdir),
+        codex_bin,
+        role["MODEL"],
+        role["REASONING_EFFORT"],
+        "-C",
+        str(wdir),
         # Inject the complete gateway object explicitly. Codex does not
         # consistently auto-load ``<worker>/.codex/config.toml`` for exec/MCP
         # discovery, so that file cannot be the production authority.
-        "--config", _worker_mcp_config_arg(wl),
+        "--config",
+        _worker_mcp_config_arg(wl),
         # on an install without .git (tarball download), codex's
         # trusted-directory check refuses to run the worker round
         "--skip-git-repo-check",
@@ -683,8 +808,11 @@ def run_round(wl: L.WorkerLayout, role: dict, prompt: str, log_path: Path,
             return 126
         try:
             _Child.proc = spawn_owned_child(
-                cmd, stdout=logf, stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL, cwd=str(wdir),
+                cmd,
+                stdout=logf,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                cwd=str(wdir),
                 env=codex.subprocess_env(codex_bin),
                 popen=subprocess.Popen,
                 hold_fds=(paid_authority_fd,),
@@ -706,9 +834,7 @@ def run_round(wl: L.WorkerLayout, role: dict, prompt: str, log_path: Path,
                     logf.write("\n[worker_loop] cooperative owner stop requested\n")
                     return WORKER_STOP_REQUESTED_RC
                 remaining = (
-                    0.25
-                    if deadline is None
-                    else max(0.0, deadline - time.monotonic())
+                    0.25 if deadline is None else max(0.0, deadline - time.monotonic())
                 )
                 if deadline is not None and remaining <= 0:
                     _terminate_owned_child(_Child.proc)
@@ -743,9 +869,7 @@ def run_round(wl: L.WorkerLayout, role: dict, prompt: str, log_path: Path,
                         os.close(paid_authority_fd)
 
 
-def _attest_bounded_thread_state(
-    response: object, *, expected_thread_id: str
-) -> str:
+def _attest_bounded_thread_state(response: object, *, expected_thread_id: str) -> str:
     """Validate ``thread/read(includeTurns=false)`` before a terminal resume.
 
     Codex 0.147's generated schema guarantees that this RPC returns the Thread
@@ -780,9 +904,8 @@ def _attest_bounded_thread_state(
 def _app_server_failure_code(exc: BaseException, *, phase: str) -> str:
     if isinstance(exc, OwnedChildHostLost) or phase == "app_server_host_lost":
         return "app_server_host_lost"
-    if (
-        phase == "thread_resume"
-        and "app-server JSONL line exceeds hard limit" in str(exc)
+    if phase == "thread_resume" and "app-server JSONL line exceeds hard limit" in str(
+        exc
     ):
         return THREAD_HISTORY_OVERSIZE_CODE
     return "app_server_failure"
@@ -802,6 +925,8 @@ def _build_app_server_audit(
     reroute_snapshot: Optional[dict] = None,
     post_terminal_settle_bound_ms: Optional[int] = None,
     token_usage_finality_override: Optional[str] = None,
+    effective_adapter_rc: Optional[int] = None,
+    coordination_disposition: Optional[str] = None,
 ) -> str:
     """Write bounded service metadata and trusted model/tool completions only.
 
@@ -809,6 +934,28 @@ def _build_app_server_audit(
     log cannot become a second copy of the intervention transcript.
     """
     usage = client.token_usage(thread_id, turn_id)
+    reasoning_reader = getattr(client, "reasoning_bandwidth", None)
+    if callable(reasoning_reader):
+        try:
+            reasoning_bandwidth = reasoning_reader(thread_id, turn_id, terminal)
+        except Exception:
+            reasoning_bandwidth = {
+                "schema": "danus_reasoning_bandwidth_v1",
+                "scope": "root_thread_only",
+                "finality": "partial",
+                "finality_reasons": ["reasoning_telemetry_read_error"],
+                "growth_samples_are_not_schema_attested_inferences": True,
+            }
+    else:
+        # Older test/rollback clients do not expose item telemetry.  Keep the
+        # field explicit and content-free; absence must never masquerade as 0.
+        reasoning_bandwidth = {
+            "schema": "danus_reasoning_bandwidth_v1",
+            "scope": "root_thread_only",
+            "finality": "partial",
+            "finality_reasons": ["reasoning_telemetry_unavailable"],
+            "growth_samples_are_not_schema_attested_inferences": True,
+        }
     reroutes = (
         reroute_snapshot
         if reroute_snapshot is not None
@@ -839,9 +986,7 @@ def _build_app_server_audit(
         raw = text.encode("utf-8")
         if len(raw) <= limit:
             return text
-        return (
-            f"[omitted bytes={len(raw)} sha256={hashlib.sha256(raw).hexdigest()}]"
-        )
+        return f"[omitted bytes={len(raw)} sha256={hashlib.sha256(raw).hexdigest()}]"
 
     def bounded_json(value: object, *, limit: int = 64 * 1024) -> object:
         if value is None:
@@ -864,9 +1009,9 @@ def _build_app_server_audit(
     omitted_hash = hashlib.sha256()
 
     def encode(record: dict) -> bytes:
-        return (
-            json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n"
-        ).encode("utf-8")
+        return (json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n").encode(
+            "utf-8"
+        )
 
     def append_record(record: dict, *, item_projection: bool = False) -> None:
         nonlocal retained_bytes, omitted_items, omitted_bytes
@@ -904,6 +1049,7 @@ def _build_app_server_audit(
             "token_usage": bounded_json(usage),
             "token_usage_observed": usage is not None,
             "token_usage_finality": token_usage_finality,
+            "reasoning_bandwidth": bounded_json(reasoning_bandwidth),
             "post_terminal_settle_bound_ms": post_terminal_settle_bound_ms,
             "requested_model": bounded_scalar(requested_model),
             "requested_effort": bounded_scalar(requested_effort),
@@ -922,6 +1068,15 @@ def _build_app_server_audit(
             "model_reroute_observation": bounded_scalar(reroute_observation),
             "model_reroutes": bounded_json(reroutes),
             "failure": bounded_scalar(failure, limit=4096),
+            **(
+                {
+                    "effective_adapter_rc": effective_adapter_rc,
+                    "coordination_disposition": coordination_disposition,
+                }
+                if effective_adapter_rc is not None
+                and coordination_disposition is not None
+                else {}
+            ),
         }
     )
 
@@ -1034,9 +1189,10 @@ def _attest_thread_runtime(
             # an uncaught worker exception.
             return None
 
-    if canonical(response.get("cwd")) != expected_cwd or canonical(
-        thread.get("cwd")
-    ) != expected_cwd:
+    if (
+        canonical(response.get("cwd")) != expected_cwd
+        or canonical(thread.get("cwd")) != expected_cwd
+    ):
         raise ProtocolError("thread start/resume did not attest the exact worker cwd")
     if response.get("approvalPolicy") != "never":
         raise ProtocolError("thread start/resume weakened approvalPolicy")
@@ -1057,7 +1213,9 @@ def _attest_thread_runtime(
         try:
             root.relative_to(expected_cwd)
         except ValueError as exc:
-            raise ProtocolError("thread sandbox writable root escapes worker cwd") from exc
+            raise ProtocolError(
+                "thread sandbox writable root escapes worker cwd"
+            ) from exc
     runtime_roots = response.get("runtimeWorkspaceRoots", [])
     if not isinstance(runtime_roots, list):
         raise ProtocolError("thread runtimeWorkspaceRoots attestation is malformed")
@@ -1068,7 +1226,9 @@ def _attest_thread_runtime(
         try:
             root.relative_to(expected_cwd)
         except ValueError as exc:
-            raise ProtocolError("thread runtime workspace root escapes worker cwd") from exc
+            raise ProtocolError(
+                "thread runtime workspace root escapes worker cwd"
+            ) from exc
     effort = response.get("reasoningEffort")
     return thread_id, requested_model, str(effort) if effort is not None else None
 
@@ -1087,11 +1247,15 @@ def _model_catalog_entry(
         if requested_model not in {row.get("id"), row.get("model")}:
             continue
         efforts = row.get("supportedReasoningEfforts")
-        supported = {
-            entry.get("reasoningEffort")
-            for entry in efforts
-            if isinstance(entry, dict)
-        } if isinstance(efforts, list) else set()
+        supported = (
+            {
+                entry.get("reasoningEffort")
+                for entry in efforts
+                if isinstance(entry, dict)
+            }
+            if isinstance(efforts, list)
+            else set()
+        )
         if requested_effort not in supported:
             raise ProtocolError(
                 f"model {requested_model} does not advertise effort {requested_effort}"
@@ -1106,12 +1270,15 @@ def run_round_app_server(
     prompt: str,
     log_path: Path,
     hard_timeout: int,
+    *,
+    coordination_provenance: Optional[dict[str, object]] = None,
 ) -> int:
     """Run one worker turn through app-server with durable human hot-join.
 
-    This transport is opt-in via ``DANUS_WORKER_TRANSPORT=app-server`` while the
-    legacy ``codex exec`` path remains available for rollback.  No model request
-    is made until the local binary's generated protocol schema passes preflight.
+    Reasoning-first projects select this transport when the override is unset;
+    legacy projects retain ``codex exec``, and an explicit ``exec`` remains
+    available for rollback. No model request is made until the local binary's
+    generated protocol schema passes preflight.
     """
     try:
         require_gateway_runtime()
@@ -1142,6 +1309,16 @@ def run_round_app_server(
 
     store = HotJoinStore(wl.project_dir)
     prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    if coordination_provenance is None:
+        coordination_binding: dict[str, object] = {}
+    elif set(coordination_provenance) != {"slot_id", "generation", "lane"}:
+        _best_effort_worker_projection(
+            log_path,
+            "[worker_loop] coordination provenance is malformed\n",
+        )
+        return 126
+    else:
+        coordination_binding = dict(coordination_provenance)
     pending_intent = store.unfinished_round_intent(wl.name)
     stored_thread = store.thread_id(wl.name)
     if pending_intent is not None:
@@ -1150,6 +1327,9 @@ def run_round_app_server(
             "prompt_sha256": prompt_sha256,
             "requested_model": role["MODEL"],
             "requested_effort": role["REASONING_EFFORT"],
+            "coordination_slot_id": coordination_binding.get("slot_id"),
+            "coordination_generation": coordination_binding.get("generation"),
+            "coordination_lane": coordination_binding.get("lane"),
         }
         if stored_thread is None or any(
             pending_intent.get(key) != value for key, value in expected.items()
@@ -1157,7 +1337,7 @@ def run_round_app_server(
             _best_effort_worker_projection(
                 log_path,
                 "[worker_loop] unfinished paid-turn intent conflicts with the "
-                "current thread, prompt, model, or effort\n",
+                "current thread, prompt, model, effort, or coordination slot\n",
             )
             return 126
     try:
@@ -1165,8 +1345,7 @@ def run_round_app_server(
     except (HotJoinError, OSError, UnicodeDecodeError) as exc:
         _best_effort_worker_projection(
             log_path,
-            "[worker_loop] unsafe model workspace: "
-            f"{redact_external_error(exc)}\n",
+            f"[worker_loop] unsafe model workspace: {redact_external_error(exc)}\n",
         )
         return 126
     argv = app_server_argv(codex_bin, _worker_mcp_config_arg(wl))
@@ -1182,8 +1361,7 @@ def run_round_app_server(
         )
         _best_effort_worker_projection(
             log_path,
-            "[worker_loop] paid launch fail-stopped: "
-            f"{redact_external_error(exc)}\n",
+            f"[worker_loop] paid launch fail-stopped: {redact_external_error(exc)}\n",
         )
         return 126
     # Raw app-server stderr can contain untrusted prompt/model/tool material and
@@ -1231,17 +1409,11 @@ def run_round_app_server(
             "attempt_dispatch_state": attempt_dispatch_state,
             "attempt_client_id": round_client_id
             or (
-                pending_intent.get("client_id")
-                if pending_intent is not None
-                else None
+                pending_intent.get("client_id") if pending_intent is not None else None
             ),
             "attempt_thread_id": thread_id or stored_thread,
             "attempt_turn_id": turn_id
-            or (
-                pending_intent.get("turn_id")
-                if pending_intent is not None
-                else None
-            ),
+            or (pending_intent.get("turn_id") if pending_intent is not None else None),
         }
         if failure_code is not unset:
             fields["attempt_failure_code"] = failure_code
@@ -1252,7 +1424,11 @@ def run_round_app_server(
     mark_attempt(failure_code=None, failure=None)
 
     def finalize_turn(
-        terminal: Optional[dict], *, failure: Optional[str] = None,
+        terminal: Optional[dict],
+        *,
+        adapter_rc: int,
+        reroute_overrides_rc: bool = True,
+        failure: Optional[str] = None,
         reroute_observation_unknown: bool = False,
         cached_after_transport_loss: Optional[str] = None,
     ) -> bool:
@@ -1324,6 +1500,16 @@ def run_round_app_server(
                 "round rejected"
             )
             failure = f"{failure}; {reroute_failure}" if failure else reroute_failure
+        effective_adapter_rc = (
+            APP_SERVER_MODEL_REROUTED_RC
+            if round_rejected_for_reroute and reroute_overrides_rc
+            else adapter_rc
+        )
+        coordination_disposition = _COORDINATION_TERMINAL_DISPOSITIONS.get(
+            effective_adapter_rc
+        )
+        if coordination_disposition is None:
+            raise ProtocolError("terminal adapter rc has no coordination disposition")
         audit_payload = _build_app_server_audit(
             client,
             thread_id=thread_id,
@@ -1340,6 +1526,12 @@ def run_round_app_server(
                 f"not_attested_after_{cached_after_transport_loss}"
                 if cached_after_transport_loss is not None
                 else None
+            ),
+            effective_adapter_rc=(
+                effective_adapter_rc if coordination_binding else None
+            ),
+            coordination_disposition=(
+                coordination_disposition if coordination_binding else None
             ),
         )
         if not round_client_id:
@@ -1359,6 +1551,12 @@ def run_round_app_server(
                 thread_id=thread_id,
                 turn_id=turn_id,
                 terminal_status=terminal_status,
+                effective_adapter_rc=(
+                    effective_adapter_rc if coordination_binding else None
+                ),
+                disposition=(
+                    coordination_disposition if coordination_binding else None
+                ),
             )
         else:
             audit_event = store.record_round_attempt_audit(
@@ -1378,6 +1576,7 @@ def run_round_app_server(
             last_turn_token_usage=canonical_meta.get("token_usage"),
             last_turn_token_usage_observed=canonical_meta.get("token_usage_observed"),
             last_turn_token_usage_finality=canonical_meta.get("token_usage_finality"),
+            last_turn_reasoning_bandwidth=canonical_meta.get("reasoning_bandwidth"),
             last_turn_model=canonical_meta.get("actual_model"),
             last_turn_effort=canonical_meta.get("requested_effort"),
             last_turn_model_rerouted=canonical_meta.get("model_rerouted"),
@@ -1468,6 +1667,9 @@ def run_round_app_server(
             prompt_sha256=prompt_sha256,
             requested_model=requested_model,
             requested_effort=requested_effort,
+            coordination_slot_id=coordination_binding.get("slot_id"),  # type: ignore[arg-type]
+            coordination_generation=coordination_binding.get("generation"),  # type: ignore[arg-type]
+            coordination_lane=coordination_binding.get("lane"),  # type: ignore[arg-type]
         )
         requested_model = str(intent["requested_model"])
         requested_effort = str(intent["requested_effort"])
@@ -1484,17 +1686,13 @@ def run_round_app_server(
                 "thread/read", {"threadId": thread_id, "includeTurns": True}
             )
         )
-        located = message_turn(
-            history, round_client_id, expected_thread_id=thread_id
-        )
+        located = message_turn(history, round_client_id, expected_thread_id=thread_id)
         recovered_prior_turn = located is not None
         if located is not None:
             mark_attempt(phase="intent_recovery", dispatch_state="recovered")
             turn_id, recovered_status = located
             _bounded_protocol_identity(turn_id, "recovered turn id")
-            recovered = turn_snapshot(
-                history, turn_id, expected_thread_id=thread_id
-            )
+            recovered = turn_snapshot(history, turn_id, expected_thread_id=thread_id)
             if recovered_status not in {"inProgress", "in_progress"}:
                 terminal = recovered
             else:
@@ -1509,9 +1707,7 @@ def run_round_app_server(
         else:
             unattributed_active = in_progress_turn_id(
                 response, expected_thread_id=thread_id
-            ) or in_progress_turn_id(
-                history, expected_thread_id=thread_id
-            )
+            ) or in_progress_turn_id(history, expected_thread_id=thread_id)
             if unattributed_active:
                 raise ProtocolError(
                     "thread has an in-progress turn not owned by the durable round intent"
@@ -1624,6 +1820,7 @@ def run_round_app_server(
                     terminal = client.terminal_turn(thread_id, turn_id)
             finalize_turn(
                 terminal,
+                adapter_rc=APP_SERVER_MODEL_REROUTED_RC,
                 failure=recovery_failure,
                 reroute_observation_unknown=True,
             )
@@ -1649,6 +1846,11 @@ def run_round_app_server(
             )
             rerouted = finalize_turn(
                 terminal,
+                adapter_rc=(
+                    0
+                    if terminal.get("status") == "completed"
+                    else APP_SERVER_PROTOCOL_FAILURE_RC
+                ),
             )
             if rerouted:
                 return APP_SERVER_MODEL_REROUTED_RC
@@ -1668,9 +1870,7 @@ def run_round_app_server(
             active_turn_id=turn_id,
         )
 
-        deadline = (
-            time.monotonic() + hard_timeout if hard_timeout > 0 else None
-        )
+        deadline = time.monotonic() + hard_timeout if hard_timeout > 0 else None
         timed_out = False
         while terminal is None:
             try:
@@ -1696,14 +1896,17 @@ def run_round_app_server(
                         {"threadId": thread_id, "turnId": turn_id},
                         timeout=10,
                     )
-                    interrupted_terminal = client.wait_turn(
-                        thread_id, turn_id, 10
-                    )
+                    interrupted_terminal = client.wait_turn(thread_id, turn_id, 10)
                 except (HotJoinError, TimeoutError):
                     pass
                 if interrupted_terminal is None:
                     interrupted_terminal = client.terminal_turn(thread_id, turn_id)
-                finalize_turn(interrupted_terminal, failure=stop_failure)
+                finalize_turn(
+                    interrupted_terminal,
+                    adapter_rc=WORKER_STOP_REQUESTED_RC,
+                    reroute_overrides_rc=False,
+                    failure=stop_failure,
+                )
                 return WORKER_STOP_REQUESTED_RC
             if client.model_reroutes(thread_id, turn_id).get("observed") is True:
                 rerouted_terminal = client.terminal_turn(thread_id, turn_id)
@@ -1719,7 +1922,10 @@ def run_round_app_server(
                         pass
                 if rerouted_terminal is None:
                     rerouted_terminal = client.terminal_turn(thread_id, turn_id)
-                finalize_turn(rerouted_terminal)
+                finalize_turn(
+                    rerouted_terminal,
+                    adapter_rc=APP_SERVER_MODEL_REROUTED_RC,
+                )
                 return APP_SERVER_MODEL_REROUTED_RC
             if broker.error is not None:
                 broker_failure = (
@@ -1745,6 +1951,7 @@ def run_round_app_server(
                     broker_terminal = client.terminal_turn(thread_id, turn_id)
                 rerouted = finalize_turn(
                     broker_terminal,
+                    adapter_rc=APP_SERVER_PROTOCOL_FAILURE_RC,
                     failure=broker_failure,
                 )
                 return (
@@ -1759,9 +1966,7 @@ def run_round_app_server(
                 timed_out = True
                 break
             try:
-                terminal = client.wait_turn(
-                    thread_id, turn_id, min(1.0, remaining)
-                )
+                terminal = client.wait_turn(thread_id, turn_id, min(1.0, remaining))
             except TimeoutError:
                 continue
         if timed_out:
@@ -1785,6 +1990,7 @@ def run_round_app_server(
                 interrupted_terminal = client.terminal_turn(thread_id, turn_id)
             rerouted = finalize_turn(
                 interrupted_terminal,
+                adapter_rc=124,
                 failure=timeout_failure,
             )
             return APP_SERVER_MODEL_REROUTED_RC if rerouted else 124
@@ -1801,7 +2007,14 @@ def run_round_app_server(
                 else f"paid turn terminal status={terminal_status}"
             ),
         )
-        rerouted = finalize_turn(terminal)
+        rerouted = finalize_turn(
+            terminal,
+            adapter_rc=(
+                0
+                if terminal.get("status") == "completed"
+                else APP_SERVER_PROTOCOL_FAILURE_RC
+            ),
+        )
         if rerouted:
             return APP_SERVER_MODEL_REROUTED_RC
         return (
@@ -1842,19 +2055,17 @@ def run_round_app_server(
             )
             rerouted = finalize_turn(
                 cached_terminal,
+                adapter_rc=APP_SERVER_PROTOCOL_FAILURE_RC,
                 failure=f"app-server failure: {redact_external_error(exc)}",
                 cached_after_transport_loss=cached_loss,
             )
         else:
             _best_effort_worker_projection(
                 log_path,
-                "[worker_loop] app-server failure: "
-                f"{redact_external_error(exc)}\n",
+                f"[worker_loop] app-server failure: {redact_external_error(exc)}\n",
             )
         return (
-            APP_SERVER_MODEL_REROUTED_RC
-            if rerouted
-            else APP_SERVER_PROTOCOL_FAILURE_RC
+            APP_SERVER_MODEL_REROUTED_RC if rerouted else APP_SERVER_PROTOCOL_FAILURE_RC
         )
     finally:
         broker_stopped = True
@@ -1883,6 +2094,7 @@ def run_round_app_server(
 
 
 # --- the loop -------------------------------------------------------------- #
+
 
 def _cleanup_pid(wl: L.WorkerLayout) -> None:
     """Remove our own .pid if it still points at us (clean exit only)."""
@@ -1960,11 +2172,22 @@ def main(worker_dir: str) -> int:
     project_dir = wl.project_dir
     project = wl.project
     worker = wl.name
-    transport = os.environ.get("DANUS_WORKER_TRANSPORT", "exec").strip().lower()
     try:
+        project_metadata = load_project_metadata(project_dir)
+        coordination = coordination_config(project_metadata)
+        transport_override = os.environ.get("DANUS_WORKER_TRANSPORT")
+        if transport_override is None:
+            transport = "app-server" if coordination.reasoning_first else "exec"
+        else:
+            transport = transport_override.strip().lower()
+        coordination_store = (
+            CoordinationStore(project_dir, project_metadata, create=False)
+            if coordination.reasoning_first
+            else None
+        )
         role = _read_role(wl, protected=transport == "app-server")
-    except HotJoinError as exc:
-        print(f"worker role unavailable: {exc}", file=sys.stderr)
+    except (CoordinationError, HotJoinError, OSError, ValueError) as exc:
+        print(f"worker role/coordination unavailable: {exc}", file=sys.stderr)
         return 126
 
     # Pin the worker's gateway to THIS interpreter (sys.executable = the venv
@@ -1974,7 +2197,7 @@ def main(worker_dir: str) -> int:
     scaffold.write_codex_config(wl)
 
     beat = float(os.environ.get("DANUS_ROUND_BEAT", "5"))
-    hard_timeout = int(os.environ.get("DANUS_ROUND_HARD_TIMEOUT", "14400"))
+    legacy_hard_timeout = int(os.environ.get("DANUS_ROUND_HARD_TIMEOUT", "14400"))
     max_rounds = int(os.environ.get("DANUS_MAX_ROUNDS", "0"))
     max_fail = int(os.environ.get("DANUS_MAX_CONSEC_FAILURES", "5"))
     try:
@@ -1982,7 +2205,48 @@ def main(worker_dir: str) -> int:
     except (HotJoinError, OSError) as exc:
         print(f"unsafe worker logs directory: {exc}", file=sys.stderr)
         return 126
-    prompt = kickoff(project, worker)
+    legacy_prompt = kickoff(project, worker)
+
+    def coordination_fields(snapshot: dict | None) -> dict[str, object]:
+        if snapshot is None:
+            return {
+                "coordination_mode": "legacy",
+                "lane": "legacy",
+                "generation": None,
+                "phase": None,
+                "phase_deadline_at": None,
+                "phase_deadline_exceeded": False,
+                "advisor_reachable": False,
+                "advisor_recommendation_present": False,
+                "advisor_recommendation_ready": False,
+                "fail_stop_reason": None,
+                "review": None,
+                "recommendation": None,
+                "resolution": None,
+                "candidate": None,
+            }
+        return {
+            "coordination_mode": snapshot["mode"],
+            "lane": snapshot.get("lane"),
+            "generation": snapshot["generation"],
+            "phase": snapshot["phase"],
+            "phase_deadline_at": snapshot["phase_deadline_at"],
+            "phase_deadline_exceeded": snapshot["phase_deadline_exceeded"],
+            "advisor_reachable": snapshot["advisor_reachable"],
+            "advisor_recommendation_present": snapshot[
+                "advisor_recommendation_present"
+            ],
+            "advisor_recommendation_ready": snapshot[
+                "advisor_recommendation_ready"
+            ],
+            "fail_stop_reason": snapshot["fail_stop_reason"],
+            "review": snapshot["review"],
+            "recommendation": snapshot["recommendation"],
+            "resolution": snapshot["resolution"],
+            "candidate": snapshot["candidate"],
+            "paid_active": snapshot["paid_active"],
+            "waiting_admission": snapshot["waiting_admission"],
+        }
 
     def _on_term(signum, _frame):
         if _Child.proc is not None:
@@ -1994,7 +2258,18 @@ def main(worker_dir: str) -> int:
     signal.signal(signal.SIGTERM, _on_term)
 
     round_seq = _prior_round_sequence(wl)
-    write_status(wl, state="running", round=round_seq, started_at=time.time())
+    initial_coordination = (
+        coordination_store.project_status(worker)
+        if coordination_store is not None
+        else None
+    )
+    write_status(
+        wl,
+        state="running",
+        round=round_seq,
+        started_at=time.time(),
+        **coordination_fields(initial_coordination),
+    )
     attempts = 0
     consec_fail = 0
     try:
@@ -2010,41 +2285,271 @@ def main(worker_dir: str) -> int:
                 write_status(wl, state="max_rounds")
                 break
 
-            attempts += 1
-            round_seq += 1
-            log_path = wl.logs / f"round_{round_seq}.log"
-            write_status(
-                wl,
-                state="running",
-                round=round_seq,
-                round_started_at=time.time(),
-                error=None,
-                recovery_required=None,
-                attempt_phase="pre_dispatch",
-                attempt_dispatch_state="none",
-                attempt_failure_code=None,
-                attempt_failure=None,
-                attempt_client_id=None,
-                attempt_thread_id=None,
-                attempt_turn_id=None,
-            )
-            if transport == "app-server":
-                rc = run_round_app_server(wl, role, prompt, log_path, hard_timeout)
-            elif transport == "exec":
-                rc = run_round(wl, role, prompt, log_path, hard_timeout)
-            else:
-                _best_effort_worker_projection(
-                    log_path,
-                    f"[worker_loop] unsupported DANUS_WORKER_TRANSPORT={transport!r}\n",
+            admission = None
+            prompt = legacy_prompt
+            round_hard_timeout = legacy_hard_timeout
+            coordination_snapshot = None
+            coordination_receipt: Optional[dict[str, object]] = None
+            hotjoin_store: Optional[HotJoinStore] = None
+            if coordination_store is not None:
+                try:
+                    admission = coordination_store.admit(worker)
+                    coordination_snapshot = coordination_store.project_status(worker)
+                    if admission is None:
+                        write_status(
+                            wl,
+                            state="waiting_admission",
+                            round=round_seq,
+                            error=None,
+                            **coordination_fields(coordination_snapshot),
+                        )
+                        time.sleep(max(0.05, min(1.0, beat if beat > 0 else 0.05)))
+                        continue
+                    if (
+                        transport == "exec"
+                        and admission.resumed
+                        and admission.state in {"active", "ambiguous"}
+                    ):
+                        write_status(
+                            wl,
+                            state="error",
+                            round=round_seq,
+                            error=(
+                                "reasoning-first exec slot resumed after an unknown "
+                                "paid outcome; automatic redispatch is disabled"
+                            ),
+                            recovery_required=(
+                                "owner must reconcile the prior exec paid outcome"
+                            ),
+                            **coordination_fields(coordination_snapshot),
+                        )
+                        return 126
+                    if admission.prompt is None:
+                        admission = coordination_store.pin_prompt(
+                            admission.slot_id,
+                            kickoff(project, worker, admission.directive),
+                        )
+                    if (
+                        admission.prompt is None
+                        or admission.prompt_sha256 is None
+                        or hashlib.sha256(admission.prompt.encode("utf-8")).hexdigest()
+                        != admission.prompt_sha256
+                    ):
+                        raise CoordinationError(
+                            "admitted prompt failed its durable pin"
+                        )
+                    prompt = admission.prompt
+                    round_hard_timeout = admission.hard_timeout_seconds
+                    if transport == "app-server":
+                        hotjoin_store = HotJoinStore(project_dir)
+                        coordination_receipt = _reconcile_coordination_terminal_receipt(
+                            coordination_store,
+                            hotjoin_store,
+                            project_dir=project_dir,
+                            worker=worker,
+                            admission=admission,
+                            role=role,
+                        )
+                    if coordination_receipt is None:
+                        admission = coordination_store.activate(admission.slot_id)
+                    coordination_snapshot = coordination_store.project_status(worker)
+                except (
+                    CoordinationError,
+                    HotJoinError,
+                    OSError,
+                    sqlite3.Error,
+                ) as exc:
+                    if admission is not None:
+                        try:
+                            coordination_store.mark_ambiguous(admission.slot_id)
+                        except (CoordinationError, OSError, sqlite3.Error):
+                            pass
+                    write_status(
+                        wl,
+                        state="error",
+                        error=f"coordination admission failed: {exc}",
+                        recovery_required=(
+                            "reconcile the exact HotJoin paid-turn intent and "
+                            "coordination slot before restart"
+                        ),
+                    )
+                    return 126
+
+            if coordination_receipt is None:
+                attempts += 1
+                round_seq += 1
+                log_path = wl.logs / f"round_{round_seq}.log"
+                write_status(
+                    wl,
+                    state="running",
+                    round=round_seq,
+                    round_started_at=time.time(),
+                    error=None,
+                    recovery_required=None,
+                    attempt_phase="pre_dispatch",
+                    attempt_dispatch_state="none",
+                    attempt_failure_code=None,
+                    attempt_failure=None,
+                    attempt_client_id=None,
+                    attempt_thread_id=None,
+                    attempt_turn_id=None,
+                    **coordination_fields(coordination_snapshot),
                 )
-                rc = 126
+                if transport == "app-server":
+                    if admission is None:
+                        rc = run_round_app_server(
+                            wl,
+                            role,
+                            prompt,
+                            log_path,
+                            round_hard_timeout,
+                        )
+                    else:
+                        rc = run_round_app_server(
+                            wl,
+                            role,
+                            prompt,
+                            log_path,
+                            round_hard_timeout,
+                            coordination_provenance={
+                                "slot_id": admission.slot_id,
+                                "generation": admission.generation,
+                                "lane": admission.lane,
+                            },
+                        )
+                elif transport == "exec":
+                    rc = run_round(wl, role, prompt, log_path, round_hard_timeout)
+                else:
+                    _best_effort_worker_projection(
+                        log_path,
+                        "[worker_loop] unsupported "
+                        f"DANUS_WORKER_TRANSPORT={transport!r}\n",
+                    )
+                    rc = 126
+                if coordination_store is not None and admission is not None:
+                    try:
+                        if transport == "app-server":
+                            if hotjoin_store is None:
+                                hotjoin_store = HotJoinStore(project_dir)
+                            coordination_receipt = (
+                                _reconcile_coordination_terminal_receipt(
+                                    coordination_store,
+                                    hotjoin_store,
+                                    project_dir=project_dir,
+                                    worker=worker,
+                                    admission=admission,
+                                    role=role,
+                                    expected_adapter_rc=rc,
+                                )
+                            )
+                            if coordination_receipt is None:
+                                coordination_store.mark_ambiguous(admission.slot_id)
+                                raise CoordinationError(
+                                    "app-server round ended without an exact "
+                                    "terminal coordination receipt"
+                                )
+                        else:
+                            coordination_store.reconcile_terminal_memory_entries(
+                                admission.slot_id,
+                                worker,
+                                _terminal_coordination_memory_entries(
+                                    project_dir,
+                                    worker,
+                                    slot_id=admission.slot_id,
+                                    generation=admission.generation,
+                                    lane=admission.lane,
+                                ),
+                            )
+                            coordination_store.complete(
+                                admission.slot_id,
+                                outcome=f"terminal_rc_{rc}",
+                            )
+                        coordination_snapshot = coordination_store.project_status(
+                            worker
+                        )
+                    except (
+                        CoordinationError,
+                        HotJoinError,
+                        OSError,
+                        sqlite3.Error,
+                    ) as exc:
+                        try:
+                            coordination_store.mark_ambiguous(admission.slot_id)
+                        except (CoordinationError, OSError, sqlite3.Error):
+                            pass
+                        write_status(
+                            wl,
+                            state="error",
+                            error=f"coordination terminal transition failed: {exc}",
+                            recovery_required=(
+                                "reconcile the exact terminal receipt before "
+                                "another paid turn"
+                            ),
+                        )
+                        return 126
+                attempt_snapshot = _read_status_snapshot(wl)
+            else:
+                rc_value = coordination_receipt.get("effective_adapter_rc")
+                if isinstance(rc_value, bool) or not isinstance(rc_value, int):
+                    write_status(
+                        wl,
+                        state="error",
+                        error="terminal coordination receipt has an invalid return code",
+                    )
+                    return 126
+                rc = rc_value
+                audit_header = coordination_receipt.get("audit_header")
+                if not isinstance(audit_header, dict):
+                    audit_header = {}
+                receipt_kind = coordination_receipt.get("receipt_kind")
+                disposition = coordination_receipt.get("disposition")
+                operator_action = coordination_receipt.get("operator_action")
+                dispatch_state = (
+                    "recovered"
+                    if receipt_kind == "terminal_audit"
+                    else "none"
+                    if operator_action == "cancelled_not_dispatched"
+                    else "unknown"
+                )
+                attempt_snapshot = {
+                    "attempt_phase": (
+                        "coordination_terminal_reconciliation"
+                        if receipt_kind == "terminal_audit"
+                        else "coordination_operator_reconciliation"
+                    ),
+                    "attempt_dispatch_state": dispatch_state,
+                    "attempt_failure_code": (
+                        None if receipt_kind == "terminal_audit" else disposition
+                    ),
+                    "attempt_failure": (
+                        None
+                        if receipt_kind == "terminal_audit"
+                        else f"coordination operator disposition: {disposition}"
+                    ),
+                    "attempt_client_id": coordination_receipt.get("client_id"),
+                    "attempt_thread_id": coordination_receipt.get("thread_id"),
+                    "attempt_turn_id": coordination_receipt.get("turn_id"),
+                    "last_turn_status": coordination_receipt.get("terminal_status"),
+                    "last_turn_token_usage": audit_header.get("token_usage"),
+                    "last_turn_token_usage_observed": audit_header.get(
+                        "token_usage_observed"
+                    ),
+                    "last_turn_token_usage_finality": audit_header.get(
+                        "token_usage_finality"
+                    ),
+                    "last_turn_reasoning_bandwidth": audit_header.get(
+                        "reasoning_bandwidth"
+                    ),
+                    "last_turn_model": audit_header.get("actual_model"),
+                    "last_turn_effort": audit_header.get("requested_effort"),
+                    "last_turn_model_rerouted": audit_header.get("model_rerouted"),
+                }
             last_fact_id = (
                 _canonical_app_server_fact_id(project_dir, worker)
                 if transport == "app-server"
                 else _parse_last_fact_id(log_path, worker=wl)
             )
             finished_at = time.time()
-            attempt_snapshot = _read_status_snapshot(wl)
             attempt = {
                 "round": round_seq,
                 "rc": rc,
@@ -2066,6 +2571,7 @@ def main(worker_dir: str) -> int:
                 "last_rc": rc,
                 "last_fact_id": last_fact_id,
                 "last_attempt": attempt,
+                **coordination_fields(coordination_snapshot),
             }
             if transport == "app-server" and attempt["dispatch_state"] in {
                 "sent",
@@ -2081,11 +2587,34 @@ def main(worker_dir: str) -> int:
                     "token_usage_finality": attempt_snapshot.get(
                         "last_turn_token_usage_finality"
                     ),
+                    "reasoning_bandwidth": attempt_snapshot.get(
+                        "last_turn_reasoning_bandwidth"
+                    ),
                     "model": attempt_snapshot.get("last_turn_model"),
                     "effort": attempt_snapshot.get("last_turn_effort"),
-                    "model_rerouted": attempt_snapshot.get(
-                        "last_turn_model_rerouted"
-                    ),
+                    "model_rerouted": attempt_snapshot.get("last_turn_model_rerouted"),
+                }
+            elif transport == "exec":
+                status_fields.update(
+                    {
+                        "last_paid_turn": None,
+                        "last_turn_status": None,
+                        "last_turn_token_usage": None,
+                        "last_turn_token_usage_observed": None,
+                        "last_turn_token_usage_finality": "unavailable",
+                        "last_turn_model": None,
+                        "last_turn_effort": None,
+                        "last_turn_model_rerouted": None,
+                    }
+                )
+                status_fields["last_turn_reasoning_bandwidth"] = {
+                    "schema": "danus_reasoning_bandwidth_v1",
+                    "scope": "root_thread_only",
+                    "finality": "unavailable",
+                    "finality_reasons": [
+                        "exec_transport_has_no_attested_item_telemetry"
+                    ],
+                    "growth_samples_are_not_schema_attested_inferences": True,
                 }
             write_status(
                 wl,
@@ -2187,7 +2716,7 @@ def main(worker_dir: str) -> int:
                     recovery_required=recovery_required,
                 )
                 return rc
-            if rc in (126, 127):             # launch prerequisite missing — do not spin
+            if rc in (126, 127):  # launch prerequisite missing — do not spin
                 error = (
                     str(attempt.get("failure"))
                     if rc == 126 and attempt.get("failure")
@@ -2199,7 +2728,9 @@ def main(worker_dir: str) -> int:
                 return rc
             consec_fail = consec_fail + 1 if rc not in (0, 124) else 0
             if max_fail and consec_fail >= max_fail:
-                write_status(wl, state="error", error=f"{consec_fail} consecutive failed rounds")
+                write_status(
+                    wl, state="error", error=f"{consec_fail} consecutive failed rounds"
+                )
                 return 1
 
             if beat > 0:

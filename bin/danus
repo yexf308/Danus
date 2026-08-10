@@ -4,4 +4,4 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/../scripts/env.sh"
-exec "$DANUS_PY" -m danus.orchestration "$@"
+exec "$DANUS_PY" -I -B -m danus.orchestration "$@"

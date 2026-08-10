@@ -6,7 +6,7 @@ markdown-it via CDN — no build step). It re-parses the on-disk stores under a
 project dir and NEVER writes:
 
   <project>/fact_graph/facts/*.md         the verified-fact DAG
-  <project>/global_memory/<kind>.jsonl    categorized findings (the 11 kinds)
+  <project>/global_memory/<kind>.jsonl    categorized findings (the 12 kinds)
   <project>/spend/consult.jsonl       pro-consult cost ledger (optional)
 
 Decoupled by design: it imports no danus.core runtime module. The channel set is
@@ -103,7 +103,8 @@ CHANNELS = [
     ("conclusion", "result"), ("example", "result"), ("counterexample", "result"),
     ("proof_attempt", "result"), ("plan", "judgment"), ("direction", "judgment"),
     ("obstacle", "deadend"), ("dead_end", "deadend"), ("verification", "verify"),
-    ("elaboration", "strategy"), ("master_guidance", "strategy"),
+    ("elaboration", "strategy"), ("advisor_checkpoint", "strategy"),
+    ("master_guidance", "strategy"),
 ]
 _CHANNEL_KINDS = {k for k, _ in CHANNELS}
 

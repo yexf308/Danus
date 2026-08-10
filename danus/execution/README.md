@@ -43,9 +43,11 @@ worker death closes that pipe and triggers the same group cleanup. It also holds
 the worker's `.paid.lock` until the group is terminal and reaped, so an immediate
 replacement worker cannot overlap a second paid launch.
 
-Two transports are available. `DANUS_WORKER_TRANSPORT=exec` is the compatibility
-default. `DANUS_WORKER_TRANSPORT=app-server` uses Codex app-server over local
-stdio, persists each worker's Codex thread id, and enables owner hot-join via
+Two transports are available. When the variable is unset, reasoning-first
+projects use `app-server` and legacy projects use `exec`; an explicit
+`DANUS_WORKER_TRANSPORT=exec` remains the compatibility opt-out.
+`DANUS_WORKER_TRANSPORT=app-server` uses Codex app-server over local stdio,
+persists each worker's Codex thread id, and enables owner hot-join via
 `danus say`. It is a thin transport change: Codex still owns the thread/turn and
 the existing contract, skills, MCP gateway, FactGraph, and adaptive verifier are
 unchanged. Before any paid turn it generates the installed binary's protocol

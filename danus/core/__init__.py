@@ -21,6 +21,7 @@ from .factgraph import (
     FactGraph,
     FactPromotionOutcomeUnknown,
     dependency_closure_digest,
+    fact_identity_from_verification_context,
     fact_context_digest,
     parse_frontmatter,
     serialize_fact,
@@ -28,7 +29,7 @@ from .factgraph import (
     statement_of,
     verification_context_digest,
 )
-from .global_memory import GlobalMemory
+from .global_memory import GlobalMemory, canonical_global_memory_record
 from .local_memory import DEFAULT_CHANNELS, LocalMemory
 from .schema import (
     EXTERNAL_REF_KEYS,
@@ -50,10 +51,12 @@ __all__ = [
     "VERIFICATION_CONTEXT_SCHEMA_VERSION",
     "VERIFICATION_CONTEXT_PROJECTION",
     "fact_context_digest",
+    "fact_identity_from_verification_context",
     "verification_context_digest",
     "dependency_closure_digest",
     "select_referenced_definitions",
     "GlobalMemory",
+    "canonical_global_memory_record",
     "LocalMemory",
     "DEFAULT_CHANNELS",
     "Fact",

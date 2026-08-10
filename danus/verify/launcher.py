@@ -30,6 +30,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib import resources
 from pathlib import Path
@@ -57,6 +58,7 @@ _DEFAULT_VERIFY_EFFORT = "xhigh"
 _MAX_VERIFICATION_OUTPUT_BYTES = 8 * 1024 * 1024
 _SERVICE_AUTHORITY_FD_ENV = "DANUS_SERVICE_AUTHORITY_FD"
 _SERVICE_AUTHORITY_PATH_ENV = "DANUS_SERVICE_AUTHORITY_PATH"
+_EXECUTION_PROFILE_SCHEMA_VERSION = 1
 
 
 def _adopt_service_authority() -> Optional[int]:
@@ -365,6 +367,67 @@ def _max_prompt_bytes() -> int:
     return value
 
 
+@dataclass(frozen=True)
+class VerificationExecutionProfile:
+    """One immutable snapshot of every call-time execution selector.
+
+    The verify scheduler hashes this projection into its exact request key and
+    passes the same object into the eventual FIFO leader.  Environment changes
+    while a request waits therefore cannot make a cache/coalescing key describe
+    one execution profile while the launcher silently uses another.
+    """
+
+    schema_version: int
+    codex_bin: str
+    model: str
+    effort: str
+    timeout_seconds: Optional[int]
+    max_prompt_bytes: int
+    python_executable: str
+
+    def canonical(self) -> Dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "codex_bin": self.codex_bin,
+            "model": self.model,
+            "effort": self.effort,
+            "timeout_seconds": self.timeout_seconds,
+            "max_prompt_bytes": self.max_prompt_bytes,
+            "python_executable": self.python_executable,
+        }
+
+
+def capture_execution_profile() -> VerificationExecutionProfile:
+    """Capture the exact launcher selectors before scheduler admission."""
+    return VerificationExecutionProfile(
+        schema_version=_EXECUTION_PROFILE_SCHEMA_VERSION,
+        codex_bin=codex.resolve_bin(),
+        model=_model(),
+        effort=_effort(),
+        timeout_seconds=_timeout(),
+        max_prompt_bytes=_max_prompt_bytes(),
+        python_executable=sys.executable,
+    )
+
+
+def _require_execution_profile(
+    profile: VerificationExecutionProfile,
+) -> VerificationExecutionProfile:
+    if not isinstance(profile, VerificationExecutionProfile):
+        raise TypeError("execution_profile must be a VerificationExecutionProfile")
+    if profile.schema_version != _EXECUTION_PROFILE_SCHEMA_VERSION:
+        raise ValueError("unsupported verifier execution profile schema")
+    if not profile.codex_bin or not profile.model or not profile.effort:
+        raise ValueError("verifier execution profile selectors must be non-empty")
+    if profile.python_executable != sys.executable:
+        raise ValueError("verifier execution profile interpreter changed")
+    if profile.timeout_seconds is not None and profile.timeout_seconds <= 0:
+        raise ValueError("verifier execution profile timeout must be positive or null")
+    if profile.max_prompt_bytes <= 0:
+        raise ValueError("verifier execution profile prompt limit must be positive")
+    return profile
+
+
 def _mcp_config_arg() -> str:
     """Inject the danus gateway (role=verifier) into the codex agent via `-c`,
     independent of CODEX_HOME. Uses this service's exact interpreter so a wheel
@@ -652,10 +715,15 @@ def build_codex_command(
     proof: str,
     fact_context: Optional[Dict[str, Any]] = None,
     glossary_introduces: Optional[Dict[str, str]] = None,
+    *,
+    execution_profile: Optional[VerificationExecutionProfile] = None,
 ) -> List[str]:
+    profile = _require_execution_profile(
+        execution_profile or capture_execution_profile()
+    )
     output_path = _results_dir(run_id) / VERIFICATION_FILENAMES[0]
     return codex.exec_cmd(
-        codex.resolve_bin(), _model(), _effort(),
+        profile.codex_bin, profile.model, profile.effort,
         "-C", str(_agent_home()),
         # on an install without .git (tarball download), codex's
         # trusted-directory check refuses to run (exit 1 → /verify HTTP 500)
@@ -680,11 +748,16 @@ def run_codex_verification(
     proof: str,
     fact_context: Optional[Dict[str, Any]] = None,
     glossary_introduces: Optional[Dict[str, str]] = None,
+    *,
+    execution_profile: Optional[VerificationExecutionProfile] = None,
 ) -> Dict[str, Any]:
     """Spawn the cold-start codex verifier; read back + return the verification
     JSON. Raises HTTPException 504 (timeout) / 500 (nonzero exit, no output, or
     bad/non-dict JSON) — the callers translate these into the fact_submit
     verify-error path."""
+    profile = _require_execution_profile(
+        execution_profile or capture_execution_profile()
+    )
     try:
         require_gateway_runtime()
     except GatewayRuntimeUnavailable as exc:
@@ -704,7 +777,7 @@ def run_codex_verification(
         glossary_introduces=glossary_introduces,
     )
     prompt_bytes = len(prompt.encode("utf-8"))
-    if prompt_bytes > _max_prompt_bytes():
+    if prompt_bytes > profile.max_prompt_bytes:
         raise HTTPException(
             status_code=413,
             detail=(
@@ -718,6 +791,7 @@ def run_codex_verification(
         proof=proof,
         fact_context=fact_context,
         glossary_introduces=glossary_introduces,
+        execution_profile=profile,
     )
     env = codex.subprocess_env(cmd[0])
     for protected_name in (
@@ -727,8 +801,8 @@ def run_codex_verification(
         "DANUS_SERVICE_INSTANCE_NONCE",
     ):
         env.pop(protected_name, None)
-    model_name = cmd[cmd.index("--model") + 1]
-    effort_name = _effort()
+    model_name = profile.model
+    effort_name = profile.effort
     context_scope = fact_context.get("scope", {}) if fact_context else {}
     context_round = (
         context_scope.get("expansion_round")
@@ -762,7 +836,7 @@ def run_codex_verification(
 
     tokens_used: Optional[int] = None
     returncode: Optional[int] = None
-    timeout_seconds = _timeout()
+    timeout_seconds = profile.timeout_seconds
     with tempfile.TemporaryFile(mode="w+b") as raw_output, tempfile.TemporaryFile(
         mode="w+t", encoding="utf-8"
     ) as prompt_input:

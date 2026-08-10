@@ -23,7 +23,7 @@ danus/core/
 
 Design: local/global memory use an append-only-JSONL + per-channel + BM25
 mechanism; the fact-graph node and `compute_fact_id` are deliberately thin
-(5 frontmatter fields, no status/verifier_outcome/claim_summary in the node; the
+(7 frontmatter fields, no status/verifier_outcome/claim_summary in the node; the
 **glossary is kept** — it makes the graph readable). Stores take **explicit
 roots** — orchestration decides where worker/project directories live.
 
@@ -41,9 +41,11 @@ lm.append("notes", {"thought": "..."}); lm.read("notes")
 gm = GlobalMemory(project_dir)
 gid = gm.append("counterexample", claim="...", evidence="...QED",   # evidence required
                 author="worker_xhigh", glossary={"X": "a manifold"})  # for verifiable kinds
-gm.append("master_guidance", claim="...", evidence="GPT-5.5-pro: ...", author="main_agent")
+# Only after an actual reviewed optional consult; `off` fabricates no guidance.
+gm.append("master_guidance", claim="...", evidence="reviewed consult reply", author="main_agent")
 gm.set_status(gid, "verified", fact_id="<id>")   # agent-driven status note
-gm.read("plan"); gm.search("query", kinds=["dead_end"])
+gm.read("plan"); gm.get(gid)  # exact 16-hex id; unique; 16 KiB serialized cap
+gm.search("query", kinds=["dead_end"])  # BM25 discovery, not exact critic hydration
 
 # fact graph low-level API (shared; production writes go through gateway fact_submit)
 fg = FactGraph(project_dir)
@@ -56,6 +58,11 @@ fg.verification_context([fid], max_chars=200000)  # internal v3 write-gate conte
 fg.get_raw(fid); fg.list(); fg.predecessors(fid); fg.glossary(); fg.descendants(fid)
 fg.revoke(fid, reason="...")     # cascades to dependents
 ```
+
+`GlobalMemory.append` is a host-internal storage primitive, not an agent
+authority seam. Production agent publications must use the role-gated gateway;
+it holds the supervisor browser-output fence and prevents exact untrusted
+browser response/clarification bytes from entering any global-memory channel.
 
 **There is no second promotion path.** Agents call the gateway's `fact_submit`;
 it validates lazy context, invokes the verifier, atomically rechecks the graph,

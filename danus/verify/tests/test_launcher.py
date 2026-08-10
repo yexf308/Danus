@@ -335,6 +335,45 @@ def test_build_codex_command_shape():
     assert "BEGIN_AUTHORITATIVE_FACT_CONTEXT_JSON" not in prompt
 
 
+def test_captured_execution_profile_is_immutable_across_environment_drift():
+    with tempfile.TemporaryDirectory() as tmp:
+        with _env(
+            DANUS_CODEX_BIN="/captured/codex",
+            VERIFY_AGENT_HOME=tmp,
+            DANUS_VERIFY_MODEL="captured-model",
+            DANUS_VERIFY_EFFORT="xhigh",
+            CODEX_TIMEOUT_SECONDS="321",
+            DANUS_VERIFY_MAX_PROMPT_BYTES="654321",
+        ):
+            profile = launcher.capture_execution_profile()
+        with _env(
+            DANUS_CODEX_BIN="/drifted/codex",
+            DANUS_VERIFY_MODEL="drifted-model",
+            DANUS_VERIFY_EFFORT="low",
+            CODEX_TIMEOUT_SECONDS="1",
+            DANUS_VERIFY_MAX_PROMPT_BYTES="1",
+        ):
+            cmd = launcher.build_codex_command(
+                "RID-profile",
+                _STMT,
+                _PROOF,
+                execution_profile=profile,
+            )
+
+    assert profile.canonical() == {
+        "schema_version": 1,
+        "codex_bin": "/captured/codex",
+        "model": "captured-model",
+        "effort": "xhigh",
+        "timeout_seconds": 321,
+        "max_prompt_bytes": 654321,
+        "python_executable": sys.executable,
+    }
+    assert cmd[0] == "/captured/codex"
+    assert cmd[cmd.index("--model") + 1] == "captured-model"
+    assert 'model_reasoning_effort="xhigh"' in cmd
+
+
 def test_preflight_failure_creates_no_result_dir_and_starts_no_codex(
     tmp_path, monkeypatch
 ):

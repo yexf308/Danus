@@ -389,13 +389,19 @@ def main(argv: list[str] | None = None) -> int:
                 _rpc_result(request_id, resumed)
                 continue
 
-            if request_id is not None and not thread_started and method != "thread/read":
+            if (
+                request_id is not None
+                and not thread_started
+                and method != "thread/read"
+            ):
                 _rpc_error(request_id, "thread not started", code=-32003)
                 continue
 
             if scenario == "out-of-order-responses" and method == "thread/read":
                 if held_thread_read_id is not None:
-                    _rpc_error(request_id, "only one delayed read is supported", code=-32008)
+                    _rpc_error(
+                        request_id, "only one delayed read is supported", code=-32008
+                    )
                     continue
                 held_thread_read_id = request_id
                 _emit(
@@ -667,7 +673,11 @@ def main(argv: list[str] | None = None) -> int:
                     # response nor a terminal notification, so it must surface
                     # delivery_unknown rather than retrying blindly.
                     trace.record(
-                        {"_fake": "steer_applied", "threadId": THREAD_ID, "turnId": TURN_ID}
+                        {
+                            "_fake": "steer_applied",
+                            "threadId": THREAD_ID,
+                            "turnId": TURN_ID,
+                        }
                     )
                     os._exit(CRASH_EXIT_CODE)
 
@@ -693,10 +703,15 @@ def main(argv: list[str] | None = None) -> int:
                         },
                     }
                 )
-                final_last = _breakdown(input_tokens=9, output_tokens=9, cached_input_tokens=2)
+                final_last = _breakdown(
+                    input_tokens=9, output_tokens=9, cached_input_tokens=2
+                )
                 final_total = _breakdown(
                     input_tokens=16, output_tokens=13, cached_input_tokens=2
                 )
+                # Thread totals are cumulative; reasoning output from the
+                # initial and post-steer samples therefore adds to four.
+                final_total["reasoningOutputTokens"] = 4
                 _usage(last=final_last, total=final_total)
                 _terminal("completed")
                 active = False

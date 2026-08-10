@@ -16,16 +16,18 @@ For the main agent's operating contract, see `CLAUDE.md`
 ```
 operator → ① orchestration (main agent + danus CLI)   — conducts, never does math
               ② strategy   (elaboration → consult → master_guidance)
-              ③ execution  (worker swarm; each round = one codex session running the Rethlas proving skills)
+              ③ execution  (durable admission: ≤1 root + ≤1 independent critic paid turn;
+                            dormant roster loops wait without starting codex)
    gm_* │         │ fact_submit
         ▼         ▼
-   ⑤ truth      ④ verification (cold-start codex judge; correct ⟺ no critical_errors AND no gaps)
+   ⑤ truth      ④ verification (one paid leader; FIFO distinct queue; exact coalescing/cache;
+                                cold-start judge; correct ⟺ no critical_errors AND no gaps)
    (fact graph + memory)   — correct verdict + locked context CAS/add
         ▲
         │ every read/write goes through …
-   ⑥ gateway (role-gated MCP: 7 tools; main has NO fact_submit; verifier read-only)
+   ⑥ gateway (role-gated MCP: 8 tools; main has NO fact_submit; verifier read-only)
 
-cross-cutting: ⑦ observability (dashboard · theorem-search · human-summary · initialize)
+cross-cutting: ⑦ observability (content-free reasoning/tool/wait telemetry · dashboard · theorem-search · human-summary · initialize)
                ⑧ ops/runtime (bootstrap · services · doctor · config)
 bottom (inherited, don't redesign): Rethlas proof core = codex + worker proving skills
 output: write-paper (publication) · human-summary (progress report) — each rendered by an isolated codex
@@ -43,10 +45,10 @@ Danus/
 ├─ config/                      env templates (BYO key; only *.env.example committed)
 ├─ danus/                       THE ENGINE (installable Python package)
 │  ├─ core/                     ⑤ truth: schema · factgraph · global/local memory · bm25 · glossary
-│  ├─ gateway/                  ⑥ role-gated MCP: 7 tools · role table (roles.py)
+│  ├─ gateway/                  ⑥ role-gated MCP: 8 tools · role table (roles.py)
 │  ├─ verify/                   ④ verification HTTP service · prechecks · cold-start codex launcher
 │  ├─ execution/                ③ worker swarm: round loop · project/worker lifecycle + layout
-│  ├─ strategy/                 ② consult gateway (gpt_pro|claude_api|claude_code|off transport)
+│  ├─ strategy/                 ② consult gateway + explicit durable browser-advisor broker
 │  ├─ orchestration/            ① the `danus` CLI verbs
 │  ├─ integrations/             arXiv theorem search (Matlas)
 │  ├─ observability/            read-only dashboard
@@ -62,7 +64,7 @@ Danus/
 ├─ .claude/skills/              MAIN-AGENT SKILLS (Claude Code auto-discovers)
 │  ├─ elaboration/  consult/  human-summary/  initialize/
 │  └─ write-paper/              the recipe SKILL.md + driver/ scripts + templates/
-├─ bin/                         thin wrappers: danus · danus-mcp · write-paper-mcp · human-summary-mcp · codex · consult
+├─ bin/                         thin wrappers: danus · danus-mcp · write-paper-mcp · human-summary-mcp · codex · consult · consult-browser
 ├─ scripts/                     bootstrap · doctor · services · env · setup/check-codex · start-verify/-dashboard · recover · install-tex
 ├─ docs/                        human docs: getting started · concepts · operating guide · security & trust · …
 └─ examples/                    unattended-ops examples + a toy project
@@ -101,18 +103,30 @@ Danus/
    session. The service attests every round digest, and the gateway atomically
    rebuilds the final expansion snapshot before writing under the graph mutation
    lock.
-6. Autonomy and resumability. Workers run detached; a "round" continues from
-   persisted memory rather than adding one increment, so no single crash loses
-   verified work.
-7. The strategy consult is the brain. Between rounds the main agent consults a
-   top-tier reasoning model (gpt-5.5-pro over the `gpt_pro` transport, or
-   claude-fable-5 over the `claude_api` / `claude_code` transports) to set direction;
-   its reply becomes the swarm's `master_guidance`. Transport is `gpt_pro` (default),
-   `claude_api`, `claude_code`, or `off` (no key — the main agent reasons on its own). The consult is not
-   optional — it is how the swarm gets steered.
-7. Portable and BYO. No hardcoded absolute paths, no committed secrets; keys come
+6. Autonomy and resumability. Workers run detached; durable memory preserves
+   verified work across crashes. In `reasoning_first_v1`, one root and one critic
+   are fixed for the generation; dormant observers are not automatically rotated
+   or promoted. Every new terminal coordination slot receives a fresh app-server
+   thread, while crash recovery of that same slot resumes only its exact pinned
+   thread. The 2700-second bound caps each paid turn, not the whole phase.
+7. Strategy consult is optional. It defaults to `off`, where the main agent
+   dispatches from its own current shared-state synthesis. `gpt_pro`,
+   `claude_api`, and `claude_code` are explicit attended opt-ins whose actual
+   replies may become `master_guidance`. A late `chatgpt_pro_browser` intervention
+   requires an exact current coordinator recommendation, then one bounded
+   `advisor_checkpoint` and fresh owner authorization for its exact question.
+   General blocked/dead-ended evidence alone is insufficient. It is never a
+   timer/environment/unattended-loop transport. Repository code only records the
+   durable handoff.
+   Imported browser text is untrusted until reviewed and adopted as strategy,
+   has no truth/control authority, and carries null subscription telemetry.
+   Adoption does not release `owner_action_required`; an audited owner-only
+   `resolve-recommendation` exact CAS—with repeated recommendation id and paid-
+   resume acknowledgement—is required. A stable browser conversation context
+   is distinct from the new recommendation id assigned to each intervention.
+8. Portable and BYO. No hardcoded absolute paths, no committed secrets; keys come
    from gitignored `config/*.env` (templates committed as `*.example`).
-8. Clean author context. Any agent that produces an artifact for an outside
+9. Clean author context. Any agent that produces an artifact for an outside
    audience (a paper, a human report) is a fresh isolated codex fed a scoped,
    machinery-free prompt, never the orchestrator's own contaminated window. It
    cannot leak `fact_id`s or swarm vocabulary it never received.
@@ -137,11 +151,12 @@ Danus/
 
 | contract | pinned shape | ends |
 |---|---|---|
-| MCP tool set + role gating | 7 tools; `roles.py` `ROLE_TOOLS` (worker/main get lazy `fact_context`; main has NO `fact_submit`; verifier read-only) | `danus.gateway` ↔ worker/main/verifier agents |
+| MCP tool set + role gating | 8 tools; `roles.py` `ROLE_TOOLS` (worker/main get exact bounded `gm_get` and lazy `fact_context`; main has NO `fact_submit`; verifier read-only) | `danus.gateway` ↔ worker/main/verifier agents |
 | MCP launch | `python -m danus.gateway` + `DANUS_ROLE` env | `danus.verify` launcher · worker `.codex/config.toml` · `.mcp.json` (main) → `danus.gateway` |
-| verify HTTP | `GET /health` attests `{output_protocol_version:3,verifier_bundle_digest}`; `POST /verify {expected_output_protocol_version:3,expected_verifier_bundle_digest,statement,proof,glossary_introduces?,fact_context?}` → schema-v3 `{output_schema_version,verification_status,verification_report,verdict,needs_expanded_proofs,repair_hints,verification_context_digest?,verification_metrics?}`; every final finding carries an exact original candidate `{source,line,exact_line}` anchor, checked independently by launcher and gateway; supplied context must be complete and digest-attested; only `final/correct` with zero findings can authorize the locked write | `danus.gateway.fact_submit` ↔ `danus.verify` |
+| verify HTTP | `GET /health` attests exact `{status,pid,instance_nonce,output_protocol_version:3,verifier_bundle_digest}`; `POST /verify {expected_verifier_instance_nonce,expected_output_protocol_version:3,expected_verifier_bundle_digest,statement,proof,glossary_introduces?,fact_context?}` → schema-v3 result plus bounded scheduler headers; every final finding carries an exact original candidate `{source,line,exact_line}` anchor, checked independently by launcher and gateway; supplied context must be complete and digest-attested; only `final/correct` with zero findings can authorize the locked write | `danus.gateway.fact_submit` ↔ `danus.verify` |
+| reasoning-first coordination | new projects persist `reasoning_first_v1` and default to `max:2,high:5`; a content-free SQLite CAS pins the two `max` workers as root and critic (no automatic rotation/failover), leaves five `high` observers dormant without paid turns, gives each new terminal coordination slot a fresh app-server thread, resumes only same-slot crashes, caps each paid turn at 2700 seconds without promising whole-phase completion, freezes admission around active candidates, and moves an exact root obstacle/dead-end into `critic_obstacle_review`, where only the fixed critic can confirm it and emit an `owner_action_required` Pro recommendation with browser authorization false; explicit roles override the roster and legacy keeps `high:3,xhigh:4` | `danus.coordination` ↔ worker loop · gateway · CLI status |
 | fact id inputs | `problem_id + sorted(predecessors) + sorted(glossary) + normalized(statement,proof)`; **external_refs EXCLUDED** | `danus.core` ↔ everyone (write-paper reads `external_refs`) |
-| global-memory kinds | the 11 `GLOBAL_KINDS` (incl. `master_guidance`/`elaboration`/`verification`) | `danus.core` ↔ agents · strategy · consult |
-| consult JSON envelope | `{transport,reply,usage,cost_usd,…}` | `danus.strategy` CLI ↔ consult skill |
+| global-memory kinds | the 12 `GLOBAL_KINDS` (incl. `master_guidance`/`elaboration`/`advisor_checkpoint`/`verification`) | `danus.core` ↔ agents · strategy · consult |
+| consult receipt/envelope | API/CLI `{transport,reply,usage,cost_usd,…}`; browser exact-CAS digest-only completion, transient exact-byte import, then adopted synthesis/provenance with null telemetry; stable `context_id` names conversation lineage while per-intervention `recommendation_id` binds the open coordinator decision, receipt, and guidance link; gateway binds browser guidance to the same-project adopted row | `danus.strategy` CLI/broker ↔ owner consult skill ↔ `gm_add` |
 | write-paper prompt assets | codex role prompts + style read from `agents/skills/write-paper/` (via `DANUS_WRITE_PAPER_SKILL_DIR`) | `danus.write_paper` assembler ↔ `agents/skills/write-paper/` |
 | env-var contract | `DANUS_* / CODEX_* / VERIFY_* / CONSULT_*` names; the codex CALL + env (bin/model/effort/PATH/`exec` prefix) is resolved through the shared `danus.codex` launcher: neutral `DANUS_CODEX_BIN` / `DANUS_CODEX_MODEL` / `DANUS_CODEX_EFFORT` + per-service `DANUS_{VERIFY,WRITE_PAPER,HUMAN_SUMMARY}_{MODEL,EFFORT}` overrides | `danus.codex` + `config/` + `scripts/env.sh` ↔ every codex-exec site (`danus.execution.loop` · `danus.verify.launcher` · `danus.authoring.driver`) |

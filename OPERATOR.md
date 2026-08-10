@@ -16,8 +16,8 @@
 ## Standing preferences
 - **Notifications:** _(how/where to reach them; what severity warrants a ping)_
 - **Spend ceiling (paid consult API):** _(USD; warn before crossing)_
-- **Consult transport:** _(`gpt_pro` — paid API, BYO key / `claude_api` — Anthropic API, per-token BYO key / `claude_code` — your Claude subscription / `off` — main agent reasons on its own)_
-- **worker roster:** _(default `high:3,xhigh:4` — 3 high + 4 xhigh; asked per project at `danus new`)_
+- **Optional consult transport:** _(`off` by default / `gpt_pro` — paid API, BYO key / `claude_api` — Anthropic API, per-token BYO key / `claude_code` — your Claude subscription; `chatgpt_pro_browser` is available only after an exact coordinator recommendation and per-question owner authorization)_
+- **worker roster:** _(reasoning-first default `max:2,high:5` — two paid root/critic lanes plus five dormant observers; explicit legacy default `high:3,xhigh:4`; override per project with `danus new --roles`)_
 
 ## Per-project pointers
 _(One line per live project → where its durable facts live. The project's own

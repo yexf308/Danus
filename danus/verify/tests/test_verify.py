@@ -16,11 +16,12 @@ import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 
-from fastapi import HTTPException
+from fastapi import HTTPException, Response
 
 from danus.verify import prechecks
 from danus.verify.service import (
     VERIFICATION_OUTPUT_PROTOCOL_VERSION,
+    VERIFY_INSTANCE_NONCE,
     VERIFIER_BUNDLE_DIGEST,
     VerifyRequest,
     verify,
@@ -59,13 +60,15 @@ def _call(statement, proof, tmp):
             _env(VERIFIER_RESULTS_DIR=str(Path(tmp) / "runs"), VERIFY_AGENT_HOME=str(tmp)):
         return verify(
             VerifyRequest(
+                expected_verifier_instance_nonce=VERIFY_INSTANCE_NONCE,
                 expected_output_protocol_version=(
                     VERIFICATION_OUTPUT_PROTOCOL_VERSION
                 ),
                 expected_verifier_bundle_digest=VERIFIER_BUNDLE_DIGEST,
                 statement=statement,
                 proof=proof,
-            )
+            ),
+            Response(),
         )
 
 

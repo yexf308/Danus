@@ -18,6 +18,8 @@ import types
 from contextlib import contextmanager
 from pathlib import Path
 
+import pytest
+
 from danus.strategy import cli, ledger
 from danus.strategy.config import (
     DEFAULT_CLAUDE_CODE_MODEL, DEFAULT_MODEL, DEFAULT_PRICE_IN, DEFAULT_PRICE_OUT,
@@ -227,17 +229,19 @@ def test_ledger_tolerates_malformed_lines():
 
 def test_resolve_transport():
     with _env(DANUS_CONSULT_TRANSPORT=None):
-        assert resolve_transport(None) == "gpt_pro"
+        assert resolve_transport(None) == "off"
         assert resolve_transport("off") == "off"
         assert resolve_transport("claude_code") == "claude_code"
+        assert resolve_transport("chatgpt_pro_browser") == "chatgpt_pro_browser"
     with _env(DANUS_CONSULT_TRANSPORT="off"):
         assert resolve_transport(None) == "off"
         assert resolve_transport("gpt_pro") == "gpt_pro"  # CLI wins
     with _env(DANUS_CONSULT_TRANSPORT="claude_code"):
         assert resolve_transport(None) == "claude_code"  # env recognised
-    # only 'gpt_pro', 'off', 'claude' exist; any other value resolves to the gpt_pro default
+    # Unknown config must never degrade into an unintended paid API call.
     with _env(DANUS_CONSULT_TRANSPORT="something-else"):
-        assert resolve_transport(None) == "gpt_pro"
+        with pytest.raises(ValueError, match="unknown consult transport"):
+            resolve_transport(None)
 
 
 def test_load_config_env():
@@ -456,8 +460,8 @@ def test_cli_api_success_full_path(capsys):
         GptProTransport.__init__ = orig_init
 
 
-def test_cli_api_warns_on_non_completed_status(capsys):
-    """A non-completed status on the gpt_pro path emits a WARNING to stderr, rc still 0."""
+def test_cli_api_warns_and_fails_on_non_completed_status(capsys):
+    """A non-completed paid response is never reported as CLI success."""
     resp = _Response(output_text="partial", usage={"input_tokens": 1, "output_tokens": 1},
                      status="incomplete")
 
@@ -478,7 +482,7 @@ def test_cli_api_warns_on_non_completed_status(capsys):
             with _env(DANUS_CONSULT_TRANSPORT="gpt_pro", DANUS_CONSULT_API_KEY="ck",
                       DANUS_CONSULT_BASE_URL=None):
                 rc = cli.main(["--file", str(pf), "--quiet"])
-            assert rc == 0
+            assert rc == 1
             err = capsys.readouterr().err
             assert "WARNING status=" in err
     finally:

@@ -227,7 +227,8 @@ def test_channels_and_channel():
         _seed_project(root)
         chans = build_channels(root)
         kinds = {c["kind"]: c for c in chans["channels"]}
-        assert len(kinds) == 11  # all GLOBAL_KINDS mirrored
+        assert len(kinds) == 12  # all GLOBAL_KINDS mirrored
+        assert kinds["advisor_checkpoint"]["role"] == "strategy"
         assert kinds["plan"]["count"] == 2 and kinds["plan"]["role"] == "judgment"
         assert kinds["verification"]["count"] == 2
 
@@ -269,7 +270,7 @@ def test_http_routes_via_testclient():
             r = client.get("/api/factgraph")
             assert r.status_code == 200 and r.json()["max_depth"] == 2
             r = client.get("/api/channels")
-            assert r.status_code == 200 and len(r.json()["channels"]) == 11
+            assert r.status_code == 200 and len(r.json()["channels"]) == 12
             r = client.get("/api/channel/plan")
             assert r.status_code == 200 and r.json()["count"] == 2
             # unknown channel -> 404
@@ -287,7 +288,7 @@ def main() -> None:
     test_factgraph_cycle_guard()
     print("  [ok] factgraph cycle guard (mutual predecessors do not hang/crash)")
     test_channels_and_channel()
-    print("  [ok] channels list (11 kinds) + channel newest-first + unknown->KeyError")
+    print("  [ok] channels list (12 kinds) + channel newest-first + unknown->KeyError")
     test_missing_dirs_tolerated()
     print("  [ok] missing dirs/files tolerated -> empty, never crash")
     test_http_routes_via_testclient()

@@ -15,4 +15,4 @@ esac
 PROJ="$("$DANUS_PY" -I -B "$HERE/service-identity.py" \
   project-dir "$DANUS_AGENTS_ROOT" "$NAME")" || exit 1
 echo "[dashboard] http://127.0.0.1:$PORT  project=$NAME"
-exec "$DANUS_PY" -m danus.observability --project "$PROJ" --port "$PORT"
+exec "$DANUS_PY" -I -B -m danus.observability --project "$PROJ" --port "$PORT"

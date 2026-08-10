@@ -35,6 +35,13 @@ DEFAULT_CLAUDE_API_PRICE_OUT = DEFAULT_CLAUDE_CODE_PRICE_OUT
 # request; the API then re-serves it on this model in the same call). "off"/"none"
 # disables the fallback parameter entirely.
 DEFAULT_CLAUDE_API_FALLBACK = "claude-opus-4-8"
+CONSULT_TRANSPORTS = (
+    "gpt_pro",
+    "claude_api",
+    "claude_code",
+    "chatgpt_pro_browser",
+    "off",
+)
 
 
 def _first(*names: str, default: str | None = None) -> str | None:
@@ -87,15 +94,21 @@ def load_config() -> ConsultConfig:
 
 def resolve_transport(cli_value: str | None) -> str:
     """Pick the transport: explicit CLI flag > ``DANUS_CONSULT_TRANSPORT`` env
-    > ``gpt_pro`` (the default / core direction-guidance path).
+    > ``off`` (the safe default; paid/API transports are explicit opt-ins).
 
     Recognized transports: ``gpt_pro`` (paid OpenAI-compatible), ``claude_api``
     (paid Anthropic API, native SDK), ``claude_code`` (the Claude Code CLI via
-    ``claude -p``, subscription auth), and ``off``. Any other value resolves to
-    the ``gpt_pro`` default.
+    ``claude -p``, subscription auth), ``chatgpt_pro_browser`` (owner-mediated
+    ChatGPT UI handoff), and ``off``. Unknown values fail closed; a typo must
+    never turn into a paid API call.
     """
-    val = (cli_value or os.environ.get("DANUS_CONSULT_TRANSPORT") or "gpt_pro").strip().lower()
-    return val if val in ("off", "gpt_pro", "claude_api", "claude_code") else "gpt_pro"
+    val = (cli_value or os.environ.get("DANUS_CONSULT_TRANSPORT") or "off").strip().lower()
+    if val not in CONSULT_TRANSPORTS:
+        raise ValueError(
+            f"unknown consult transport {val!r}; expected one of "
+            f"{', '.join(CONSULT_TRANSPORTS)}"
+        )
+    return val
 
 
 @dataclass(frozen=True)

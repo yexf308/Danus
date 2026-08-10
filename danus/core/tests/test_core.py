@@ -14,6 +14,8 @@ import json
 import tempfile
 from pathlib import Path
 
+import pytest
+
 from danus.core import (
     FactGraph,
     FactPromotionOutcomeUnknown,
@@ -21,12 +23,145 @@ from danus.core import (
     LocalMemory,
     clean_external_refs,
     compute_fact_id,
+    fact_identity_from_verification_context,
     parse_frontmatter,
     verification_context_digest,
 )
 from danus.core import glossary as _glossary
 from danus.core import factgraph as _factgraph
+from danus.core import global_memory as _global_memory
+from danus.core import schema as _schema
 from danus.core._util import append_jsonl, read_jsonl
+
+
+def _browser_consult_provenance_v1() -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "transport": "chatgpt_pro_browser",
+        "request_id": "1" * 16,
+        "elaboration_id": "2" * 16,
+        "context_id": "durable-context-1",
+        "recommendation_id": "3" * 16,
+        "binding_sha256": "4" * 64,
+        "receipt_sha256": "5" * 64,
+        "prompt_sha256": "6" * 64,
+        "reply_sha256": "7" * 64,
+        "adopted_strategy_sha256": "8" * 64,
+        "trust": "adopted_strategy",
+        "billing_basis": "subscription",
+        "model": None,
+        "ui_mode": "Pro",
+        "input_tokens": None,
+        "output_tokens": None,
+        "cost_usd": None,
+    }
+
+
+def _reject_consult_provenance(value: object) -> None:
+    try:
+        _schema.clean_consult_provenance(value)
+        assert False, "invalid consult provenance must be rejected"
+    except ValueError:
+        pass
+
+
+def test_consult_provenance_schema1_shape_is_unchanged():
+    browser = _browser_consult_provenance_v1()
+    assert _schema.clean_consult_provenance(browser) == browser
+
+    metered = {
+        "schema_version": 1,
+        "transport": "gpt_pro",
+        "trust": "provider_response",
+        "billing_basis": "metered_api",
+        "model": "gpt-pro",
+        "ui_mode": None,
+        "input_tokens": 10,
+        "output_tokens": 20,
+        "cost_usd": 3,
+    }
+    assert _schema.clean_consult_provenance(metered) == {
+        "schema_version": 1,
+        "transport": "gpt_pro",
+        "request_id": None,
+        "elaboration_id": None,
+        "context_id": None,
+        "recommendation_id": None,
+        "binding_sha256": None,
+        "receipt_sha256": None,
+        "prompt_sha256": None,
+        "reply_sha256": None,
+        "adopted_strategy_sha256": None,
+        "trust": "provider_response",
+        "billing_basis": "metered_api",
+        "model": "gpt-pro",
+        "ui_mode": None,
+        "input_tokens": 10,
+        "output_tokens": 20,
+        "cost_usd": 3.0,
+    }
+
+    for checkpoint_field, checkpoint_value in (
+        ("checkpoint_id", "9" * 16),
+        ("checkpoint_sha256", "a" * 64),
+        ("checkpoint_bytes", 1),
+    ):
+        _reject_consult_provenance(
+            {**browser, checkpoint_field: checkpoint_value}
+        )
+
+
+def test_consult_provenance_schema2_exact_checkpoint_projection():
+    schema2 = {
+        **_browser_consult_provenance_v1(),
+        "schema_version": 2,
+        "checkpoint_id": "9" * 16,
+        "checkpoint_sha256": "a" * 64,
+        "checkpoint_bytes": 32 * 1024,
+    }
+    cleaned = _schema.clean_consult_provenance(schema2)
+    assert cleaned == schema2
+    assert set(cleaned) == set(schema2)
+
+
+def test_consult_provenance_schema2_rejects_partial_unknown_and_wrong_transport():
+    schema2 = {
+        **_browser_consult_provenance_v1(),
+        "schema_version": 2,
+        "checkpoint_id": "9" * 16,
+        "checkpoint_sha256": "a" * 64,
+        "checkpoint_bytes": 1024,
+    }
+    for checkpoint_field in (
+        "checkpoint_id",
+        "checkpoint_sha256",
+        "checkpoint_bytes",
+    ):
+        _reject_consult_provenance(
+            {key: item for key, item in schema2.items() if key != checkpoint_field}
+        )
+    _reject_consult_provenance({**schema2, "checkpoint_encoding": "utf-8"})
+    _reject_consult_provenance({**schema2, "transport": "gpt_pro"})
+
+
+def test_consult_provenance_schema2_validates_checkpoint_identity_and_size():
+    schema2 = {
+        **_browser_consult_provenance_v1(),
+        "schema_version": 2,
+        "checkpoint_id": "9" * 16,
+        "checkpoint_sha256": "a" * 64,
+        "checkpoint_bytes": 1,
+    }
+    for invalid_id in ("9" * 15, "9" * 17, "A" * 16, "g" * 16, None, 9):
+        _reject_consult_provenance({**schema2, "checkpoint_id": invalid_id})
+    for invalid_sha256 in ("a" * 63, "a" * 65, "A" * 64, "g" * 64, None, 1):
+        _reject_consult_provenance(
+            {**schema2, "checkpoint_sha256": invalid_sha256}
+        )
+    for invalid_bytes in (0, -1, 32 * 1024 + 1, True, 1.0, None):
+        _reject_consult_provenance(
+            {**schema2, "checkpoint_bytes": invalid_bytes}
+        )
 
 
 def test_local_memory_edge_cases():
@@ -73,7 +208,160 @@ def test_global_memory_edge_cases():
             if hit["entry"]["id"] == first:
                 assert hit["entry"]["status"] == "supported"
         # a query matching nothing yields zero results (score<=0 break)
-        assert gm.search("zzzquarkxyz", kinds=["plan"])["results_by_kind"]["plan"]["count"] == 0
+        assert (
+            gm.search("zzzquarkxyz", kinds=["plan"])["results_by_kind"]["plan"]["count"]
+            == 0
+        )
+
+
+def test_global_memory_exact_get_is_bounded_and_unambiguous():
+    with tempfile.TemporaryDirectory() as d:
+        gm = GlobalMemory(Path(d) / "p")
+        entry_id = gm.append(
+            "obstacle", claim="exact obstruction", evidence="bounded", author="critic"
+        )
+        gm.set_status(entry_id, "supported", fact_id="0123456789abcdef")
+        entry = gm.get(entry_id)
+        assert entry["id"] == entry_id
+        assert entry["kind"] == "obstacle"
+        assert entry["status"] == "supported"
+        assert entry["fact_id"] == "0123456789abcdef"
+
+        for invalid in ("0" * 15, "0" * 17, "A" * 16, "g" * 16, None):
+            try:
+                gm.get(invalid)  # type: ignore[arg-type]
+                assert False, "invalid exact-lookup id must be rejected"
+            except ValueError:
+                pass
+        try:
+            gm.get("f" * 16)
+            assert False, "unknown exact-lookup id must be rejected"
+        except ValueError as exc:
+            assert "unknown" in str(exc)
+
+    with tempfile.TemporaryDirectory() as d:
+        gm = GlobalMemory(Path(d) / "p")
+        duplicate_id = "1" * 16
+        for kind in ("plan", "obstacle"):
+            append_jsonl(
+                gm._path(kind),
+                {"id": duplicate_id, "kind": kind, "claim": kind, "evidence": ""},
+            )
+        try:
+            gm.get(duplicate_id)
+            assert False, "duplicate ids across kinds must fail closed"
+        except ValueError as exc:
+            assert "duplicate" in str(exc)
+
+    with tempfile.TemporaryDirectory() as d:
+        gm = GlobalMemory(Path(d) / "p")
+        oversized_id = gm.append(
+            "plan", claim="oversized", evidence="x" * (16 * 1024), author="worker"
+        )
+        try:
+            gm.get(oversized_id)
+            assert False, "oversized exact hydration must fail closed"
+        except ValueError as exc:
+            assert "serialized byte limit" in str(exc)
+
+
+def test_global_memory_strict_reader_bounds_before_decode_or_json_parse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    gm = GlobalMemory(tmp_path / "project")
+    path = gm._path("advisor_checkpoint")
+    path.parent.mkdir(parents=True)
+    path.write_bytes(
+        b"{" + b"x" * _global_memory.GM_IMMUTABLE_MAX_PHYSICAL_LINE_BYTES
+    )
+    calls = {"loads": 0}
+
+    def forbidden_loads(_value):
+        calls["loads"] += 1
+        raise AssertionError("oversized physical lines must be rejected before JSON")
+
+    monkeypatch.setattr(_global_memory.json, "loads", forbidden_loads)
+    with pytest.raises(ValueError, match="physical byte limit"):
+        gm.read_immutable("advisor_checkpoint")
+    assert calls == {"loads": 0}
+
+
+@pytest.mark.parametrize(
+    ("raw", "error"),
+    [
+        (b'{"id":"1111111111111111"}', "torn"),
+        (b"\xff\n", "UTF-8"),
+        (b"not-json\n", "malformed"),
+    ],
+)
+def test_global_memory_strict_reader_rejects_torn_utf8_and_json(
+    tmp_path: Path, raw: bytes, error: str
+):
+    gm = GlobalMemory(tmp_path / "project")
+    path = gm._path("advisor_checkpoint")
+    path.parent.mkdir(parents=True)
+    path.write_bytes(raw)
+    with pytest.raises(ValueError, match=error):
+        gm.read_immutable("advisor_checkpoint")
+
+
+def test_checkpoint_scoped_immutable_lookup_is_bounded_and_channel_local(
+    tmp_path: Path,
+):
+    gm = GlobalMemory(tmp_path / "project")
+    checkpoint_id = "1" * 16
+    record = {
+        "id": checkpoint_id,
+        "kind": "advisor_checkpoint",
+        "claim": "bounded checkpoint",
+        "evidence": "x" * 31_000,
+    }
+    assert len(_global_memory.canonical_global_memory_record(record)) <= 32 * 1024
+    append_jsonl(gm._path("advisor_checkpoint"), record)
+    physical = gm._path("advisor_checkpoint").read_bytes()
+    assert len(physical) <= _global_memory.GM_IMMUTABLE_MAX_PHYSICAL_LINE_BYTES
+
+    unrelated = gm._path("plan")
+    unrelated.write_bytes(
+        b"{" + b"y" * _global_memory.GM_IMMUTABLE_MAX_PHYSICAL_LINE_BYTES
+    )
+    assert gm.get_immutable_in_kind("advisor_checkpoint", checkpoint_id) == record
+    with pytest.raises(ValueError, match="physical byte limit"):
+        gm.get_immutable(checkpoint_id)
+
+    append_jsonl(gm._path("advisor_checkpoint"), record)
+    with pytest.raises(ValueError, match="duplicate"):
+        gm.get_immutable_in_kind("advisor_checkpoint", checkpoint_id)
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        b'{"id":"0000000000000000","value":NaN}\n',
+        b'{"id":"0000000000000000","value":Infinity}\n',
+        b'{"id":"0000000000000000","value":-Infinity}\n',
+        b'{"id":"0000000000000000","value":1e999}\n',
+        b'{"id":"0000000000000000","id":"2222222222222222"}\n',
+        b'{"id":"0000000000000000","nested":{"x":1,"x":2}}\n',
+        (
+            b'{"id":"0000000000000000","padding":"'
+            + b"z" * (32 * 1024)
+            + b'"}\n'
+        ),
+    ],
+)
+def test_checkpoint_scoped_lookup_rejects_nonmatching_noncanonical_rows(
+    tmp_path: Path, invalid: bytes
+):
+    gm = GlobalMemory(tmp_path / "project")
+    target = {"id": "1" * 16, "kind": "advisor_checkpoint"}
+    path = gm._path("advisor_checkpoint")
+    path.parent.mkdir(parents=True)
+    path.write_bytes(
+        invalid + json.dumps(target, separators=(",", ":")).encode("utf-8") + b"\n"
+    )
+    with pytest.raises(ValueError):
+        gm.get_immutable_in_kind("advisor_checkpoint", target["id"])
 
 
 def test_util_read_jsonl_missing_and_garbage():
@@ -82,10 +370,10 @@ def test_util_read_jsonl_missing_and_garbage():
         assert read_jsonl(missing) == []  # missing file -> []
         garbage = Path(d) / "g.jsonl"
         garbage.write_text(
-            '{"ok": 1}\n'          # valid dict
-            "\n"                    # blank line skipped
-            "not json at all\n"     # JSONDecodeError skipped
-            "[1, 2, 3]\n"           # valid JSON but not a dict -> skipped
+            '{"ok": 1}\n'  # valid dict
+            "\n"  # blank line skipped
+            "not json at all\n"  # JSONDecodeError skipped
+            "[1, 2, 3]\n"  # valid JSON but not a dict -> skipped
             '{"ok": 2}\n',
             encoding="utf-8",
         )
@@ -134,17 +422,25 @@ def test_glossary_flatten_and_undefined():
     # falsy -> {}
     assert _glossary.flatten(None) == {} and _glossary.flatten({}) == {}
     # nested {version, terms:{term:{definition, aliases}}} shape + flat shape
-    nested = {"version": 1, "terms": {"S_M": {"definition": "a set", "aliases": ["SM"]}}}
+    nested = {
+        "version": 1,
+        "terms": {"S_M": {"definition": "a set", "aliases": ["SM"]}},
+    }
     fl = _glossary.flatten(nested)
     assert fl["S_M"] == "a set" and fl["SM"] == "a set"  # alias inherits definition
     assert _glossary.flatten({"K_F": "canonical"}) == {"K_F": "canonical"}  # flat entry
     # undefined_symbols: a token whose base-form (sans arg list) is defined is OK.
     # "S_M(x)" is an interesting token; its base "S_M" is in `defined` -> not flagged.
-    assert _glossary.undefined_symbols(
-        statement="S_M(x) applied", proof="", defined={"S_M"}) == []
+    assert (
+        _glossary.undefined_symbols(
+            statement="S_M(x) applied", proof="", defined={"S_M"}
+        )
+        == []
+    )
     # and if neither the token nor its base is defined, it IS flagged
     assert _glossary.undefined_symbols(
-        statement="S_M(x) applied", proof="", defined=set()) == ["S_M(x)"]
+        statement="S_M(x) applied", proof="", defined=set()
+    ) == ["S_M(x)"]
 
 
 def test_glossary_global_load_and_fallback():
@@ -178,6 +474,7 @@ def test_glossary_missing_resource_fallback():
     # point the loader at a package with no glossary resource -> None (the
     # FileNotFoundError/OSError branch of _load_global_text)
     import danus.core.glossary as g
+
     orig_res = g._GLOBAL_RESOURCE
     g._GLOBAL_RESOURCE = "does_not_exist_anywhere.json"
     try:
@@ -190,9 +487,16 @@ def test_factgraph_edge_cases():
     with tempfile.TemporaryDirectory() as d:
         fg = FactGraph(Path(d) / "proj")
         # intuition is serialized (## intuition block)
-        fid = fg.add(problem_id="P", author="w", statement="A holds", proof="pf",
-                     intuition="the key idea is X")
-        assert "## intuition" in fg.get_raw(fid) and "the key idea is X" in fg.get_raw(fid)
+        fid = fg.add(
+            problem_id="P",
+            author="w",
+            statement="A holds",
+            proof="pf",
+            intuition="the key idea is X",
+        )
+        assert "## intuition" in fg.get_raw(fid) and "the key idea is X" in fg.get_raw(
+            fid
+        )
 
         # search: `limit` cap is honored (three matching facts, limit=2)
         for s in ("B one", "B two", "B three"):
@@ -228,12 +532,19 @@ def test_factgraph_set_external_refs_edge_cases():
             assert "unknown fact_id" in str(e)
 
         # a fact whose file has NO external_refs line (legacy) -> the line is inserted
-        fid = compute_fact_id(problem_id="P", predecessors=[], glossary_introduces={},
-                              statement="L holds", proof="pf L")
+        fid = compute_fact_id(
+            problem_id="P",
+            predecessors=[],
+            glossary_introduces={},
+            statement="L holds",
+            proof="pf L",
+        )
         fg.facts_dir.mkdir(parents=True, exist_ok=True)
-        legacy = (f"---\nfact_id: {fid}\nproblem_id: P\nauthor: w\n"
-                  "predecessors: []\nglossary_introduces: {}\n---\n\n"
-                  "## statement\nL holds\n\n## proof\npf L\n")
+        legacy = (
+            f"---\nfact_id: {fid}\nproblem_id: P\nauthor: w\n"
+            "predecessors: []\nglossary_introduces: {}\n---\n\n"
+            "## statement\nL holds\n\n## proof\npf L\n"
+        )
         fg._path(fid).write_text(legacy, encoding="utf-8")
         refs = [{"key": "K1", "title": "T1"}]
         assert fg.set_external_refs(fid, refs) == refs
@@ -241,8 +552,13 @@ def test_factgraph_set_external_refs_edge_cases():
         assert "external_refs:" in fg.get_raw(fid)
 
         # a malformed file (no frontmatter close) -> ValueError
-        bad = compute_fact_id(problem_id="P", predecessors=[], glossary_introduces={},
-                              statement="M", proof="p")
+        bad = compute_fact_id(
+            problem_id="P",
+            predecessors=[],
+            glossary_introduces={},
+            statement="M",
+            proof="p",
+        )
         fg._path(bad).write_text("---\nfact_id: x\nno close here\n", encoding="utf-8")
         try:
             fg.set_external_refs(bad, refs)
@@ -253,18 +569,22 @@ def test_factgraph_set_external_refs_edge_cases():
 
 def test_parse_frontmatter_edge_cases():
     # external_refs with invalid JSON payload -> [] (JSONDecodeError branch)
-    bad_refs = ("---\nfact_id: x\nproblem_id: P\nauthor: w\npredecessors: []\n"
-                "glossary_introduces: {}\nexternal_refs: {not valid json\n---\n\n"
-                "## statement\ns\n\n## proof\np\n")
+    bad_refs = (
+        "---\nfact_id: x\nproblem_id: P\nauthor: w\npredecessors: []\n"
+        "glossary_introduces: {}\nexternal_refs: {not valid json\n---\n\n"
+        "## statement\ns\n\n## proof\np\n"
+    )
     assert parse_frontmatter(bad_refs)["external_refs"] == []
 
     # a glossary block terminated by a NON-glossary, non-special line
     # (in_gloss stays True until a line fails _GLOSS_LINE_RE -> in_gloss=False)
-    with_gloss = ("---\nfact_id: x\nproblem_id: P\nauthor: w\npredecessors: []\n"
-                  "glossary_introduces:\n  X: a manifold\n"
-                  "some_other_field: value\n"        # not a glossary line -> terminates block
-                  "external_refs: []\n---\n\n"
-                  "## statement\ns\n\n## proof\np\n")
+    with_gloss = (
+        "---\nfact_id: x\nproblem_id: P\nauthor: w\npredecessors: []\n"
+        "glossary_introduces:\n  X: a manifold\n"
+        "some_other_field: value\n"  # not a glossary line -> terminates block
+        "external_refs: []\n---\n\n"
+        "## statement\ns\n\n## proof\np\n"
+    )
     parsed = parse_frontmatter(with_gloss)
     assert parsed["glossary_introduces"] == {"X": "a manifold"}
     assert parsed["external_refs"] == []
@@ -272,10 +592,7 @@ def test_parse_frontmatter_edge_cases():
 
 def test_statement_of_helper():
     # Internal H2 markdown is content; only the reserved proof boundary ends it.
-    raw = (
-        "## statement\nA holds\n\n## Assumptions\nand more\n\n"
-        "## proof\nirrelevant\n"
-    )
+    raw = "## statement\nA holds\n\n## Assumptions\nand more\n\n## proof\nirrelevant\n"
     assert _factgraph.statement_of(raw) == "A holds ## Assumptions and more"
 
 
@@ -294,23 +611,94 @@ def test_global_memory():
         gm = GlobalMemory(Path(d) / "project")
 
         # judgment (verifiable=false): no evidence required
-        pid = gm.append("plan", claim="reduce to the q>=2 case", evidence="", author="worker_high")
+        pid = gm.append(
+            "plan", claim="reduce to the q>=2 case", evidence="", author="worker_high"
+        )
         assert [e for e in gm.read("plan") if e["id"] == pid][0]["status"] == "open"
 
         # main-agent strategic guidance
-        gm.append("master_guidance", claim="prioritize the symplectic-rank route",
-                  evidence="pro: the rank obstruction is the crux", author="main_agent")
+        gm.append(
+            "master_guidance",
+            claim="prioritize the symplectic-rank route",
+            evidence="pro: the rank obstruction is the crux",
+            author="main_agent",
+        )
 
         # main-agent elaboration (judgment synthesis; verifiable=false, cited fact_ids in links)
-        eid = gm.append("elaboration", claim="**Not solved.** Main blocker: rank obstruction",
-                        evidence="## 0. Mathematical verdict\n**Not solved.** ...", author="main_agent",
-                        links={"fact_ids": ["abc123"]})
+        eid = gm.append(
+            "elaboration",
+            claim="**Not solved.** Main blocker: rank obstruction",
+            evidence="## 0. Mathematical verdict\n**Not solved.** ...",
+            author="main_agent",
+            links={"fact_ids": ["abc123"]},
+        )
         eentry = [e for e in gm.read("elaboration") if e["id"] == eid][0]
         assert eentry["status"] == "open" and eentry["links"]["fact_ids"] == ["abc123"]
 
+        checkpoint = (
+            "## Verified facts\n"
+            "- `0123456789abcdef`: a verified reduction.\n\n"
+            "## Failed routes and evidence\n"
+            "- Route A conflicts with counterexample entry `deadbeef`.\n\n"
+            "## Unresolved bottleneck\n"
+            "No continuum-safe atomization is known.\n\n"
+            "## Candidate decision question\n"
+            "Which of two remaining routes should the workers prioritize?"
+        )
+        checkpoint_id = gm.append(
+            "advisor_checkpoint",
+            claim="Late advisor checkpoint: continuum-safe atomization is blocked",
+            evidence=checkpoint,
+            author="main_agent",
+            links={"fact_ids": ["0123456789abcdef"]},
+        )
+        checkpoint_entry = [
+            entry
+            for entry in gm.read("advisor_checkpoint")
+            if entry["id"] == checkpoint_id
+        ][0]
+        assert checkpoint_entry["verifiable"] is False
+        assert checkpoint_entry["links"]["fact_ids"] == ["0123456789abcdef"]
+
+        for invalid_evidence in (
+            checkpoint.replace("## Candidate decision question", "## Missing"),
+            checkpoint.replace("## Verified facts", "## TEMP")
+            .replace("## Failed routes and evidence", "## Verified facts")
+            .replace("## TEMP", "## Failed routes and evidence"),
+            checkpoint + "x" * (16 * 1024),
+        ):
+            try:
+                gm.append(
+                    "advisor_checkpoint",
+                    claim="invalid checkpoint",
+                    evidence=invalid_evidence,
+                    author="main_agent",
+                    links={"fact_ids": []},
+                )
+                assert False, "should reject malformed/unbounded advisor checkpoint"
+            except ValueError:
+                pass
+        try:
+            gm.append(
+                "advisor_checkpoint",
+                claim="too many fact ids",
+                evidence=checkpoint,
+                author="main_agent",
+                links={"fact_ids": [f"{index:016x}" for index in range(13)]},
+            )
+            assert False, "should cap an advisor checkpoint at 12 verified fact ids"
+        except ValueError:
+            pass
+
         # verification trace (logged by fact_submit; verifiable=false, extra fields allowed)
-        vid = gm.append("verification", claim="Lemma L fails for n=2", evidence="verdict: correct",
-                        author="worker_xhigh", verdict="correct", fact_id="abc123")
+        vid = gm.append(
+            "verification",
+            claim="Lemma L fails for n=2",
+            evidence="verdict: correct",
+            author="worker_xhigh",
+            verdict="correct",
+            fact_id="abc123",
+        )
         ventry = [e for e in gm.read("verification") if e["id"] == vid][0]
         assert ventry["verdict"] == "correct" and ventry["fact_id"] == "abc123"
 
@@ -322,9 +710,15 @@ def test_global_memory():
             pass
 
         # a verifiable claim, then status transitions (agent-driven)
-        gid = gm.append("counterexample", claim="Lemma L fails for n=2",
-                        evidence="Take X=P^1; ... QED.", author="worker_xhigh")
-        assert [e for e in gm.read("counterexample") if e["id"] == gid][0]["status"] == "unverified"
+        gid = gm.append(
+            "counterexample",
+            claim="Lemma L fails for n=2",
+            evidence="Take X=P^1; ... QED.",
+            author="worker_xhigh",
+        )
+        assert [e for e in gm.read("counterexample") if e["id"] == gid][0][
+            "status"
+        ] == "unverified"
         gm.set_status(gid, "verified", fact_id="abc123")
         entry = [e for e in gm.read("counterexample") if e["id"] == gid][0]
         assert entry["status"] == "verified" and entry["fact_id"] == "abc123"
@@ -333,17 +727,36 @@ def test_global_memory():
 def test_factgraph():
     with tempfile.TemporaryDirectory() as d:
         fg = FactGraph(Path(d) / "proj2")
-        base = fg.add(problem_id="P", author="P_high", statement="A holds", proof="proof of A",
-                      glossary_introduces={"X": "a complex manifold"})
-        child = fg.add(problem_id="P", author="P_high", statement="B from A", proof="uses A",
-                       predecessors=[base])
-        grand = fg.add(problem_id="P", author="P_high", statement="C from B", proof="uses B",
-                       predecessors=[child])
+        base = fg.add(
+            problem_id="P",
+            author="P_high",
+            statement="A holds",
+            proof="proof of A",
+            glossary_introduces={"X": "a complex manifold"},
+        )
+        child = fg.add(
+            problem_id="P",
+            author="P_high",
+            statement="B from A",
+            proof="uses A",
+            predecessors=[base],
+        )
+        grand = fg.add(
+            problem_id="P",
+            author="P_high",
+            statement="C from B",
+            proof="uses B",
+            predecessors=[child],
+        )
 
         # content addressing: same content (incl. glossary) -> same id
-        assert base == compute_fact_id(problem_id="P", predecessors=[],
-                                       glossary_introduces={"X": "a complex manifold"},
-                                       statement="A holds", proof="proof of A")
+        assert base == compute_fact_id(
+            problem_id="P",
+            predecessors=[],
+            glossary_introduces={"X": "a complex manifold"},
+            statement="A holds",
+            proof="proof of A",
+        )
         assert fg.predecessors(child) == [base]
         assert set(fg.descendants(base)) == {child, grand}
         assert "## statement" in fg.get_raw(base) and "## proof" in fg.get_raw(base)
@@ -351,23 +764,36 @@ def test_factgraph():
         # derived fact index: BM25 search over fact bodies, rebuilt on demand
         hits = fg.search("B from A")
         assert hits and hits[0]["fact_id"] == child
-        assert hits[0]["statement"] == "B from A"          # snippet is the ## statement body
-        assert "proof" not in hits[0]                       # search stays summary-only
-        assert all(h["score"] > 0 for h in hits)           # zero-score hits are dropped
+        assert hits[0]["statement"] == "B from A"  # snippet is the ## statement body
+        assert "proof" not in hits[0]  # search stays summary-only
+        assert all(h["score"] > 0 for h in hits)  # zero-score hits are dropped
         assert fg.search("nonexistent symplectic quark") == []
 
         # glossary: serialized in the node, merged into the project glossary, parsed back
         assert '"X": "a complex manifold"' in fg.get_raw(base)
         assert fg.glossary().get("X") == "a complex manifold"
-        assert parse_frontmatter(fg.get_raw(base))["glossary_introduces"] == {"X": "a complex manifold"}
+        assert parse_frontmatter(fg.get_raw(base))["glossary_introduces"] == {
+            "X": "a complex manifold"
+        }
 
         # coverage check: a symbol defined in a predecessor is OK; an undefined one is flagged
-        assert fg.undefined_symbols(statement="K_F equals zero", proof="by X",
-                                    predecessors=[base], glossary_introduces={}) == ["K_F"]
-        assert fg.undefined_symbols(statement="X is nice", proof="X is a manifold",
-                                    predecessors=[base]) == []
+        assert fg.undefined_symbols(
+            statement="K_F equals zero",
+            proof="by X",
+            predecessors=[base],
+            glossary_introduces={},
+        ) == ["K_F"]
+        assert (
+            fg.undefined_symbols(
+                statement="X is nice", proof="X is a manifold", predecessors=[base]
+            )
+            == []
+        )
         # global glossary: universal notation counts as defined everywhere (no project def needed)
-        assert fg.undefined_symbols(statement="let epsilon in R+", proof="Z+ is nonempty") == []
+        assert (
+            fg.undefined_symbols(statement="let epsilon in R+", proof="Z+ is nonempty")
+            == []
+        )
 
         # cascade revoke + predecessor-revoked refusal
         revoked = fg.revoke(base, reason="A was wrong")
@@ -386,21 +812,36 @@ def test_factgraph():
             assert "fact_revoked" in str(e)
         assert not fg.exists(base) and fg._revoked_path(base).exists()
         try:
-            fg.add(problem_id="P", author="P_high", statement="D from A", proof="uses A",
-                   predecessors=[base])
+            fg.add(
+                problem_id="P",
+                author="P_high",
+                statement="D from A",
+                proof="uses A",
+                predecessors=[base],
+            )
             assert False, "should refuse revoked predecessor"
         except ValueError as e:
             assert "predecessor_revoked" in str(e)
         try:
-            fg.add(problem_id="P", author="P_high", statement="phantom", proof="bad",
-                   predecessors=["0000000000000000"])
+            fg.add(
+                problem_id="P",
+                author="P_high",
+                statement="phantom",
+                proof="bad",
+                predecessors=["0000000000000000"],
+            )
             assert False, "should refuse an unknown predecessor"
         except ValueError as e:
             assert "predecessor_unknown" in str(e)
         live = fg.add(problem_id="P", author="P_high", statement="fresh", proof="proof")
         try:
-            fg.add(problem_id="P", author="P_high", statement="duplicate edge", proof="bad",
-                   predecessors=[live, live])
+            fg.add(
+                problem_id="P",
+                author="P_high",
+                statement="duplicate edge",
+                proof="bad",
+                predecessors=[live, live],
+            )
             assert False, "should refuse duplicate predecessor edges"
         except ValueError as e:
             assert "duplicate predecessor" in str(e)
@@ -410,20 +851,37 @@ def test_factgraph_lazy_context():
     with tempfile.TemporaryDirectory() as d:
         fg = FactGraph(Path(d) / "context")
         base = fg.add(problem_id="P", author="w", statement="Base", proof="proof base")
-        other = fg.add(problem_id="P", author="w", statement="Other", proof="proof other")
-        child = fg.add(problem_id="P", author="w", statement="Child", proof="proof child",
-                       predecessors=[base])
-        root = fg.add(problem_id="P", author="w", statement="Root", proof="proof root",
-                      predecessors=[child])
-        unrelated = fg.add(problem_id="P", author="w", statement="Unrelated",
-                           proof="must not be read")
+        other = fg.add(
+            problem_id="P", author="w", statement="Other", proof="proof other"
+        )
+        child = fg.add(
+            problem_id="P",
+            author="w",
+            statement="Child",
+            proof="proof child",
+            predecessors=[base],
+        )
+        root = fg.add(
+            problem_id="P",
+            author="w",
+            statement="Root",
+            proof="proof root",
+            predecessors=[child],
+        )
+        unrelated = fg.add(
+            problem_id="P", author="w", statement="Unrelated", proof="must not be read"
+        )
 
         # Default is summary/relations only and depth zero.
         summary = fg.context([root])
-        assert summary["facts"] == [{
-            "fact_id": root, "statement": "Root", "predecessors": [child],
-            "glossary_introduces": {},
-        }]
+        assert summary["facts"] == [
+            {
+                "fact_id": root,
+                "statement": "Root",
+                "predecessors": [child],
+                "glossary_introduces": {},
+            }
+        ]
         assert summary["complete"] is True and summary["truncated"] is False
         assert summary["schema_version"] == 1
         assert summary["scope"] == {
@@ -461,7 +919,9 @@ def test_factgraph_lazy_context():
         assert all("proof" not in item for item in selected["facts"][1:])
         hydrated = fg.context([root], predecessor_depth=None, proof_mode="all")
         assert [item["proof"] for item in hydrated["facts"]] == [
-            "proof root", "proof child", "proof base",
+            "proof root",
+            "proof child",
+            "proof base",
         ]
 
         # A depth bound is complete for the requested scope, not a truncation.
@@ -470,9 +930,14 @@ def test_factgraph_lazy_context():
         assert bounded["complete"] is True and bounded["truncated"] is False
 
         # Budgets charge whole records and stop at the first record that cannot fit.
-        first_chars = len(json.dumps(
-            closure["facts"][0], ensure_ascii=False, sort_keys=True, separators=(",", ":")
-        ))
+        first_chars = len(
+            json.dumps(
+                closure["facts"][0],
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
         budgeted = fg.context(
             [root, other], predecessor_depth=None, max_chars=first_chars
         )
@@ -491,15 +956,22 @@ def test_factgraph_lazy_context():
         assert unavailable["complete"] is False and unavailable["facts"] == []
 
         removed = fg.add(problem_id="P", author="w", statement="Removed", proof="proof")
-        dangling = fg.add(problem_id="P", author="w", statement="Dangling",
-                          proof="uses missing", predecessors=[removed])
+        dangling = fg.add(
+            problem_id="P",
+            author="w",
+            statement="Dangling",
+            proof="uses missing",
+            predecessors=[removed],
+        )
         (fg.facts_dir / f"{removed}.md").unlink()  # simulate a corrupt legacy graph
         transitive_missing = fg.context([dangling], predecessor_depth=None)
         assert [item["fact_id"] for item in transitive_missing["facts"]] == [dangling]
         assert transitive_missing["missing_fact_ids"] == [removed]
         assert transitive_missing["complete"] is False
 
-        empty = fg.context([], predecessor_depth=None, proof_mode="selected", max_chars=0)
+        empty = fg.context(
+            [], predecessor_depth=None, proof_mode="selected", max_chars=0
+        )
         assert empty["complete"] is True and empty["facts"] == []
         assert empty["characters_used"] == 0 and empty["omitted_fact_ids"] == []
 
@@ -539,16 +1011,25 @@ def test_factgraph_lazy_context():
 
         unicode_glossary = {"U_X": "first\u2028second\u2029third"}
         unicode_fact = fg.add(
-            problem_id="P", author="w", statement="Unicode definition",
-            proof="proof", glossary_introduces=unicode_glossary,
+            problem_id="P",
+            author="w",
+            statement="Unicode definition",
+            proof="proof",
+            glossary_introduces=unicode_glossary,
         )
-        assert fg.context([unicode_fact])["facts"][0]["glossary_introduces"] == unicode_glossary
+        assert (
+            fg.context([unicode_fact])["facts"][0]["glossary_introduces"]
+            == unicode_glossary
+        )
 
         before_invalid = set(fg.list())
         try:
             fg.add(
-                problem_id="P", author="w", statement="Bad intuition boundary",
-                proof="proof", intuition="first\n\n## intuition\nsecond",
+                problem_id="P",
+                author="w",
+                statement="Bad intuition boundary",
+                proof="proof",
+                intuition="first\n\n## intuition\nsecond",
             )
             assert False, "reserved intuition boundary must be rejected before write"
         except ValueError as e:
@@ -568,24 +1049,30 @@ def test_factgraph_lazy_context():
             [], predecessor_depth=None, glossary_texts=["Apply Q_X now."]
         )
         assert glossary_context["facts"] == []
-        assert glossary_context["glossary"] == {
-            "Q_X": "a distinguished project object"
-        }
+        assert glossary_context["glossary"] == {"Q_X": "a distinguished project object"}
         assert glossary_context["scope"]["glossary_terms"] == ["Q_X"]
         assert glossary_context["complete"] is True
         glossary_budget = fg.context(
-            [], predecessor_depth=None, max_chars=1,
+            [],
+            predecessor_depth=None,
+            max_chars=1,
             glossary_texts=["Apply Q_X now."],
         )
         assert glossary_budget["facts"] == [] and glossary_budget["glossary"] == {}
         assert glossary_budget["omitted_glossary_terms"] == ["Q_X"]
-        assert glossary_budget["complete"] is False and glossary_budget["truncated"] is True
+        assert (
+            glossary_budget["complete"] is False
+            and glossary_budget["truncated"] is True
+        )
 
         before_conflict = set(fg.list())
         try:
             fg.add(
-                problem_id="P", author="w", statement="Conflicting definition",
-                proof="proof", glossary_introduces={"Q_X": "a different object"},
+                problem_id="P",
+                author="w",
+                statement="Conflicting definition",
+                proof="proof",
+                glossary_introduces={"Q_X": "a different object"},
             )
             assert False, "project glossary terms must be semantically stable"
         except ValueError as e:
@@ -605,7 +1092,10 @@ def test_factgraph_lazy_context():
         assert set(fg.list()) == before_conflict
 
         tampered = fg.add(
-            problem_id="P", author="w", statement="Tamper target", proof="original proof"
+            problem_id="P",
+            author="w",
+            statement="Tamper target",
+            proof="original proof",
         )
         tampered_path = fg.facts_dir / f"{tampered}.md"
         tampered_path.write_text(
@@ -641,7 +1131,9 @@ def test_factgraph_lazy_context_deep_dag_is_iterative():
             [tip], predecessor_depth=None, proof_mode="selected", max_chars=None
         )
         assert context["complete"] is True and context["truncated"] is False
-        assert [record["fact_id"] for record in context["facts"]] == list(reversed(expected))
+        assert [record["fact_id"] for record in context["facts"]] == list(
+            reversed(expected)
+        )
         assert "proof" in context["facts"][0]
         assert all("proof" not in record for record in context["facts"][1:])
 
@@ -716,19 +1208,31 @@ def test_adaptive_verification_context_diamond_deduplicates_and_binds_every_laye
     with tempfile.TemporaryDirectory() as d:
         fg = FactGraph(Path(d) / "adaptive-diamond")
         base = fg.add(
-            problem_id="P", author="w", statement="Base",
-            proof="base proof bytes", glossary_introduces={"B": "base object"},
+            problem_id="P",
+            author="w",
+            statement="Base",
+            proof="base proof bytes",
+            glossary_introduces={"B": "base object"},
         )
         left = fg.add(
-            problem_id="P", author="w", statement="Left", proof="left proof",
+            problem_id="P",
+            author="w",
+            statement="Left",
+            proof="left proof",
             predecessors=[base],
         )
         right = fg.add(
-            problem_id="P", author="w", statement="Right", proof="right proof",
+            problem_id="P",
+            author="w",
+            statement="Right",
+            proof="right proof",
             predecessors=[base],
         )
         root = fg.add(
-            problem_id="P", author="w", statement="Root", proof="root proof",
+            problem_id="P",
+            author="w",
+            statement="Root",
+            proof="root proof",
             predecessors=[left, right],
         )
 
@@ -748,7 +1252,9 @@ def test_adaptive_verification_context_diamond_deduplicates_and_binds_every_laye
         assert reads == closure_order
         assert first["scope"]["closure_fact_ids"] == closure_order
         assert [record["fact_id"] for record in first["facts"]] == closure_order
-        assert len(first["facts"]) == len({record["fact_id"] for record in first["facts"]})
+        assert len(first["facts"]) == len(
+            {record["fact_id"] for record in first["facts"]}
+        )
         assert first["expanded_proofs"] == []
         assert all("proof" not in record for record in first["facts"])
 
@@ -782,7 +1288,9 @@ def test_adaptive_verification_context_diamond_deduplicates_and_binds_every_laye
             lambda value: value["expanded_proofs"][0].__setitem__(
                 "proof", "right proof!"
             ),
-            lambda value: value.__setitem__("characters_used", value["characters_used"] + 1),
+            lambda value: value.__setitem__(
+                "characters_used", value["characters_used"] + 1
+            ),
         ):
             variant = json.loads(json.dumps(second))
             variant.pop("digest")
@@ -791,9 +1299,11 @@ def test_adaptive_verification_context_diamond_deduplicates_and_binds_every_laye
         assert all(digest != second["digest"] for digest in variants)
 
         proof_record = {"fact_id": base, "proof": "base proof bytes"}
-        record_chars = len(json.dumps(
-            proof_record, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-        ))
+        record_chars = len(
+            json.dumps(
+                proof_record, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            )
+        )
         omitted = fg.verification_context(
             [root],
             max_chars=None,
@@ -825,7 +1335,10 @@ def test_factgraph_public_snapshot_lock_linearizes_list_against_revoke():
         fg = FactGraph(graph_root)
         root = fg.add(problem_id="P", author="w", statement="root", proof="proof")
         child = fg.add(
-            problem_id="P", author="w", statement="child", proof="proof",
+            problem_id="P",
+            author="w",
+            statement="child",
+            proof="proof",
             predecessors=[root],
         )
         unrelated = fg.add(
@@ -844,9 +1357,7 @@ def test_factgraph_public_snapshot_lock_linearizes_list_against_revoke():
 
         fg._list_unchecked = paused_list_unchecked  # type: ignore[assignment]
 
-        reader = threading.Thread(
-            target=lambda: results.setdefault("read", fg.list())
-        )
+        reader = threading.Thread(target=lambda: results.setdefault("read", fg.list()))
         writer = threading.Thread(
             target=lambda: results.setdefault(
                 "revoked", FactGraph(graph_root).revoke(root, reason="race")
@@ -874,23 +1385,38 @@ def test_factgraph_descendants_reverse_adjacency_handles_branching_dag():
         fg = FactGraph(Path(d) / "branching-descendants")
         root = fg.add(problem_id="P", author="w", statement="root", proof="proof")
         left = fg.add(
-            problem_id="P", author="w", statement="left", proof="proof",
+            problem_id="P",
+            author="w",
+            statement="left",
+            proof="proof",
             predecessors=[root],
         )
         right = fg.add(
-            problem_id="P", author="w", statement="right", proof="proof",
+            problem_id="P",
+            author="w",
+            statement="right",
+            proof="proof",
             predecessors=[root],
         )
         left_leaf = fg.add(
-            problem_id="P", author="w", statement="left leaf", proof="proof",
+            problem_id="P",
+            author="w",
+            statement="left leaf",
+            proof="proof",
             predecessors=[left],
         )
         right_leaf = fg.add(
-            problem_id="P", author="w", statement="right leaf", proof="proof",
+            problem_id="P",
+            author="w",
+            statement="right leaf",
+            proof="proof",
             predecessors=[right],
         )
         join = fg.add(
-            problem_id="P", author="w", statement="join", proof="proof",
+            problem_id="P",
+            author="w",
+            statement="join",
+            proof="proof",
             predecessors=[left_leaf, right_leaf],
         )
         unrelated = fg.add(
@@ -908,11 +1434,16 @@ def test_revoke_rebuilds_project_glossary_from_active_facts():
         fg = FactGraph(Path(d) / "glossary-provenance")
         term = "PROVENANCE_X_321"
         source = fg.add(
-            problem_id="P", author="w", statement="Definition source",
-            proof="proof", glossary_introduces={term: "a fixed object"},
+            problem_id="P",
+            author="w",
+            statement="Definition source",
+            proof="proof",
+            glossary_introduces={term: "a fixed object"},
         )
         independent = fg.add(
-            problem_id="P", author="w", statement=f"{term} has property A",
+            problem_id="P",
+            author="w",
+            statement=f"{term} has property A",
             proof=f"A self-contained proof mentioning {term}.",
         )
         verification_view = fg.context(
@@ -925,8 +1456,11 @@ def test_revoke_rebuilds_project_glossary_from_active_facts():
         assert verification_view["glossary"] == {}
         assert verification_view["scope"]["include_project_glossary"] is False
         dependent = fg.add(
-            problem_id="P", author="w", statement=f"{term} has property A",
-            proof=f"Use the definition of {term}.", predecessors=[source],
+            problem_id="P",
+            author="w",
+            statement=f"{term} has property A",
+            proof=f"Use the definition of {term}.",
+            predecessors=[source],
         )
         assert set(fg.revoke(source, reason="definition withdrawn")) == {
             source,
@@ -956,7 +1490,9 @@ def test_revoke_rebuilds_project_glossary_from_active_facts():
         fg.revoke(first, reason="first introducer withdrawn")
         assert fg.glossary()[term] == definition
         still_available = fg.context(
-            [], predecessor_depth=None, proof_mode="none",
+            [],
+            predecessor_depth=None,
+            proof_mode="none",
             glossary_texts=[f"Use {term}."],
         )
         assert still_available["complete"] is True
@@ -965,7 +1501,9 @@ def test_revoke_rebuilds_project_glossary_from_active_facts():
         fg.revoke(second, reason="last introducer withdrawn")
         assert term not in fg.glossary()
         removed = fg.context(
-            [], predecessor_depth=None, proof_mode="none",
+            [],
+            predecessor_depth=None,
+            proof_mode="none",
             glossary_texts=[f"Use {term}."],
         )
         assert removed["complete"] is True
@@ -978,8 +1516,11 @@ def test_revoke_rebuilds_project_glossary_from_active_facts():
         fg = FactGraph(Path(d) / "failed-revoke")
         term = "REV_CRASH_X_654"
         fact_id = fg.add(
-            problem_id="P", author="w", statement="Definition source",
-            proof="proof", glossary_introduces={term: "temporary definition"},
+            problem_id="P",
+            author="w",
+            statement="Definition source",
+            proof="proof",
+            glossary_introduces={term: "temporary definition"},
         )
         original_move = _factgraph.shutil.move
 
@@ -1000,7 +1541,9 @@ def test_revoke_rebuilds_project_glossary_from_active_facts():
             fg.list,
             fg.glossary,
             lambda: fg.context(
-                [], predecessor_depth=None, proof_mode="none",
+                [],
+                predecessor_depth=None,
+                proof_mode="none",
                 glossary_texts=[f"Use {term}."],
             ),
             lambda: fg.search("Definition"),
@@ -1012,7 +1555,9 @@ def test_revoke_rebuilds_project_glossary_from_active_facts():
                 assert "fact_graph_recovery_required" in str(exc)
 
         # Retrying the original mutation resumes the journal idempotently.
-        assert fg.revoke(fact_id, reason="retry may use a different message") == [fact_id]
+        assert fg.revoke(fact_id, reason="retry may use a different message") == [
+            fact_id
+        ]
         assert not fg.exists(fact_id)
         assert term not in fg.glossary()
 
@@ -1031,7 +1576,9 @@ def test_fact_add_is_atomic_and_rolls_back_glossary_failure():
         try:
             try:
                 fg.add(
-                    problem_id="P", author="w", statement="Never partial",
+                    problem_id="P",
+                    author="w",
+                    statement="Never partial",
                     proof="proof",
                 )
                 assert False, "injected fact write failure must propagate"
@@ -1054,8 +1601,11 @@ def test_fact_add_is_atomic_and_rolls_back_glossary_failure():
         try:
             try:
                 fg.add(
-                    problem_id="P", author="w", statement="Definition candidate",
-                    proof="proof", glossary_introduces={term: "a test object"},
+                    problem_id="P",
+                    author="w",
+                    statement="Definition candidate",
+                    proof="proof",
+                    glossary_introduces={term: "a test object"},
                 )
                 assert False, "injected glossary failure must propagate"
             except OSError as exc:
@@ -1088,8 +1638,11 @@ def test_fact_add_is_atomic_and_rolls_back_glossary_failure():
         try:
             try:
                 fg.add(
-                    problem_id="P", author="w", statement="Pending definition",
-                    proof="proof", glossary_introduces={term: "a pending object"},
+                    problem_id="P",
+                    author="w",
+                    statement="Pending definition",
+                    proof="proof",
+                    glossary_introduces={term: "a pending object"},
                 )
                 assert False, "failed rollback must surface a recovery error"
             except RuntimeError as exc:
@@ -1181,6 +1734,169 @@ def test_fact_add_exact_retry_returns_without_rewriting_committed_state():
             assert fg.list() == [fact_id]
             assert not fg.pending_add_path.exists()
             assert not fg.pending_add_commit_path.exists()
+
+
+def test_full_fact_identity_is_canonical_and_binds_context_and_glossary():
+    common = {
+        "problem_id": "P",
+        "predecessors": ["b" * 16, "a" * 16],
+        "glossary_introduces": {"Y": " a   definition ", "X": "another"},
+        "statement": "  A   holds\n",
+        "proof": "by   induction",
+        "context_bindings": {
+            "facts": [{"fact_id": "a" * 16, "statement": "base"}],
+            "projection": "test",
+        },
+        "glossary_bindings": {"Z": " fixed   object "},
+    }
+    first = _schema.compute_fact_identity(**common)
+    cosmetic = _schema.compute_fact_identity(
+        **{
+            **common,
+            "predecessors": list(reversed(common["predecessors"])),
+            "glossary_introduces": {"X": "another", "Y": "a definition"},
+            "statement": "A holds",
+            "proof": "by induction",
+            "glossary_bindings": {"Z": "fixed object"},
+        }
+    )
+    assert first == cosmetic and len(first) == 64
+    assert (
+        _schema.compute_fact_identity(
+            **{**common, "glossary_bindings": {"Z": "a changed object"}}
+        )
+        != first
+    )
+    assert (
+        _schema.compute_fact_identity(
+            **{
+                **common,
+                "context_bindings": {
+                    "facts": [{"fact_id": "a" * 16, "statement": "changed"}],
+                    "projection": "test",
+                },
+            }
+        )
+        != first
+    )
+
+
+def test_round_zero_full_identity_uses_exact_snapshot_and_ignores_budgets():
+    with tempfile.TemporaryDirectory() as d:
+        fg = FactGraph(Path(d) / "round-zero-identity")
+        content = {
+            "problem_id": "P",
+            "predecessors": [],
+            "glossary_introduces": {},
+            "statement": "A budget-stable semantic candidate",
+            "proof": "A complete proof of the candidate.",
+        }
+        fact_id = compute_fact_id(**content)
+
+        def snapshot(character_budget: int) -> dict[str, object]:
+            return fg.verification_context(
+                [],
+                max_chars=character_budget,
+                candidate_fact_id=fact_id,
+                expanded_proof_ids=[],
+                expansion_round=0,
+                expanded_proof_max_chars=character_budget,
+                glossary_texts=[
+                    content["statement"],
+                    content["proof"],
+                    "mutable intuition-only display text",
+                ],
+                glossary_exclude_terms=[],
+            )
+
+        first_context = snapshot(200_000)
+        drifted_budget_context = snapshot(210_000)
+        assert first_context["digest"] != drifted_budget_context["digest"]
+        first_identity = fact_identity_from_verification_context(
+            verification_context=first_context,
+            **content,
+        )
+        assert first_identity == fact_identity_from_verification_context(
+            verification_context=drifted_budget_context,
+            **content,
+        )
+
+        assert fg.add(author="worker", **content) == fact_id
+        with fg.locked_active_fact_identity(fact_id) as active_identity:
+            assert active_identity == first_identity
+        assert fg.lookup_active_exact_identity(**content) == (fact_id, first_identity)
+
+        try:
+            fact_identity_from_verification_context(
+                verification_context=first_context,
+                **{**content, "statement": "A distinct colliding candidate"},
+            )
+            assert False, "round-zero context must bind exact candidate content"
+        except ValueError as exc:
+            assert "round-zero candidate snapshot" in str(exc)
+
+
+def test_active_exact_lookup_is_read_only_and_short_collisions_fail_closed():
+    with tempfile.TemporaryDirectory() as d:
+        fg = FactGraph(Path(d) / "exact-identity")
+        original_refs = [{"key": "ORIGINAL", "title": "Original reference"}]
+        fact_id = fg.add(
+            problem_id="P",
+            author="first-author",
+            statement="An exact active fact",
+            proof="A complete proof.",
+            intuition="first intuition",
+            external_refs=original_refs,
+        )
+        fact_path = fg._path(fact_id)
+        before = (fact_path.stat().st_mtime_ns, fact_path.read_bytes())
+
+        assert (
+            fg.lookup_active_exact(
+                problem_id="P",
+                statement="  An exact   active fact ",
+                proof="A complete proof.",
+            )
+            == fact_id
+        )
+        assert (
+            fg.add(
+                problem_id="P",
+                author="different-author",
+                statement="An exact active fact",
+                proof="A complete proof.",
+                intuition="different mutable intuition",
+                external_refs=[{"key": "NEW", "title": "Must not replace"}],
+            )
+            == fact_id
+        )
+        assert (fact_path.stat().st_mtime_ns, fact_path.read_bytes()) == before
+        assert fg.external_refs(fact_id) == original_refs
+
+        original_compute = _factgraph.compute_fact_id
+        _factgraph.compute_fact_id = lambda **_kwargs: fact_id
+        try:
+            try:
+                fg.lookup_active_exact(
+                    problem_id="P",
+                    statement="A genuinely different colliding statement",
+                    proof="Different proof.",
+                )
+                assert False, "a short-id/full-identity collision must fail closed"
+            except ValueError as exc:
+                assert "fact_identity_collision" in str(exc)
+        finally:
+            _factgraph.compute_fact_id = original_compute
+
+        assert fg.revoke(fact_id, reason="identity revoked") == [fact_id]
+        assert (
+            fg.lookup_active_exact(
+                problem_id="P",
+                statement="An exact active fact",
+                proof="A complete proof.",
+            )
+            is None
+        )
 
 
 def test_fact_add_commit_marker_fsync_failure_rolls_back():
@@ -1276,7 +1992,10 @@ def test_fact_add_commit_marker_fsync_failure_rolls_back():
         except ValueError as exc:
             assert "fact_graph_recovery_required" in str(exc)
         survivor = FactGraph(root).add(
-            problem_id="P", author="w", statement="After rollback recovery", proof="proof"
+            problem_id="P",
+            author="w",
+            statement="After rollback recovery",
+            proof="proof",
         )
         restarted = FactGraph(root)
         assert restarted.list() == [survivor]
@@ -1796,9 +2515,7 @@ def test_prepared_marker_unlink_ambiguity_blocks_later_mutation():
     with tempfile.TemporaryDirectory() as d:
         root = Path(d) / "prepared-unlink-ambiguity"
         fg = FactGraph(root)
-        stable = fg.add(
-            problem_id="P", author="w", statement="stable", proof="proof"
-        )
+        stable = fg.add(problem_id="P", author="w", statement="stable", proof="proof")
         stable_raw = fg.get_raw(stable)
         stable_path = fg._path(stable)
         original_atomic_write = fg._atomic_write_text
@@ -1869,9 +2586,7 @@ def test_aborted_add_final_prepared_unlink_ambiguity_blocks_later_mutation():
     with tempfile.TemporaryDirectory() as d:
         root = Path(d) / "aborted-prepared-unlink-ambiguity"
         fg = FactGraph(root)
-        stable = fg.add(
-            problem_id="P", author="w", statement="stable", proof="proof"
-        )
+        stable = fg.add(problem_id="P", author="w", statement="stable", proof="proof")
         stable_raw = fg.get_raw(stable)
         original_atomic_write = fg._atomic_write_text
         original_unlink = fg._unlink_durable
@@ -1948,12 +2663,8 @@ def test_revocation_marker_unlink_ambiguity_blocks_later_mutation():
     with tempfile.TemporaryDirectory() as d:
         root = Path(d) / "revocation-unlink-ambiguity"
         fg = FactGraph(root)
-        stable = fg.add(
-            problem_id="P", author="w", statement="stable", proof="proof"
-        )
-        victim = fg.add(
-            problem_id="P", author="w", statement="victim", proof="proof"
-        )
+        stable = fg.add(problem_id="P", author="w", statement="stable", proof="proof")
+        victim = fg.add(problem_id="P", author="w", statement="victim", proof="proof")
         stable_raw = fg.get_raw(stable)
         original_unlink = fg._unlink_durable
         original_fsync_directory = fg._fsync_directory
@@ -2107,11 +2818,17 @@ def test_revoke_journal_recovers_second_move_and_log_failures_once():
         fg = FactGraph(Path(d) / "second-move")
         root = fg.add(problem_id="P", author="w", statement="root", proof="proof")
         child = fg.add(
-            problem_id="P", author="w", statement="child", proof="proof",
+            problem_id="P",
+            author="w",
+            statement="child",
+            proof="proof",
             predecessors=[root],
         )
         leaf = fg.add(
-            problem_id="P", author="w", statement="leaf", proof="proof",
+            problem_id="P",
+            author="w",
+            statement="leaf",
+            proof="proof",
             predecessors=[child],
         )
         original_move = _factgraph.shutil.move
@@ -2146,13 +2863,18 @@ def test_revoke_journal_recovers_second_move_and_log_failures_once():
         assert fg.list() == [survivor]
         assert all(fg._revoked_path(item).exists() for item in (root, child, leaf))
         logged = read_jsonl(fg.revocation_log)
-        assert sorted(entry["fact_id"] for entry in logged) == sorted([root, child, leaf])
+        assert sorted(entry["fact_id"] for entry in logged) == sorted(
+            [root, child, leaf]
+        )
 
     with tempfile.TemporaryDirectory() as d:
         fg = FactGraph(Path(d) / "log-failure")
         root = fg.add(problem_id="P", author="w", statement="root", proof="proof")
         child = fg.add(
-            problem_id="P", author="w", statement="child", proof="proof",
+            problem_id="P",
+            author="w",
+            statement="child",
+            proof="proof",
             predecessors=[root],
         )
         original_log_write = fg._write_revocation_log_atomic
@@ -2184,7 +2906,9 @@ def test_project_glossary_cannot_change_global_semantics():
         term, definition = next(iter(_glossary.global_glossary().items()))
         try:
             fg.add(
-                problem_id="P", author="w", statement="Conflicting global alias",
+                problem_id="P",
+                author="w",
+                statement="Conflicting global alias",
                 proof="proof",
                 glossary_introduces={term: definition + " (different meaning)"},
             )
@@ -2201,9 +2925,7 @@ def test_factgraph_mutation_lock_serializes_add_and_revoke():
     with tempfile.TemporaryDirectory() as d:
         root = Path(d) / "locked-graph"
         fg = FactGraph(root)
-        predecessor = fg.add(
-            problem_id="P", author="w", statement="A", proof="proof A"
-        )
+        predecessor = fg.add(problem_id="P", author="w", statement="A", proof="proof A")
         snapshot = fg.context(
             [predecessor], predecessor_depth=None, proof_mode="none", max_chars=None
         )
@@ -2253,15 +2975,33 @@ def test_factgraph_mutation_lock_serializes_add_and_revoke():
 def test_external_refs():
     with tempfile.TemporaryDirectory() as d:
         fg = FactGraph(Path(d) / "proj3")
-        refs = [{"key": "HL26", "authors": ["Han", "Liu"], "title": "On X",
-                 "arxiv": "2603.03817", "year": 2026, "cited_for": "Theorem 1.2"}]
+        refs = [
+            {
+                "key": "HL26",
+                "authors": ["Han", "Liu"],
+                "title": "On X",
+                "arxiv": "2603.03817",
+                "year": 2026,
+                "cited_for": "Theorem 1.2",
+            }
+        ]
 
         # 1) BACKWARD COMPAT (load-bearing): external_refs is NOT hashed, so adding
         #    refs does not change the fact_id, and the id equals the bare compute_fact_id.
-        bare = compute_fact_id(problem_id="P", predecessors=[], glossary_introduces={},
-                               statement="A holds", proof="proof of A")
-        fid_a = fg.add(problem_id="P", author="w", statement="A holds", proof="proof of A",
-                       external_refs=refs)
+        bare = compute_fact_id(
+            problem_id="P",
+            predecessors=[],
+            glossary_introduces={},
+            statement="A holds",
+            proof="proof of A",
+        )
+        fid_a = fg.add(
+            problem_id="P",
+            author="w",
+            statement="A holds",
+            proof="proof of A",
+            external_refs=refs,
+        )
         assert fid_a == bare, "external_refs must not change the fact_id"
 
         # 2) refs round-trip through serialize/parse and the read helper
@@ -2270,25 +3010,37 @@ def test_external_refs():
         assert "external_refs:" in fg.get_raw(fid_a)
 
         # 3) same content + no refs => SAME id (dedup); re-adding is idempotent
-        fid_a2 = fg.add(problem_id="P", author="w", statement="A holds", proof="proof of A")
+        fid_a2 = fg.add(
+            problem_id="P", author="w", statement="A holds", proof="proof of A"
+        )
         assert fid_a2 == fid_a
 
         # 4) a fact written without refs reads back as [] (and old-format files too)
-        fid_b = fg.add(problem_id="P", author="w", statement="B holds", proof="proof of B")
+        fid_b = fg.add(
+            problem_id="P", author="w", statement="B holds", proof="proof of B"
+        )
         assert fg.external_refs(fid_b) == []
-        legacy = ("---\nfact_id: deadbeefdeadbeef\nproblem_id: P\nauthor: w\n"
-                  "predecessors: []\nglossary_introduces: {}\n---\n\n## statement\nx\n\n## proof\ny\n")
-        assert parse_frontmatter(legacy)["external_refs"] == []   # no field -> default []
+        legacy = (
+            "---\nfact_id: deadbeefdeadbeef\nproblem_id: P\nauthor: w\n"
+            "predecessors: []\nglossary_introduces: {}\n---\n\n## statement\nx\n\n## proof\ny\n"
+        )
+        assert (
+            parse_frontmatter(legacy)["external_refs"] == []
+        )  # no field -> default []
 
         # 5) set_external_refs (the auditor's path): rewrites refs, preserves id + body
         body_before = fg.get_raw(fid_b).split("## statement", 1)[1]
         out = fg.set_external_refs(fid_b, refs)
         assert out == refs and fg.external_refs(fid_b) == refs
-        assert fg.exists(fid_b)                                            # id/file unchanged
-        assert fg.get_raw(fid_b).split("## statement", 1)[1] == body_before  # body untouched
+        assert fg.exists(fid_b)  # id/file unchanged
+        assert (
+            fg.get_raw(fid_b).split("## statement", 1)[1] == body_before
+        )  # body untouched
 
         # 6) normalization: non-dict entries dropped, canonical key order, [] for empty
-        assert clean_external_refs([{"title": "T", "key": "K"}, "junk", 7]) == [{"key": "K", "title": "T"}]
+        assert clean_external_refs([{"title": "T", "key": "K"}, "junk", 7]) == [
+            {"key": "K", "title": "T"}
+        ]
         assert clean_external_refs(None) == [] and clean_external_refs([]) == []
 
 
@@ -2301,6 +3053,8 @@ def main() -> None:
     print("  [ok] global memory append/status/search + evidence rule")
     test_global_memory_edge_cases()
     print("  [ok] global memory: unknown kind / bad status / search limit+fold-in")
+    test_global_memory_exact_get_is_bounded_and_unambiguous()
+    print("  [ok] global memory exact get: bounded / unique / strict id")
     test_util_read_jsonl_missing_and_garbage()
     print("  [ok] _util.read_jsonl: missing file + garbage/non-dict lines skipped")
     test_schema_clean_external_refs_extra_keys()
@@ -2330,7 +3084,9 @@ def main() -> None:
     test_statement_of_helper()
     print("  [ok] statement_of preserves internal headings and stops at proof")
     test_external_refs()
-    print("  [ok] external_refs: not hashed (backward compat) + round-trip + auditor rewrite")
+    print(
+        "  [ok] external_refs: not hashed (backward compat) + round-trip + auditor rewrite"
+    )
     print("ALL CORE TESTS PASSED")
 
 

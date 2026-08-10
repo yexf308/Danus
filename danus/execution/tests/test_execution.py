@@ -19,6 +19,7 @@ import tomllib
 from contextlib import contextmanager
 from pathlib import Path
 
+from danus.coordination import DEFAULT_COORDINATION, CoordinationStore
 from danus.execution import layout as L
 from danus.execution import loop, scaffold
 
@@ -49,13 +50,16 @@ def _project_env(tmp: Path):
     contract.write_text("# worker contract (stub)\n", encoding="utf-8")
     skills = tmp / "skills"
     skills.mkdir(exist_ok=True)
-    with _env(DANUS_AGENTS_ROOT=str(tmp / "agents"),
-              DANUS_WORKER_CONTRACT=str(contract),
-              DANUS_WORKER_SKILLS=str(skills)):
+    with _env(
+        DANUS_AGENTS_ROOT=str(tmp / "agents"),
+        DANUS_WORKER_CONTRACT=str(contract),
+        DANUS_WORKER_SKILLS=str(skills),
+    ):
         yield
 
 
 # --- parse_roles ----------------------------------------------------------- #
+
 
 def test_parse_roles_default_roster():
     pairs = L.parse_roles("high:3,xhigh:4")
@@ -76,6 +80,7 @@ def test_parse_roles_rejects_bad_specs():
 
 
 # --- WorkerLayout ---------------------------------------------------------- #
+
 
 def test_worker_layout_paths():
     wl = L.WorkerLayout(Path("/x/proj/workers/high"))
@@ -117,6 +122,7 @@ def test_resolve_and_target():
 
 # --- do_new scaffolding ---------------------------------------------------- #
 
+
 def test_do_new_scaffolds_project(tmp: Path):
     with _project_env(tmp):
         r = scaffold.do_new("P", roles="high:2,xhigh:1", model="gpt-5.5")
@@ -124,14 +130,23 @@ def test_do_new_scaffolds_project(tmp: Path):
         pdir = L.project_dir("P")
         assert (pdir / "global_memory").is_dir() and (pdir / "fact_graph").is_dir()
         meta = json.loads((pdir / "project.json").read_text())
-        assert meta["workers"] == ["high", "high2", "xhigh"] and meta["model"] == "gpt-5.5"
+        assert (
+            meta["workers"] == ["high", "high2", "xhigh"] and meta["model"] == "gpt-5.5"
+        )
+        assert meta["coordination"] == DEFAULT_COORDINATION
+        coordination = CoordinationStore(pdir, meta, create=False).project_status()
+        assert coordination["root_worker"] == "xhigh"
+        assert coordination["critic_worker"] == "high"
+        assert coordination["paid_active"] == 0
 
         for w, eff in [("high", "high"), ("high2", "high"), ("xhigh", "xhigh")]:
             wl = L.WorkerLayout(L.worker_dir("P", w))
             assert wl.local_memory.is_dir() and wl.logs.is_dir()
             # symlinks resolve to the (stub) contract + skills
             assert (wl.dir / "AGENTS.md").resolve() == L.worker_md().resolve()
-            assert (wl.dir / ".agents" / "skills").resolve() == L.worker_skills_dir().resolve()
+            assert (
+                wl.dir / ".agents" / "skills"
+            ).resolve() == L.worker_skills_dir().resolve()
             cfg = wl.codex_config.read_text()
             parsed = tomllib.loads(cfg)
             assert Path(sys.executable).is_absolute()
@@ -160,6 +175,36 @@ def test_do_new_scaffolds_project(tmp: Path):
             assert json.loads(wl.status.read_text())["state"] == "created"
 
 
+def test_do_new_reasoning_first_default_pins_max_paid_lanes_and_high_observers(
+    tmp: Path,
+):
+    with _project_env(tmp):
+        result = scaffold.do_new("reasoning-default")
+        project = L.project_dir("reasoning-default")
+        metadata = json.loads((project / "project.json").read_text())
+        assert metadata["roles"] == scaffold.DEFAULT_REASONING_FIRST_ROLES
+        assert result["workers"] == [
+            "max",
+            "max2",
+            "high",
+            "high2",
+            "high3",
+            "high4",
+            "high5",
+        ]
+        store = CoordinationStore.open_existing(project, metadata)
+        assert store is not None
+        status = store.project_status()
+        assert status["root_worker"] == "max"
+        assert status["critic_worker"] == "max2"
+        assert store.admit("high") is None
+        assert store.project_status("high")["lane"] == "observer"
+        assert store.project_status()["paid_active"] == 0
+        for worker in ("max", "max2"):
+            role = L.WorkerLayout(L.worker_dir("reasoning-default", worker)).role.read_text()
+            assert "REASONING_EFFORT=max" in role
+
+
 def test_do_new_refuses_existing(tmp: Path):
     with _project_env(tmp):
         scaffold.do_new("P", roles="high:1")
@@ -168,6 +213,35 @@ def test_do_new_refuses_existing(tmp: Path):
             assert False, "should refuse an existing project dir"
         except SystemExit:
             pass
+
+
+def test_do_new_explicit_legacy_writes_mode_without_coordination_database(
+    tmp: Path,
+):
+    with _project_env(tmp):
+        scaffold.do_new("legacy", roles="high:1", coordination="legacy")
+        project = L.project_dir("legacy")
+        metadata = json.loads((project / "project.json").read_text())
+        assert metadata["coordination"] == {"mode": "legacy"}
+        assert not (project / ".coordination").exists()
+
+
+def test_do_new_legacy_default_preserves_historical_roster(tmp: Path):
+    with _project_env(tmp):
+        result = scaffold.do_new("legacy-default", coordination="legacy")
+        project = L.project_dir("legacy-default")
+        metadata = json.loads((project / "project.json").read_text())
+        assert metadata["roles"] == scaffold.DEFAULT_LEGACY_ROLES
+        assert result["workers"] == [
+            "high",
+            "high2",
+            "high3",
+            "xhigh",
+            "xhigh2",
+            "xhigh3",
+            "xhigh4",
+        ]
+        assert not (project / ".coordination").exists()
 
 
 def test_do_new_rejects_project_traversal_before_filesystem_mutation(tmp: Path):
@@ -193,6 +267,7 @@ def test_do_new_verify_url_from_env(tmp: Path):
 
 
 # --- loop helpers (pure) --------------------------------------------------- #
+
 
 def test_parse_last_fact_id(tmp: Path):
     log = tmp / "round.log"
@@ -402,10 +477,10 @@ def test_round_log_open_rejects_symlink_hardlink_and_fifo_without_mutation(
 def test_deadline_passed(tmp: Path):
     pdir = tmp / "proj"
     pdir.mkdir()
-    assert loop._deadline_passed(pdir) is False           # no deadline file
-    (pdir / L.DEADLINE_FILE).write_text("1")              # epoch 1 = long past
+    assert loop._deadline_passed(pdir) is False  # no deadline file
+    (pdir / L.DEADLINE_FILE).write_text("1")  # epoch 1 = long past
     assert loop._deadline_passed(pdir) is True
-    (pdir / L.DEADLINE_FILE).write_text("garbage")        # bad = not passed
+    (pdir / L.DEADLINE_FILE).write_text("garbage")  # bad = not passed
     assert loop._deadline_passed(pdir) is False
 
 
@@ -459,14 +534,22 @@ def test_read_role_defaults_and_overrides(tmp: Path):
     # gpt-5.6-sol default)
     with _env(DANUS_CODEX_MODEL=None):
         role = loop._read_role(wl)
-    assert role["MODEL"] == "gpt-5.6-sol" and role["ROLE"] == "high" and role["DANUS_AUTHOR"] == "xhigh"
+    assert (
+        role["MODEL"] == "gpt-5.6-sol"
+        and role["ROLE"] == "high"
+        and role["DANUS_AUTHOR"] == "xhigh"
+    )
     # the neutral DANUS_CODEX_MODEL is the worker default when .role omits MODEL
     with _env(DANUS_CODEX_MODEL="neutral-model"):
         role = loop._read_role(wl)
     assert role["MODEL"] == "neutral-model"
     wl.role.write_text("# comment\nMODEL=gpt-x\nREASONING_EFFORT=xhigh\n\nROLE=xhigh\n")
     role = loop._read_role(wl)
-    assert role["MODEL"] == "gpt-x" and role["REASONING_EFFORT"] == "xhigh" and role["ROLE"] == "xhigh"
+    assert (
+        role["MODEL"] == "gpt-x"
+        and role["REASONING_EFFORT"] == "xhigh"
+        and role["ROLE"] == "xhigh"
+    )
 
 
 def test_protected_role_ignores_worker_writable_role_projection(tmp: Path):
@@ -500,20 +583,31 @@ def test_protected_role_ignores_worker_writable_role_projection(tmp: Path):
 
 # --- runner ---------------------------------------------------------------- #
 
-_NO_TMP = {test_parse_roles_default_roster, test_parse_roles_rejects_bad_specs,
-           test_worker_layout_paths, test_resolve_and_target}
+_NO_TMP = {
+    test_parse_roles_default_roster,
+    test_parse_roles_rejects_bad_specs,
+    test_worker_layout_paths,
+    test_resolve_and_target,
+}
 
 
 def main() -> None:
-    for t in [test_parse_roles_default_roster, test_parse_roles_rejects_bad_specs,
-              test_worker_layout_paths, test_resolve_and_target,
-              test_do_new_scaffolds_project, test_do_new_refuses_existing,
-              test_do_new_rejects_project_traversal_before_filesystem_mutation,
-              test_do_new_verify_url_from_env, test_parse_last_fact_id,
-              test_deadline_passed, test_write_status_atomic_and_stamps,
-              test_write_status_does_not_follow_planted_links,
-              test_read_role_defaults_and_overrides,
-              test_protected_role_ignores_worker_writable_role_projection]:
+    for t in [
+        test_parse_roles_default_roster,
+        test_parse_roles_rejects_bad_specs,
+        test_worker_layout_paths,
+        test_resolve_and_target,
+        test_do_new_scaffolds_project,
+        test_do_new_refuses_existing,
+        test_do_new_rejects_project_traversal_before_filesystem_mutation,
+        test_do_new_verify_url_from_env,
+        test_parse_last_fact_id,
+        test_deadline_passed,
+        test_write_status_atomic_and_stamps,
+        test_write_status_does_not_follow_planted_links,
+        test_read_role_defaults_and_overrides,
+        test_protected_role_ignores_worker_writable_role_projection,
+    ]:
         if t in _NO_TMP:
             t()
         else:

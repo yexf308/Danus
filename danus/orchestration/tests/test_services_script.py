@@ -8,6 +8,7 @@ import http.client
 import json
 import os
 from pathlib import Path
+import runpy
 import shutil
 import signal
 import socket
@@ -283,7 +284,11 @@ def _verify_payload(ctx) -> dict[str, object]:
     health = _helper("verify-health", ctx["record"], ctx["url"])
     assert health.returncode == 0, health.stdout + health.stderr
     contract = json.loads(health.stdout)
+    instance_nonce = json.loads(ctx["record"].read_text(encoding="utf-8"))[
+        "instance_nonce"
+    ]
     return {
+        "expected_verifier_instance_nonce": instance_nonce,
         "expected_output_protocol_version": contract["protocol"],
         "expected_verifier_bundle_digest": contract["digest"],
         "statement": "For every integer n, n + 0 equals n.",
@@ -295,18 +300,15 @@ def _verify_payload(ctx) -> dict[str, object]:
     }
 
 
-def _post_verify(port: int, payload: dict[str, object], timeout: float = 4.0) -> int:
+def _scheduler_snapshot(port: int, timeout: float = 4.0) -> dict[str, object]:
     connection = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
     try:
-        connection.request(
-            "POST",
-            "/verify",
-            body=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-        )
+        connection.request("GET", "/scheduler")
         response = connection.getresponse()
-        response.read()
-        return response.status
+        body = json.loads(response.read())
+        assert response.status == 200
+        assert isinstance(body, dict)
+        return body
     finally:
         connection.close()
 
@@ -571,9 +573,13 @@ def test_verify_paid_group_fences_restart_until_stubborn_cleanup(tmp_path, termi
         )
         assert paid_host_pgid == paid_child_pgid
         assert paid_pid != paid_host_pgid
-        # This is the real service, not a TestClient seam: the paid lease stays
-        # occupied while the first Codex process is blocked.
-        assert _post_verify(ctx["port"], payload) == 429
+        # This is the real service, not a TestClient seam: the one paid slot
+        # stays occupied while the first Codex process is blocked. Exact
+        # duplicates now coalesce, so inspect the scheduler instead of issuing
+        # an obsolete busy-rejection probe.
+        scheduler = _scheduler_snapshot(ctx["port"])
+        assert scheduler["paid_concurrency_limit"] == 1
+        assert scheduler["running"] == scheduler["active_keys"] == 1
 
         deleted = _helper(
             "manifest", "del", ctx["manifest"], ctx["manifest_lock"], ctx["entry"]
@@ -746,6 +752,24 @@ def test_cleanup_syscall_exception_retains_authority_until_exact_reap(tmp_path, 
     out, err = stop.communicate(timeout=8)
     assert stop.returncode == 0, out + err
     assert _wait(lambda: not ctx["record"].exists())
+
+
+def test_open_then_unlinked_record_uses_lock_backed_absence_semantics(
+    tmp_path, monkeypatch
+):
+    helper = runpy.run_path(str(HELPER), run_name="danus_test_service_identity")
+    record = tmp_path / "dashboard-Test.pid"
+    record.write_bytes(b"{}\n")
+    record.chmod(0o600)
+    real_fstat = os.fstat
+
+    def unlink_before_fstat(fd):
+        record.unlink()
+        return real_fstat(fd)
+
+    monkeypatch.setattr(os, "fstat", unlink_before_fstat)
+    with pytest.raises(FileNotFoundError):
+        helper["read_record"](record)
 
 
 @pytest.mark.parametrize(

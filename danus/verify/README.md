@@ -20,7 +20,8 @@ research-level target theorems still need expert review before being trusted.
 
 ```
 POST /verify
-  request : {"expected_output_protocol_version": 3,
+  request : {"expected_verifier_instance_nonce": <health nonce>,
+             "expected_output_protocol_version": 3,
              "expected_verifier_bundle_digest": <health sha256>,
              "statement": <str, >=1 char>, "proof": <str, >=1 char>,
              "glossary_introduces": <object, optional>,
@@ -40,16 +41,30 @@ POST /verify
             internal fact_id citation without declared context
   408     : request-body upload exceeded DANUS_VERIFY_BODY_TIMEOUT_SECONDS
   413     : request body or final serialized verifier prompt exceeded its byte cap
-  429     : another admitted verification already occupies all configured slots
-  409     : caller output protocol or health-probed bundle no longer matches
-  422     : request-model validation (including a missing protocol/digest handshake)
+  429     : distinct FIFO queue, waiter cap, or queue-wait bound was exhausted
+  409     : caller nonce, output protocol, or health-probed bundle no longer matches
+  422     : request-model validation (including a missing nonce/protocol/digest handshake)
   500     : codex failed / wrote no output / output violates the verdict JSON contract
   504     : codex exec timed out (only if CODEX_TIMEOUT_SECONDS is set)
 
 GET /health -> {"status": "ok", "pid": <int>,    # async; never queues behind /verify
+               "instance_nonce": <guardian nonce>,
                "output_protocol_version": 3,
                "verifier_bundle_digest": <sha256>}
+
+GET /scheduler -> bounded queue/cache counts, configured limits, and counters;
+                  never request keys, statements, proofs, or cached results
 ```
+
+Every scheduler-handled response reports control-plane telemetry only in HTTP
+headers, never in the mathematical result JSON:
+
+- `X-Danus-Verify-Scheduler: launched | coalesced | cache_hit` (`rejected` for
+  scheduler admission failures),
+- `X-Danus-Verify-Key: <lowercase SHA-256>`,
+- `X-Danus-Verify-Wait-Ms: <non-negative decimal>`, and
+- `X-Danus-Verify-Rejection: per_key_waiters_full | total_waiters_full |
+  distinct_queue_full | queue_wait_timeout` on a scheduler rejection.
 
 **Fail-closed invariants (enforced in production code, with prompt backstops):**
 For `verification_status="final"`, `verdict == "correct"` ⟺
@@ -82,11 +97,23 @@ starts; the gateway owns closure integrity and recomputes the locked snapshot
 before add. The launcher rejects malformed or self-contradictory verdict output. For a
 context-bearing request, the service itself adds `verification_context_digest`
 to the response; the gateway refuses responses without that exact attestation.
-Before every POST, the gateway GETs `/health`, requires output protocol 3 and a
-well-formed bundle digest, then echoes both values into the request. Thus a new
-gateway sends zero paid requests to an old health endpoint, an old gateway is
-rejected by a new service before run allocation, and a service replacement
-between health and POST is rejected before Codex.
+Before every POST, the gateway GETs `/health`, requires its instance nonce,
+output protocol 3, and a well-formed bundle digest, then echoes all three values
+into the request. The service checks nonce, protocol, then bundle before
+prechecks, scheduler admission, or run allocation. Thus a new gateway sends zero
+paid requests to an old health endpoint, an old gateway is rejected by a new
+service before run allocation, and a same-bundle service replacement between
+health and POST is rejected before cache reuse or Codex.
+
+After deterministic prechecks and complete fact-context validation, the service
+hashes a strict canonical identity containing the key schema, service nonce,
+protocol, bundle digest, captured execution profile, and the exact statement,
+proof, glossary map, and full context. One fixed paid slot serves distinct keys
+FIFO. Exact in-flight duplicates join the leader even when the distinct queue is
+full; only that leader preflights the gateway, allocates a run, and launches.
+Leader failure is fanned out but never cached. A successful response is
+independently revalidated against the original candidate before atomic
+publication to followers and the per-process, nonce-bound LRU/TTL cache.
 
 ## Modules
 - `prechecks.py` — pure, offline-testable: vacuousness + P1/P3/P5 hard prohibitions
@@ -117,8 +144,12 @@ between health and POST is rejected before Codex.
   provisioning cannot escape into an attacker-selected path. Injects the
   read-only gateway with the verify service's exact
   interpreter as **`<sys.executable> -m danus.gateway`**.
-- `service.py` — FastAPI app (`/verify`, `/health`) and deterministic context
-  validation before any verifier process starts.
+- `scheduler.py` — synchronous `Condition`-based single-paid-slot scheduler with
+  a bounded FIFO distinct queue, exact in-flight coalescing, bounded waiter
+  admission, and a byte/entry/TTL-bounded completed-success LRU.
+- `service.py` — FastAPI app (`/verify`, `/health`, read-only `/scheduler`),
+  deterministic context validation before scheduling, exact canonical request
+  identity, independent result validation, and header-only scheduler telemetry.
 
 ## Run
 
@@ -152,7 +183,12 @@ system Python without `danus`.
 | `DANUS_VERIFY_MAX_PROMPT_BYTES` | `200000` | hard limit on the final UTF-8 prompt, including candidate, escaped context, definitions, and envelope; overflow returns HTTP 413 before Codex starts |
 | `DANUS_VERIFY_MAX_REQUEST_BYTES` | `1000000` | hard request-body cap enforced before FastAPI/Pydantic buffers or parses JSON |
 | `DANUS_VERIFY_BODY_TIMEOUT_SECONDS` | `10` | total time allowed to upload a `/verify` request body |
-| `DANUS_VERIFY_MAX_CONCURRENT_REQUESTS` | `1` | pre-parse admission slots; excess requests receive HTTP 429 instead of starting more cold verifier sessions |
+| `DANUS_VERIFY_MAX_BODY_UPLOADS` | `32` | bounded concurrent request-body uploads; independent from paid/queued work |
+| paid verifier concurrency | fixed `1` | never configurable above one; only a FIFO leader allocates and launches |
+| `DANUS_VERIFY_QUEUE_LIMIT` / `DANUS_VERIFY_QUEUE_WAIT_SECONDS` | `4` / `1800` | distinct FIFO queue depth and maximum pre-launch wait |
+| `DANUS_VERIFY_MAX_WAITERS_PER_KEY` / `DANUS_VERIFY_MAX_WAITERS` | `8` / `32` | exact-duplicate follower cap and total queued/follower cap |
+| `DANUS_VERIFY_CACHE_MAX_ENTRIES` / `DANUS_VERIFY_CACHE_MAX_BYTES` | `64` / `16777216` | per-process validated-success LRU entry and canonical-JSON byte bounds |
+| `DANUS_VERIFY_CACHE_TTL_SECONDS` | `3600` | monotonic completed-success cache lifetime |
 | `VERIFY_MIN_STATEMENT_CHARS` / `VERIFY_MIN_PROOF_CHARS` / `VERIFY_MIN_PROOF_WORDS` | 10 / 30 / 5 | vacuousness thresholds |
 | `VERIFY_REJECT_PROBLEM_MD_CITATIONS` / `VERIFY_REJECT_UNPROVEN_CONDITIONALS` / `VERIFY_REJECT_VAGUE_GESTURES` | `1` | toggle P1 / P3 / P5 (`0` disables) |
 
@@ -161,7 +197,9 @@ system Python without `danus`.
 statement/edge/fact-local-definition cards for the entire transitive closure,
 immutable selected definitions, and no ancestor proofs),
 then attests `/health` and POSTs
-`{expected_output_protocol_version, expected_verifier_bundle_digest, statement, proof, glossary_introduces, fact_context}` to `DANUS_VERIFY_URL`
+`{expected_verifier_instance_nonce, expected_output_protocol_version,
+expected_verifier_bundle_digest, statement, proof, glossary_introduces,
+fact_context}` to `DANUS_VERIFY_URL`
 (e.g. `http://127.0.0.1:8091/verify`). Missing, revoked, incomplete, or
 over-budget context blocks before the service is contacted. `needs_context`
 triggers exact canonical hydration by the gateway and a fresh

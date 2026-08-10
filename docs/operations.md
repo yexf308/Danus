@@ -94,12 +94,12 @@ bash scripts/check-codex.sh     # one live codex ping + scan recent logs for API
     ok   python dep: openai (gpt_pro consult)
     ok   python dep: anthropic (claude_api consult)
     ok   node: .../runtime/node22/bin/node
-    ok   codex: codex-cli 0.142.5
+    ok   codex: codex-cli 0.147
     ok   codex login ok (/home/you/codex-home)
     ok   verify service up :8091 (ours)
     warn no pdflatex on PATH (write-paper PDF render needs it; set TEX_ENGINE or install TeX)
     ok   chrome: /usr/bin/chromium-browser (human-summary PDF)
-  consult transport: gpt_pro
+  consult transport: off
   done.
   ```
 
@@ -135,6 +135,12 @@ explicit action. If paid execution may already have begun and the outcome is
 unknown, this command refuses; use the stronger acknowledged `abandon-intent`
 workflow instead.
 
+An `outcome_unknown` reasoning-first verification candidate is also separate.
+It has no TTL and must never be retried or resubmitted. Inspect the exact receipt
+with `danus status <project> --json`, fail-stop/reconcile the source slot, then use
+the owner-only `danus resolve-candidate` transition. It audits the FactGraph
+identity and releases only that exact live candidate slot.
+
 ## Worker lifecycle (operational view)
 
 ```bash
@@ -145,12 +151,18 @@ danus stop   <project> --force  # durable request: interrupt active owned work, 
 ```
 
 - Workers run detached in their own process groups, so they outlive your session and
-  a graceful stop lets an in-flight round finish (no lost verified work). `--force`
+  a graceful stop lets an in-flight paid turn finish (no lost verified work). In
+  `reasoning_first_v1`, one root and one critic are fixed for the generation;
+  dormant observers consume no paid turns and are not automatic failover. A new
+  terminal coordination slot starts a fresh app-server thread, while same-slot
+  crash recovery alone resumes its exact pinned thread. The 2700-second cap is
+  per paid turn, not a whole-phase completion guarantee. `--force`
   never signals a numeric PID/PGID from the CLI: the authenticated worker reads
   the durable request, interrupts its app-server turn or cleans its retained
   direct-child process group, reaps it, audits the result, and exits.
-- `status` shows a `stuck?` soft signal when a running round exceeds ~1.5× the hard
-  timeout — investigate (often a flaky backend); decide stop/restart.
+- `status --json` separates physical liveness, paid admission, candidate state,
+  and content-free reasoning diagnostics. `unavailable`/`partial` telemetry is
+  not zero, proof state, or authority to trigger an advisor.
 
 ## Unattended operation (examples, not core)
 
@@ -159,8 +171,10 @@ Under `examples/ops/` (parameterized; nothing in the engine depends on them):
 - `main-agent-tmux.sh` — run Claude Code (the main agent) detached in a tmux
   session, so strategic beats continue while you are away. **The only unattended
   mode.**
-- `strategy-loop.sh <project>` — fire a strategy consult on a cadence
-  (`DANUS_STRATEGY_BEAT`, default ~2h) when an elaboration is present.
+- `strategy-loop.sh <project>` — a legacy/example timer wrapper for API/CLI
+  consults. It is not the core reasoning-first coordinator and cannot interpret
+  root/critic evidence, create an advisor checkpoint, or authorize browser Pro;
+  prefer the attended event-driven strategy loop for new projects.
 - `watchdog.sh <project>` — probe verify `/health` + parse `danus status`; alarm via
   a generic `DANUS_NOTIFY` hook on a `stuck?`/`dead`/`error` worker or a down verify.
 

@@ -1,7 +1,7 @@
 """``danus`` — the main agent's control surface over codex workers.
 
     danus list   [--json]
-    danus new    <project> [--roles high:3,xhigh:4] [--model M]
+    danus new    <project> [--roles ROLE_SPEC] [--model M]
     danus assign <project>/<worker> (--task "…" | --file P | --stdin)
     danus say    <project>/<worker> (--text "…" | --file P | --stdin)
     danus messages <project>[/<worker>] [--json]
@@ -9,6 +9,13 @@
     danus abandon-intent <project>/<worker> --thread-id ID --client-id ID
                        --expected-state STATE --reason TEXT
                        --acknowledge-paid-outcome-unknown
+    danus resolve-candidate <project> --receipt ID --outcome OUTCOME
+                       --acknowledge-paid-outcome-unknown
+    danus resolve-recommendation <project> --recommendation-id ID
+                       --resolution adopted-master-guidance|continue-without-advisor
+                       --acknowledge-recommendation-id ID
+                       --acknowledge-resume-paid-reasoning
+                       [--master-guidance-entry-id ID]
     danus cancel-prepared-intent <project>/<worker> --thread-id ID --client-id ID
                        --reason TEXT
     danus reset-thread <project>/<worker> --expected-thread-id ID
@@ -34,6 +41,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import fcntl
+import hashlib
 import json
 import os
 import signal
@@ -46,15 +54,39 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from danus.coordination import (
+    CoordinationError,
+    CoordinationStore,
+    coordination_config,
+)
+from danus.coordination.store import load_project_metadata
+from danus.core import FactGraph, GlobalMemory
+from danus.core.schema import clean_consult_provenance
 from danus.execution import layout as L
 from danus.execution.scaffold import atomic_write, do_new, ensure_real_dir, spawn_loop
 from danus.hotjoin import HotJoinError, HotJoinStore, IdempotencyConflict, StaleClaim
+from danus.strategy.browser_advisor import BrowserAdvisorError
 
 __all__ = [
-    "do_new", "do_assign", "do_start", "do_status", "worker_status",
-    "do_list", "do_stop", "do_finalize", "do_say", "do_messages",
-    "do_interrupt_turn", "do_abandon_intent", "do_cancel_prepared_intent", "do_reset_thread",
-    "do_rotate_thread", "build_parser", "main",
+    "do_new",
+    "do_assign",
+    "do_start",
+    "do_status",
+    "worker_status",
+    "do_list",
+    "do_stop",
+    "do_finalize",
+    "do_say",
+    "do_messages",
+    "do_interrupt_turn",
+    "do_abandon_intent",
+    "do_cancel_prepared_intent",
+    "do_reset_thread",
+    "do_rotate_thread",
+    "do_resolve_candidate",
+    "do_resolve_recommendation",
+    "build_parser",
+    "main",
 ]
 
 
@@ -145,7 +177,9 @@ def _darwin_process_birth(
         except ProcessLookupError as exc:
             raise ProcessLookupError(pid) from exc
         except PermissionError as exc:
-            raise ProcessIdentityError("cannot authenticate worker process owner") from exc
+            raise ProcessIdentityError(
+                "cannot authenticate worker process owner"
+            ) from exc
         raise ProcessIdentityError(
             "macOS kernel process identity API returned an incompatible record"
         )
@@ -172,14 +206,18 @@ def _load_pid_record(wl: L.WorkerLayout) -> Optional[Dict[str, object]]:
                 or info.st_nlink != 1
                 or info.st_size > _MAX_PID_RECORD_BYTES
             ):
-                raise ProcessIdentityError("worker PID record is not a safe regular file")
+                raise ProcessIdentityError(
+                    "worker PID record is not a safe regular file"
+                )
             payload = os.read(fd, _MAX_PID_RECORD_BYTES + 1)
         finally:
             os.close(fd)
     except FileNotFoundError:
         return None
     except OSError as exc:
-        raise ProcessIdentityError(f"cannot safely read worker PID record: {exc}") from exc
+        raise ProcessIdentityError(
+            f"cannot safely read worker PID record: {exc}"
+        ) from exc
 
     try:
         record = json.loads(payload.decode("utf-8", errors="strict"))
@@ -190,7 +228,10 @@ def _load_pid_record(wl: L.WorkerLayout) -> Optional[Dict[str, object]]:
     if not isinstance(record, dict):
         raise ProcessIdentityError("worker PID record must be a JSON object")
     required = {"schema_version", "pid", "pgid", "start_token", "worker_dir"}
-    if set(record) != required or record.get("schema_version") != _PID_RECORD_SCHEMA_VERSION:
+    if (
+        set(record) != required
+        or record.get("schema_version") != _PID_RECORD_SCHEMA_VERSION
+    ):
         raise ProcessIdentityError("worker PID record has an unsupported schema")
     pid = record.get("pid")
     pgid = record.get("pgid")
@@ -233,7 +274,9 @@ def _ps_field(pid: int, field: str) -> str:
             env=env,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        raise ProcessIdentityError(f"cannot inspect worker process identity: {exc}") from exc
+        raise ProcessIdentityError(
+            f"cannot inspect worker process identity: {exc}"
+        ) from exc
     value = completed.stdout.strip()
     if completed.returncode != 0 or not value:
         try:
@@ -241,7 +284,9 @@ def _ps_field(pid: int, field: str) -> str:
         except ProcessLookupError as exc:
             raise ProcessLookupError(pid) from exc
         except PermissionError as exc:
-            raise ProcessIdentityError("cannot authenticate worker process owner") from exc
+            raise ProcessIdentityError(
+                "cannot authenticate worker process owner"
+            ) from exc
         raise ProcessIdentityError("worker process identity probe returned no value")
     return value
 
@@ -268,7 +313,9 @@ def _process_identity(pid: int) -> Dict[str, object]:
         except FileNotFoundError as exc:
             raise ProcessLookupError(pid) from exc
         except (OSError, IndexError, ValueError) as exc:
-            raise ProcessIdentityError("cannot parse kernel worker process identity") from exc
+            raise ProcessIdentityError(
+                "cannot parse kernel worker process identity"
+            ) from exc
         if proc_pgid != observed_pgid:
             raise ProcessIdentityError("worker PGID changed during identity inspection")
         return {
@@ -309,7 +356,9 @@ def _capture_pid_record(wl: L.WorkerLayout, pid: int) -> Dict[str, object]:
     if identity["pgid"] != pid:
         raise ProcessIdentityError("spawned worker is not its own process-group leader")
     if str(identity["state"]).startswith("Z"):
-        raise ProcessIdentityError("spawned worker exited before supervisor registration")
+        raise ProcessIdentityError(
+            "spawned worker exited before supervisor registration"
+        )
     return {
         "schema_version": _PID_RECORD_SCHEMA_VERSION,
         "pid": pid,
@@ -380,7 +429,11 @@ def _read_status(wl: L.WorkerLayout) -> Dict:
         fd = os.open(str(sp), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         try:
             info = os.fstat(fd)
-            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > 1_048_576:
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_nlink != 1
+                or info.st_size > 1_048_576
+            ):
                 return {}
             payload = bytearray()
             while len(payload) <= 1_048_576:
@@ -402,6 +455,7 @@ def _read_status(wl: L.WorkerLayout) -> Dict:
 # assign                                                                       #
 # --------------------------------------------------------------------------- #
 
+
 def do_assign(target: str, task: str) -> Dict:
     """Overwrite (replace, NOT append) a worker's TASK.md, ensuring a trailing
     newline. Rejects a bare project, a nonexistent worker, and an empty task."""
@@ -414,13 +468,239 @@ def do_assign(target: str, task: str) -> Dict:
     wl = L.WorkerLayout(dirs[0])
     if not task.strip():
         raise SystemExit("refusing to assign an empty task")
+    try:
+        metadata = load_project_metadata(wl.project_dir)
+        config = coordination_config(metadata)
+        if config.reasoning_first:
+            store = CoordinationStore.open_existing(wl.project_dir, metadata)
+            if store is None:
+                raise CoordinationError(
+                    "reasoning-first coordination database is missing"
+                )
+            if store.project_status()["candidate"] is not None:
+                raise SystemExit(
+                    "active candidate freezes retask until its paid outcome is known"
+                )
+    except (CoordinationError, OSError, sqlite3.Error, ValueError) as exc:
+        raise SystemExit(f"coordination state unavailable: {exc}") from exc
     atomic_write(wl.task, task if task.endswith("\n") else task + "\n")
     return {"worker": f"{project}/{worker}", "task_file": str(wl.task)}
+
+
+def do_resolve_candidate(
+    project: str,
+    candidate_receipt_id: str,
+    *,
+    outcome: str,
+    acknowledge_paid_outcome_unknown: bool,
+) -> Dict:
+    """Release an unknown candidate only through an explicit owner audit seam."""
+
+    try:
+        project = L.validate_segment(project, label="project")
+        project_dir = L.existing_project_dir(project)
+    except ValueError as exc:
+        raise SystemExit(f"invalid project: {exc}") from exc
+    if project_dir is None:
+        raise SystemExit(f"no such project: {project}")
+    if outcome not in {"known-no-promotion", "abandon-unknown"}:
+        raise SystemExit("unsupported candidate owner outcome")
+    if acknowledge_paid_outcome_unknown is not True:
+        raise SystemExit(
+            "resolve-candidate requires --acknowledge-paid-outcome-unknown"
+        )
+    try:
+        metadata = load_project_metadata(project_dir)
+        if not coordination_config(metadata).reasoning_first:
+            raise CoordinationError("legacy project has no candidate overlay")
+        store = CoordinationStore.open_existing(project_dir, metadata)
+        if store is None:
+            raise CoordinationError("reasoning-first coordination database is missing")
+        candidate = store.candidate_entry(candidate_receipt_id)
+        if candidate is None:
+            raise CoordinationError("candidate receipt does not exist")
+        resolution = outcome.replace("-", "_")
+        prior_resolution = candidate.get("owner_resolution")
+        if prior_resolution is not None:
+            fact_active = candidate.get("candidate_fact_active_at_resolution")
+            if not isinstance(fact_active, bool):
+                raise CoordinationError("candidate owner audit is incomplete")
+            return store.resolve_candidate_outcome_unknown(
+                candidate_receipt_id,
+                resolution=resolution,
+                acknowledge_paid_outcome_unknown=True,
+                candidate_fact_active=fact_active,
+            )
+        candidate_fact_id = candidate.get("candidate_fact_id")
+        if not isinstance(candidate_fact_id, str):
+            raise CoordinationError("candidate has no canonical fact id")
+        candidate_fact_identity = candidate.get("candidate_fact_identity")
+        if (
+            not isinstance(candidate_fact_identity, str)
+            or len(candidate_fact_identity) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in candidate_fact_identity
+            )
+        ):
+            raise CoordinationError("candidate has no canonical full fact identity")
+        graph = FactGraph(project_dir)
+        with graph.locked_active_fact_identity(candidate_fact_id) as active_identity:
+            return store.resolve_candidate_outcome_unknown(
+                candidate_receipt_id,
+                resolution=resolution,
+                acknowledge_paid_outcome_unknown=True,
+                candidate_fact_active=active_identity == candidate_fact_identity,
+            )
+    except (CoordinationError, OSError, sqlite3.Error, ValueError) as exc:
+        raise SystemExit(f"candidate resolution failed: {exc}") from exc
+
+
+def do_resolve_recommendation(
+    project: str,
+    recommendation_id: str,
+    *,
+    resolution: str,
+    acknowledge_recommendation_id: str,
+    acknowledge_resume_paid_reasoning: bool,
+    master_guidance_entry_id: str | None,
+) -> Dict:
+    """Owner-only exact-CAS resume after one terminal critic review."""
+
+    try:
+        project = L.validate_segment(project, label="project")
+        project_dir = L.existing_project_dir(project)
+    except ValueError as exc:
+        raise SystemExit(f"invalid project: {exc}") from exc
+    if project_dir is None:
+        raise SystemExit(f"no such project: {project}")
+    if acknowledge_recommendation_id != recommendation_id:
+        raise SystemExit(
+            "--acknowledge-recommendation-id must exactly equal --recommendation-id"
+        )
+    if acknowledge_resume_paid_reasoning is not True:
+        raise SystemExit(
+            "resolve-recommendation requires --acknowledge-resume-paid-reasoning"
+        )
+    if resolution not in {
+        "adopted-master-guidance",
+        "continue-without-advisor",
+    }:
+        raise SystemExit("unsupported recommendation owner resolution")
+    if resolution == "adopted-master-guidance" and master_guidance_entry_id is None:
+        raise SystemExit(
+            "adopted-master-guidance requires --master-guidance-entry-id"
+        )
+    if resolution == "continue-without-advisor" and master_guidance_entry_id is not None:
+        raise SystemExit(
+            "continue-without-advisor cannot include --master-guidance-entry-id"
+        )
+
+    try:
+        metadata = load_project_metadata(project_dir)
+        if not coordination_config(metadata).reasoning_first:
+            raise CoordinationError("legacy project has no advisor recommendation state")
+        store = CoordinationStore.open_existing(project_dir, metadata)
+        if store is None:
+            raise CoordinationError("reasoning-first coordination database is missing")
+
+        from danus.strategy.browser_advisor import BrowserAdvisorBroker
+
+        with BrowserAdvisorBroker.project_memory_fence(project_dir):
+            normalized_resolution = resolution.replace("-", "_")
+            prior_resolution = store.recommendation_resolution(recommendation_id)
+            if prior_resolution is not None:
+                if (
+                    prior_resolution["resolution"] == normalized_resolution
+                    and prior_resolution["master_guidance_entry_id"]
+                    == master_guidance_entry_id
+                ):
+                    return prior_resolution
+                raise CoordinationError(
+                    "recommendation already has a conflicting owner resolution"
+                )
+
+            if resolution == "continue-without-advisor":
+                BrowserAdvisorBroker.assert_recommendation_releasable(
+                    project_dir,
+                    recommendation_id=recommendation_id,
+                )
+
+            record_sha256 = None
+            browser_request_id = None
+            browser_receipt_sha256 = None
+            if master_guidance_entry_id is not None:
+                guidance = GlobalMemory(project_dir).get(master_guidance_entry_id)
+                if guidance.get("kind") != "master_guidance":
+                    raise CoordinationError(
+                        "owner resolution entry is not exact master_guidance"
+                    )
+                links = guidance.get("links")
+                if (
+                    not isinstance(links, dict)
+                    or links.get("recommendation_id") != recommendation_id
+                ):
+                    raise CoordinationError(
+                        "master guidance must link the exact recommendation id"
+                    )
+                encoded = json.dumps(
+                    guidance,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ).encode("utf-8")
+                record_sha256 = hashlib.sha256(encoded).hexdigest()
+                provenance_raw = guidance.get("consult_provenance")
+                if provenance_raw is not None:
+                    provenance = clean_consult_provenance(provenance_raw)
+                    if provenance["transport"] == "chatgpt_pro_browser":
+                        if provenance.get("recommendation_id") != recommendation_id:
+                            raise CoordinationError(
+                                "browser guidance must bind the exact recommendation id"
+                            )
+                        evidence = guidance.get("evidence")
+                        if not isinstance(evidence, str):
+                            raise CoordinationError(
+                                "browser master guidance has invalid evidence"
+                            )
+                        BrowserAdvisorBroker.validate_adopted_master_guidance(
+                            project_dir,
+                            provenance=provenance,
+                            evidence=evidence,
+                        )
+                        browser_request_id = provenance.get("request_id")
+                        browser_receipt_sha256 = provenance.get("receipt_sha256")
+                        if (
+                            not isinstance(browser_request_id, str)
+                            or not isinstance(browser_receipt_sha256, str)
+                        ):
+                            raise CoordinationError(
+                                "browser master guidance has incomplete adopted receipt"
+                            )
+            return store.resolve_recommendation(
+                recommendation_id,
+                resolution=normalized_resolution,
+                owner_acknowledgement=acknowledge_recommendation_id,
+                master_guidance_entry_id=master_guidance_entry_id,
+                master_guidance_record_sha256=record_sha256,
+                browser_request_id=browser_request_id,
+                browser_receipt_sha256=browser_receipt_sha256,
+            )
+    except (
+        BrowserAdvisorError,
+        CoordinationError,
+        OSError,
+        sqlite3.Error,
+        ValueError,
+    ) as exc:
+        raise SystemExit(f"recommendation resolution failed: {exc}") from exc
 
 
 # --------------------------------------------------------------------------- #
 # human hot-join mailbox                                                       #
 # --------------------------------------------------------------------------- #
+
 
 def _hotjoin_target(target: str) -> tuple[str, str, HotJoinStore]:
     project, worker = L.resolve_target(target)
@@ -459,9 +739,7 @@ def do_say(
         raise SystemExit(f"cannot enqueue human message: {exc}") from exc
 
 
-def do_interrupt_turn(
-    target: str, *, client_id: Optional[str] = None
-) -> Dict:
+def do_interrupt_turn(target: str, *, client_id: Optional[str] = None) -> Dict:
     """Enqueue an explicit owner control request to interrupt one active turn."""
     _project, worker, store = _hotjoin_target(target)
     try:
@@ -521,7 +799,9 @@ def do_abandon_intent(
             acknowledge_paid_outcome_unknown=acknowledge_paid_outcome_unknown,
         )
     except KeyError as exc:
-        raise SystemExit(f"cannot abandon paid-turn intent: no such client id {exc.args[0]}") from exc
+        raise SystemExit(
+            f"cannot abandon paid-turn intent: no such client id {exc.args[0]}"
+        ) from exc
     except (ValueError, StaleClaim, HotJoinError, ProcessIdentityError) as exc:
         raise SystemExit(f"cannot abandon paid-turn intent: {exc}") from exc
     finally:
@@ -593,9 +873,7 @@ def do_reset_thread(target: str, *, expected_thread_id: str) -> Dict:
     )
 
 
-def do_rotate_thread(
-    target: str, *, expected_thread_id: str, reason: str
-) -> Dict:
+def do_rotate_thread(target: str, *, expected_thread_id: str, reason: str) -> Dict:
     """Owner-authorized terminal thread rotation after a bounded resume failure.
 
     This only clears the CAS-fenced conversation mapping.  It neither starts a
@@ -702,8 +980,10 @@ def _fmt_messages(rows: List[Dict]) -> str:
 # finalize                                                                     #
 # --------------------------------------------------------------------------- #
 
-def do_finalize(project: str, fact_ids: List[str],
-                paper_id: Optional[str] = None) -> Dict:
+
+def do_finalize(
+    project: str, fact_ids: List[str], paper_id: Optional[str] = None
+) -> Dict:
     """Record the finalized target theorem(s) for a PAPER of a project in that
     paper's TARGET.md — the durable slot write-paper reads (never a guess). The
     default paper writes the LEGACY ``<project>/TARGET.md``; a non-default
@@ -732,8 +1012,11 @@ def do_finalize(project: str, fact_ids: List[str],
 
     if not fact_ids:
         # suggestion mode: never auto-pick — just list candidate terminal facts.
-        return {"project": project, "paper_id": paper_id,
-                "suggested": assemble._terminal_facts(fg)}
+        return {
+            "project": project,
+            "paper_id": paper_id,
+            "suggested": assemble._terminal_facts(fg),
+        }
 
     unknown = [fid for fid in fact_ids if not fg.exists(fid)]
     if unknown:
@@ -755,13 +1038,18 @@ def do_finalize(project: str, fact_ids: List[str],
             seen.add(fid)
             ids.append(fid)
     path = assemble.write_target_fact_ids(pdir, ids, paper_id)
-    return {"project": project, "paper_id": paper_id,
-            "target_file": str(path), "target_fact_ids": ids}
+    return {
+        "project": project,
+        "paper_id": paper_id,
+        "target_file": str(path),
+        "target_fact_ids": ids,
+    }
 
 
 # --------------------------------------------------------------------------- #
 # start                                                                        #
 # --------------------------------------------------------------------------- #
+
 
 def _open_worker_lock(wl: L.WorkerLayout):
     lock_fd = os.open(
@@ -791,11 +1079,14 @@ def _cleanup_unregistered_child(proc: subprocess.Popen) -> None:
     if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1:
         raise ProcessIdentityError("spawned worker has an unsafe PID")
     try:
-        leader_exited = os.waitid(
-            os.P_PID,
-            pid,
-            os.WEXITED | os.WNOHANG | os.WNOWAIT,
-        ) is not None
+        leader_exited = (
+            os.waitid(
+                os.P_PID,
+                pid,
+                os.WEXITED | os.WNOHANG | os.WNOWAIT,
+            )
+            is not None
+        )
     except InterruptedError:
         leader_exited = False
     except ChildProcessError:
@@ -819,11 +1110,14 @@ def _cleanup_unregistered_child(proc: subprocess.Popen) -> None:
             deadline = time.monotonic() + 0.25
             while not leader_exited and time.monotonic() < deadline:
                 try:
-                    leader_exited = os.waitid(
-                        os.P_PID,
-                        pid,
-                        os.WEXITED | os.WNOHANG | os.WNOWAIT,
-                    ) is not None
+                    leader_exited = (
+                        os.waitid(
+                            os.P_PID,
+                            pid,
+                            os.WEXITED | os.WNOHANG | os.WNOWAIT,
+                        )
+                        is not None
+                    )
                 except InterruptedError:
                     continue
                 if not leader_exited:
@@ -934,6 +1228,44 @@ def do_start(target: str, stagger: float = 0.2) -> List[Dict]:
 # status                                                                       #
 # --------------------------------------------------------------------------- #
 
+
+def _bounded_status_json(value: object, *, max_bytes: int) -> object:
+    """Project one host-written diagnostic without allowing status ballooning."""
+
+    if value is None:
+        return None
+    try:
+        encoded = json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError):
+        return {"omitted": True, "reason": "malformed_status_telemetry"}
+    if len(encoded) > max_bytes:
+        return {
+            "omitted": True,
+            "reason": "status_telemetry_exceeds_projection_limit",
+            "bytes": len(encoded),
+            "sha256": hashlib.sha256(encoded).hexdigest(),
+        }
+    return json.loads(encoded.decode("utf-8"))
+
+
+def _bounded_status_scalar(value: object, *, max_bytes: int = 512) -> object:
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        try:
+            encoded = value.encode("utf-8")
+        except UnicodeEncodeError:
+            return None
+        return value if len(encoded) <= max_bytes else None
+    return None
+
+
 def worker_status(wl: L.WorkerLayout) -> Dict:
     pid = None
     alive = False
@@ -946,6 +1278,37 @@ def worker_status(wl: L.WorkerLayout) -> Dict:
     except ProcessIdentityError as exc:
         identity_error = str(exc)
     st = _read_status(wl)
+    coordination_error = None
+    coordination_view: Dict[str, object] = {
+        "mode": "legacy",
+        "lane": "legacy",
+        "generation": None,
+        "phase": None,
+        "paid_active": None,
+        "waiting_admission": 0,
+        "phase_deadline_at": None,
+        "phase_deadline_exceeded": False,
+        "advisor_reachable": False,
+        "advisor_recommendation_present": False,
+        "advisor_recommendation_ready": False,
+        "fail_stop_reason": None,
+        "review": None,
+        "recommendation": None,
+        "resolution": None,
+        "candidate": None,
+    }
+    try:
+        metadata = load_project_metadata(wl.project_dir)
+        config = coordination_config(metadata)
+        if config.reasoning_first:
+            store = CoordinationStore.open_existing(wl.project_dir, metadata)
+            if store is None:
+                raise CoordinationError(
+                    "reasoning-first coordination database is missing"
+                )
+            coordination_view = store.project_status(wl.name)
+    except (CoordinationError, OSError, sqlite3.Error, ValueError) as exc:
+        coordination_error = str(exc)[:512]
     unfinished_paid_intent = None
     intent_ledger_error = None
     database = wl.project_dir / ".human-intervention" / "events.sqlite3"
@@ -983,16 +1346,31 @@ def worker_status(wl: L.WorkerLayout) -> Dict:
     if identity_error is not None:
         label = "pid-unsafe"
     elif alive:
-        # a round legitimately runs for hours; only flag truly stale running rounds
-        rs = st.get("round_started_at")
-        hard = int(os.environ.get("DANUS_ROUND_HARD_TIMEOUT", "14400"))
-        if state == "running" and isinstance(rs, (int, float)) and (now - rs) > hard * 1.5:
-            label = "stuck?"
+        if state == "waiting_admission":
+            label = "waiting"
         else:
-            label = "working"
+            # a round legitimately runs for hours; only flag truly stale running rounds
+            rs = st.get("round_started_at")
+            hard = (
+                2700
+                if coordination_view.get("mode") == "reasoning_first_v1"
+                else int(os.environ.get("DANUS_ROUND_HARD_TIMEOUT", "14400"))
+            )
+            if (
+                state == "running"
+                and isinstance(rs, (int, float))
+                and (now - rs) > hard * 1.5
+            ):
+                label = "stuck?"
+            else:
+                label = "working"
     else:
-        label = state if state in ("stopped", "deadline", "max_rounds", "error",
-                                   "terminated", "created") else "dead"
+        label = (
+            state
+            if state
+            in ("stopped", "deadline", "max_rounds", "error", "terminated", "created")
+            else "dead"
+        )
     recovery_required = st.get("recovery_required")
     if unfinished_paid_intent is not None:
         if unfinished_paid_intent["state"] == "prepared":
@@ -1040,20 +1418,69 @@ def worker_status(wl: L.WorkerLayout) -> Dict:
                 "next_action": "reset-thread or rotate-thread before restart",
             }
     return {
-        "worker": wl.name, "pid": pid, "alive": alive, "state": state,
-        "round": st.get("round", 0), "age_s": round(age, 1) if age is not None else None,
-        "last_fact_id": st.get("last_fact_id"), "label": label,
+        "worker": wl.name,
+        "pid": pid,
+        "alive": alive,
+        "state": state,
+        "round": st.get("round", 0),
+        "age_s": round(age, 1) if age is not None else None,
+        "last_fact_id": st.get("last_fact_id"),
+        "label": label,
         # Kept out of the compact table but exposed in --json so an owner can
         # CAS-fence an explicit recovery after a server-side thread deletion.
         "app_server_thread_id": st.get("app_server_thread_id"),
         "active_turn_id": st.get("active_turn_id"),
         "error": st.get("error"),
         "last_attempt": st.get("last_attempt"),
-        "last_paid_turn": st.get("last_paid_turn"),
+        "last_paid_turn": _bounded_status_json(
+            st.get("last_paid_turn"), max_bytes=262_144
+        ),
+        "last_turn_reasoning_bandwidth": _bounded_status_json(
+            st.get("last_turn_reasoning_bandwidth"), max_bytes=131_072
+        ),
+        "last_turn_token_usage": _bounded_status_json(
+            st.get("last_turn_token_usage"), max_bytes=32_768
+        ),
+        "last_turn_token_usage_observed": _bounded_status_scalar(
+            st.get("last_turn_token_usage_observed")
+        ),
+        "last_turn_token_usage_finality": _bounded_status_scalar(
+            st.get("last_turn_token_usage_finality")
+        ),
+        "last_turn_status": _bounded_status_scalar(st.get("last_turn_status")),
+        "last_turn_model": _bounded_status_scalar(st.get("last_turn_model")),
+        "last_turn_effort": _bounded_status_scalar(st.get("last_turn_effort")),
+        "last_turn_model_rerouted": _bounded_status_scalar(
+            st.get("last_turn_model_rerouted")
+        ),
         "recovery_required": recovery_required,
         "unfinished_paid_intent": unfinished_paid_intent,
         "intent_ledger_error": intent_ledger_error,
         "pid_record_error": identity_error,
+        "live_processes": 1 if alive else 0,
+        "paid_active": coordination_view.get("paid_active"),
+        "waiting_admission": coordination_view.get("waiting_admission", 0),
+        "lane": coordination_view.get("lane"),
+        "generation": coordination_view.get("generation"),
+        "phase": coordination_view.get("phase"),
+        "phase_deadline_at": coordination_view.get("phase_deadline_at"),
+        "phase_deadline_exceeded": coordination_view.get(
+            "phase_deadline_exceeded", False
+        ),
+        "advisor_reachable": coordination_view.get("advisor_reachable", False),
+        "advisor_recommendation_present": coordination_view.get(
+            "advisor_recommendation_present", False
+        ),
+        "advisor_recommendation_ready": coordination_view.get(
+            "advisor_recommendation_ready", False
+        ),
+        "fail_stop_reason": coordination_view.get("fail_stop_reason"),
+        "review": coordination_view.get("review"),
+        "recommendation": coordination_view.get("recommendation"),
+        "resolution": coordination_view.get("resolution"),
+        "candidate": coordination_view.get("candidate"),
+        "coordination_mode": coordination_view.get("mode"),
+        "coordination_error": coordination_error,
     }
 
 
@@ -1068,55 +1495,144 @@ def do_status(target: str) -> List[Dict]:
 # list                                                                         #
 # --------------------------------------------------------------------------- #
 
+
 def do_list() -> List[Dict]:
     """One row per project: roster + how many workers are live + model."""
     out: List[Dict] = []
     for project in L.list_projects():
-        meta = {}
-        mp = L.project_dir(project) / "project.json"
-        if mp.exists():
-            try:
-                meta = json.loads(mp.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
-                meta = {}
+        coordination_error = None
+        try:
+            meta = load_project_metadata(L.project_dir(project))
+        except (CoordinationError, OSError, ValueError) as exc:
+            meta = {}
+            coordination_error = str(exc)[:512]
         workers = L.list_workers(project)
         live = 0
+        waiting_live = 0
         for worker in workers:
             wl = L.WorkerLayout(L.worker_dir(project, worker))
             try:
                 record = _load_pid_record(wl)
                 if record is not None and _pid_record_is_live(record):
                     live += 1
+                    if _read_status(wl).get("state") == "waiting_admission":
+                        waiting_live += 1
             except ProcessIdentityError:
                 # Listing stays read-only, but an unsafe record is never counted
                 # as live and start/stop will refuse to act on it.
                 pass
-        out.append({"project": project, "workers": len(workers), "live": live,
-                    "model": meta.get("model", "—")})
+        coordination_view: Dict[str, object] = {
+            "mode": "legacy",
+            "generation": None,
+            "phase": None,
+            "root_worker": None,
+            "critic_worker": None,
+            "paid_active": None,
+            "phase_deadline_at": None,
+            "phase_deadline_exceeded": False,
+            "advisor_reachable": False,
+            "advisor_recommendation_present": False,
+            "advisor_recommendation_ready": False,
+            "fail_stop_reason": None,
+            "review": None,
+            "recommendation": None,
+            "resolution": None,
+            "candidate": None,
+        }
+        try:
+            if coordination_error is None:
+                config = coordination_config(meta)
+                if config.reasoning_first:
+                    store = CoordinationStore.open_existing(
+                        L.project_dir(project), meta
+                    )
+                    if store is None:
+                        raise CoordinationError(
+                            "reasoning-first coordination database is missing"
+                        )
+                    coordination_view = store.project_status()
+        except (CoordinationError, OSError, sqlite3.Error, ValueError) as exc:
+            coordination_error = str(exc)[:512]
+        out.append(
+            {
+                "project": project,
+                "workers": len(workers),
+                "live": live,
+                "live_processes": live,
+                "paid_active": coordination_view.get("paid_active"),
+                "waiting_admission": waiting_live,
+                "lane": {
+                    "root": coordination_view.get("root_worker"),
+                    "critic": coordination_view.get("critic_worker"),
+                },
+                "generation": coordination_view.get("generation"),
+                "phase": coordination_view.get("phase"),
+                "phase_deadline_at": coordination_view.get("phase_deadline_at"),
+                "phase_deadline_exceeded": coordination_view.get(
+                    "phase_deadline_exceeded", False
+                ),
+                "advisor_reachable": coordination_view.get(
+                    "advisor_reachable", False
+                ),
+                "advisor_recommendation_present": coordination_view.get(
+                    "advisor_recommendation_present", False
+                ),
+                "advisor_recommendation_ready": coordination_view.get(
+                    "advisor_recommendation_ready", False
+                ),
+                "fail_stop_reason": coordination_view.get("fail_stop_reason"),
+                "review": coordination_view.get("review"),
+                "recommendation": coordination_view.get("recommendation"),
+                "resolution": coordination_view.get("resolution"),
+                "candidate": coordination_view.get("candidate"),
+                "coordination_mode": coordination_view.get("mode"),
+                "coordination_error": coordination_error,
+                "model": meta.get("model", "—"),
+            }
+        )
     return out
 
 
 def _fmt_list(rows: List[Dict]) -> str:
-    head = f"{'PROJECT':<24}{'WORKERS':>8}{'LIVE':>6}  {'MODEL':<12}"
+    head = (
+        f"{'PROJECT':<24}{'WORKERS':>8}{'LIVE':>6}{'PAID':>6}{'WAIT':>6}  "
+        f"{'PHASE':<22}{'CANDIDATE':<16}{'MODEL':<12}"
+    )
     lines = [head, "-" * len(head)]
     for r in rows:
-        lines.append(f"{r['project']:<24}{r['workers']:>8}{r['live']:>6}  {str(r['model']):<12}")
+        paid = r.get("paid_active")
+        lines.append(
+            f"{r['project']:<24}{r['workers']:>8}{r['live']:>6}"
+            f"{str(paid if paid is not None else '—'):>6}"
+            f"{str(r.get('waiting_admission', 0)):>6}  "
+            f"{str(r.get('phase') or '—'):<22}"
+            f"{str((r.get('candidate') or {}).get('state', '—')):<16}"
+            f"{str(r['model']):<12}"
+        )
     return "\n".join(lines) if rows else "(no projects under the agents root)"
 
 
 def _fmt_status(rows: List[Dict]) -> str:
-    head = f"{'WORKER':<14}{'LABEL':<12}{'STATE':<13}{'ROUND':>6}  {'AGE':>7}  {'LAST_FACT':<16}"
+    head = (
+        f"{'WORKER':<14}{'LANE':<10}{'LABEL':<12}{'STATE':<19}"
+        f"{'ROUND':>6}  {'AGE':>7}  {'CANDIDATE':<16}{'LAST_FACT':<16}"
+    )
     lines = [head, "-" * len(head)]
     for r in rows:
         age = f"{r['age_s']:.0f}s" if r["age_s"] is not None else "—"
-        lines.append(f"{r['worker']:<14}{r['label']:<12}{r['state']:<13}"
-                     f"{r['round']:>6}  {age:>7}  {str(r['last_fact_id'] or '—'):<16}")
+        lines.append(
+            f"{r['worker']:<14}{str(r.get('lane') or '—'):<10}"
+            f"{r['label']:<12}{r['state']:<19}{r['round']:>6}  {age:>7}  "
+            f"{str((r.get('candidate') or {}).get('state', '—')):<16}"
+            f"{str(r['last_fact_id'] or '—'):<16}"
+        )
     return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------- #
 # stop                                                                         #
 # --------------------------------------------------------------------------- #
+
 
 def _stop_one(wl: L.WorkerLayout, force: bool) -> str:
     lock = _open_worker_lock(wl)
@@ -1166,8 +1682,10 @@ def do_stop(target: str, force: bool = False) -> List[Dict]:
 # argparse                                                                      #
 # --------------------------------------------------------------------------- #
 
+
 def _task_from_args(args) -> str:
     import sys
+
     if args.task is not None:
         return args.task
     if args.file:
@@ -1179,6 +1697,7 @@ def _task_from_args(args) -> str:
 
 def _message_from_args(args) -> str:
     import sys
+
     if args.text is not None:
         return args.text
     if args.file:
@@ -1197,8 +1716,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     n = sub.add_parser("new", help="scaffold a project + worker dirs")
     n.add_argument("project")
-    n.add_argument("--roles", default="high:3,xhigh:4", help="e.g. high:3,xhigh:4 (default)")
+    n.add_argument(
+        "--roles",
+        default=None,
+        help=(
+            "explicit worker roster; defaults to max:2,high:5 for reasoning-first "
+            "and high:3,xhigh:4 for legacy"
+        ),
+    )
     n.add_argument("--model", default=None)
+    n.add_argument(
+        "--coordination",
+        choices=("legacy", "reasoning-first"),
+        default="reasoning-first",
+    )
 
     a = sub.add_parser("assign", help="write a worker's per-round TASK.md")
     a.add_argument("target", help="<project>/<worker>")
@@ -1213,7 +1744,9 @@ def build_parser() -> argparse.ArgumentParser:
     say.add_argument("--stdin", action="store_true")
     say.add_argument("--client-id", default=None, help="stable idempotency key")
     say.add_argument(
-        "--fallback", choices=("queue", "fail"), default="queue",
+        "--fallback",
+        choices=("queue", "fail"),
+        default="queue",
         help="when the worker has no active turn (default: queue)",
     )
 
@@ -1250,6 +1783,45 @@ def build_parser() -> argparse.ArgumentParser:
         help="accept that the paid turn may have completed remotely",
     )
 
+    resolve_candidate = sub.add_parser(
+        "resolve-candidate",
+        help="explicitly resolve a crash/outcome-unknown candidate overlay",
+    )
+    resolve_candidate.add_argument("project")
+    resolve_candidate.add_argument("--receipt", required=True)
+    resolve_candidate.add_argument(
+        "--outcome",
+        required=True,
+        choices=("known-no-promotion", "abandon-unknown"),
+    )
+    resolve_candidate.add_argument(
+        "--acknowledge-paid-outcome-unknown",
+        action="store_true",
+    )
+
+    resolve_recommendation = sub.add_parser(
+        "resolve-recommendation",
+        help="owner-resolve one terminal reviewed advisor recommendation",
+    )
+    resolve_recommendation.add_argument("project")
+    resolve_recommendation.add_argument("--recommendation-id", required=True)
+    resolve_recommendation.add_argument(
+        "--resolution",
+        required=True,
+        choices=("adopted-master-guidance", "continue-without-advisor"),
+    )
+    resolve_recommendation.add_argument(
+        "--acknowledge-recommendation-id",
+        required=True,
+        help="must exactly repeat --recommendation-id",
+    )
+    resolve_recommendation.add_argument(
+        "--acknowledge-resume-paid-reasoning",
+        action="store_true",
+        help="explicitly authorize a fresh reasoning generation after resolution",
+    )
+    resolve_recommendation.add_argument("--master-guidance-entry-id")
+
     cancel_prepared = sub.add_parser(
         "cancel-prepared-intent",
         help=(
@@ -1280,15 +1852,24 @@ def build_parser() -> argparse.ArgumentParser:
     rotate.add_argument("--expected-thread-id", required=True)
     rotate.add_argument("--reason", required=True)
 
-    f = sub.add_parser("finalize", help="record the finalized target fact_id(s) in "
-                                        "a paper's TARGET.md (write-paper reads this)")
+    f = sub.add_parser(
+        "finalize",
+        help="record the finalized target fact_id(s) in "
+        "a paper's TARGET.md (write-paper reads this)",
+    )
     f.add_argument("project")
-    f.add_argument("--paper", default=None,
-                   help="the paper_id (multiple papers per project). Default / 'main' "
-                        "→ legacy <project>/TARGET.md; else "
-                        "<project>/papers/<paper_id>/TARGET.md")
-    f.add_argument("fact_ids", nargs="*",
-                   help="the target fact id(s); omit to print candidate terminal facts")
+    f.add_argument(
+        "--paper",
+        default=None,
+        help="the paper_id (multiple papers per project). Default / 'main' "
+        "→ legacy <project>/TARGET.md; else "
+        "<project>/papers/<paper_id>/TARGET.md",
+    )
+    f.add_argument(
+        "fact_ids",
+        nargs="*",
+        help="the target fact id(s); omit to print candidate terminal facts",
+    )
 
     s = sub.add_parser("start", help="launch worker loop(s)")
     s.add_argument("target", help="<project> or <project>/<worker>")
@@ -1314,11 +1895,22 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     if args.cmd == "list":
         rows = do_list()
-        print(json.dumps(rows, ensure_ascii=False, indent=2) if args.json else _fmt_list(rows))
+        print(
+            json.dumps(rows, ensure_ascii=False, indent=2)
+            if args.json
+            else _fmt_list(rows)
+        )
     elif args.cmd == "new":
-        r = do_new(args.project, roles=args.roles, model=args.model)
-        print(f"created {args.project} with {len(r['workers'])} workers: "
-              f"{', '.join(r['workers'])}\n  {r['project_dir']}")
+        r = do_new(
+            args.project,
+            roles=args.roles,
+            model=args.model,
+            coordination=args.coordination,
+        )
+        print(
+            f"created {args.project} with {len(r['workers'])} workers: "
+            f"{', '.join(r['workers'])}\n  {r['project_dir']}"
+        )
     elif args.cmd == "assign":
         r = do_assign(args.target, _task_from_args(args))
         print(f"assigned {r['worker']} -> {r['task_file']}")
@@ -1332,7 +1924,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"{r['message_id']}: {r['state']} -> {r['target']}")
     elif args.cmd == "messages":
         rows = do_messages(args.target, limit=args.limit)
-        print(json.dumps(rows, ensure_ascii=False, indent=2) if args.json else _fmt_messages(rows))
+        print(
+            json.dumps(rows, ensure_ascii=False, indent=2)
+            if args.json
+            else _fmt_messages(rows)
+        )
     elif args.cmd == "interrupt-turn":
         r = do_interrupt_turn(args.target, client_id=args.client_id)
         print(f"{r['message_id']}: {r['state']} -> {r['target']} (interrupt)")
@@ -1343,14 +1939,38 @@ def main(argv: Optional[List[str]] = None) -> int:
             client_id=args.client_id,
             expected_state=args.expected_state,
             reason=args.reason,
-            acknowledge_paid_outcome_unknown=(
-                args.acknowledge_paid_outcome_unknown
-            ),
+            acknowledge_paid_outcome_unknown=(args.acknowledge_paid_outcome_unknown),
         )
         print(
             f"{r['target']}: abandoned outcome-unknown paid intent "
             f"{r['client_id']} ({r['prior_state']} -> {r['terminal_status']}); "
             "reset or rotate the thread before restarting"
+        )
+    elif args.cmd == "resolve-candidate":
+        r = do_resolve_candidate(
+            args.project,
+            args.receipt,
+            outcome=args.outcome,
+            acknowledge_paid_outcome_unknown=(args.acknowledge_paid_outcome_unknown),
+        )
+        print(
+            f"{args.project}: owner-resolved candidate "
+            f"{r['candidate_receipt_id']} as {r['owner_resolution']}"
+        )
+    elif args.cmd == "resolve-recommendation":
+        r = do_resolve_recommendation(
+            args.project,
+            args.recommendation_id,
+            resolution=args.resolution,
+            acknowledge_recommendation_id=args.acknowledge_recommendation_id,
+            acknowledge_resume_paid_reasoning=(
+                args.acknowledge_resume_paid_reasoning
+            ),
+            master_guidance_entry_id=args.master_guidance_entry_id,
+        )
+        print(
+            f"{args.project}: owner-resolved recommendation "
+            f"{r['recommendation_id']} as {r['resolution']}"
         )
     elif args.cmd == "cancel-prepared-intent":
         r = do_cancel_prepared_intent(
@@ -1365,13 +1985,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             "thread before restarting"
         )
     elif args.cmd == "reset-thread":
-        r = do_reset_thread(
-            args.target, expected_thread_id=args.expected_thread_id
-        )
-        print(
-            f"{r['target']}: cleared lost app-server thread "
-            f"{r['cleared_thread_id']}"
-        )
+        r = do_reset_thread(args.target, expected_thread_id=args.expected_thread_id)
+        print(f"{r['target']}: cleared lost app-server thread {r['cleared_thread_id']}")
     elif args.cmd == "rotate-thread":
         r = do_rotate_thread(
             args.target,
@@ -1389,23 +2004,35 @@ def main(argv: Optional[List[str]] = None) -> int:
         if "suggested" in r:
             sug = r["suggested"]
             if sug:
-                print(f"no fact_id given — candidate target facts for {r['project']}{paper_note} "
-                      f"(terminal facts; nothing depends on them):")
+                print(
+                    f"no fact_id given — candidate target facts for {r['project']}{paper_note} "
+                    f"(terminal facts; nothing depends on them):"
+                )
                 for fid in sug:
                     print(f"  {fid}")
-                print(f"\nrun: danus finalize {r['project']}{paper_flag} <fact_id> [<fact_id> ...] to record")
+                print(
+                    f"\nrun: danus finalize {r['project']}{paper_flag} <fact_id> [<fact_id> ...] to record"
+                )
             else:
-                print(f"no candidate terminal facts in {r['project']} "
-                      f"(is the fact graph empty?); nothing recorded")
+                print(
+                    f"no candidate terminal facts in {r['project']} "
+                    f"(is the fact graph empty?); nothing recorded"
+                )
         else:
-            print(f"finalized target for {r['project']}{paper_note}: {', '.join(r['target_fact_ids'])}\n"
-                  f"  wrote {r['target_file']}")
+            print(
+                f"finalized target for {r['project']}{paper_note}: {', '.join(r['target_fact_ids'])}\n"
+                f"  wrote {r['target_file']}"
+            )
     elif args.cmd == "start":
         for r in do_start(args.target):
             print(f"{r['worker']}: {r['result']}")
     elif args.cmd == "status":
         rows = do_status(args.target)
-        print(json.dumps(rows, ensure_ascii=False, indent=2) if args.json else _fmt_status(rows))
+        print(
+            json.dumps(rows, ensure_ascii=False, indent=2)
+            if args.json
+            else _fmt_status(rows)
+        )
     elif args.cmd == "stop":
         for r in do_stop(args.target, force=args.force):
             print(f"{r['worker']}: {r['result']}")

@@ -23,9 +23,12 @@ import asyncio
 import json
 import sys
 import threading
+import time
 import types
 from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor
 
+import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
@@ -36,6 +39,7 @@ from danus.core import (
 )
 from danus.verify import launcher as verify_launcher
 from danus.verify import service
+from danus.verify.scheduler import SchedulerLimits, VerificationScheduler
 
 _STMT = "For every integer n, n + 0 equals n."
 _PROOF = (
@@ -130,21 +134,44 @@ _FACT_CONTEXT = _make_context()
 _SCOPE = _FACT_CONTEXT["scope"]
 
 
+@pytest.fixture(autouse=True)
+def _isolated_scheduler(monkeypatch):
+    monkeypatch.setattr(
+        service,
+        "_SCHEDULER",
+        VerificationScheduler(
+            instance_nonce=service.VERIFY_INSTANCE_NONCE,
+            limits=SchedulerLimits(),
+        ),
+    )
+
+
 @contextmanager
 def _fake_run(fn):
     """Replace the launcher's codex-run (imported into service) with a fake."""
     orig_run = service.run_codex_verification
     orig_alloc = service._allocate_run_id
     orig_preflight = service.require_gateway_runtime
-    service.run_codex_verification = fn
+    orig_scheduler = service._SCHEDULER
+
+    def adapted(*args, **kwargs):
+        kwargs.pop("execution_profile", None)
+        return fn(*args, **kwargs)
+
+    service.run_codex_verification = adapted
     service._allocate_run_id = lambda statement: "RID-fake"
     service.require_gateway_runtime = lambda: None
+    service._SCHEDULER = VerificationScheduler(
+        instance_nonce=service.VERIFY_INSTANCE_NONCE,
+        limits=SchedulerLimits(),
+    )
     try:
         yield
     finally:
         service.run_codex_verification = orig_run
         service._allocate_run_id = orig_alloc
         service.require_gateway_runtime = orig_preflight
+        service._SCHEDULER = orig_scheduler
 
 
 def _client():
@@ -153,6 +180,7 @@ def _client():
 
 def _verify_json(**payload):
     return {
+        "expected_verifier_instance_nonce": service.VERIFY_INSTANCE_NONCE,
         "expected_output_protocol_version": (
             service.VERIFICATION_OUTPUT_PROTOCOL_VERSION
         ),
@@ -169,6 +197,13 @@ def test_health_ok():
     resp = _client().get("/health")
     assert resp.status_code == 200
     body = resp.json()
+    assert set(body) == {
+        "status",
+        "pid",
+        "instance_nonce",
+        "output_protocol_version",
+        "verifier_bundle_digest",
+    }
     assert body["status"] == "ok"
     # /health self-identifies with the serving process pid (callers match it
     # against runtime/run/verify.pid to distinguish OUR verify from a foreign
@@ -181,6 +216,17 @@ def test_health_ok():
         == 3
     )
     assert body["verifier_bundle_digest"] == service.VERIFIER_BUNDLE_DIGEST
+
+
+def test_scheduler_wait_env_rejects_platform_timeout_overflow(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv(
+        "DANUS_VERIFY_QUEUE_WAIT_SECONDS",
+        str(int(threading.TIMEOUT_MAX) + 1),
+    )
+    with pytest.raises(RuntimeError, match="threading.TIMEOUT_MAX"):
+        service._scheduler_limits_from_env()
 
 
 def test_old_gateway_request_fails_before_allocation_or_codex(monkeypatch):
@@ -217,6 +263,12 @@ def test_protocol_or_health_digest_mismatch_fails_before_paid_work(monkeypatch):
         lambda *_args, **_kwargs: calls.__setitem__("codex", calls["codex"] + 1),
     )
 
+    stale_instance = _verify_json(statement=_STMT, proof=_PROOF)
+    stale_instance["expected_verifier_instance_nonce"] = "stale-instance"
+    response = _client().post("/verify", json=stale_instance)
+    assert response.status_code == 409
+    assert "instance changed" in response.json()["detail"]
+
     wrong_protocol = _verify_json(statement=_STMT, proof=_PROOF)
     wrong_protocol["expected_output_protocol_version"] = 2
     response = _client().post("/verify", json=wrong_protocol)
@@ -227,6 +279,7 @@ def test_protocol_or_health_digest_mismatch_fails_before_paid_work(monkeypatch):
     response = _client().post("/verify", json=stale_health)
     assert response.status_code == 409
     assert calls == {"allocate": 0, "codex": 0}
+    assert service._SCHEDULER.snapshot()["counters"]["submitted"] == 0
 
 
 # --------------------------------------------------------------------------- #
@@ -247,6 +300,253 @@ def test_verify_accept_contract():
     assert body["verdict"] == "correct"
     assert body["verification_report"]["critical_errors"] == []
     assert "repair_hints" in body
+    assert set(resp.headers).issuperset(
+        {
+            service.SCHEDULER_SOURCE_HEADER.lower(),
+            service.SCHEDULER_KEY_HEADER.lower(),
+            service.SCHEDULER_WAIT_HEADER.lower(),
+        }
+    )
+    assert resp.headers[service.SCHEDULER_SOURCE_HEADER] == "launched"
+    assert len(resp.headers[service.SCHEDULER_KEY_HEADER]) == 64
+    assert resp.headers[service.SCHEDULER_WAIT_HEADER].isdecimal()
+    assert not any(key.startswith("scheduler_") for key in body)
+
+
+def test_exact_duplicate_coalesces_one_launch_and_cache_hits_afterward():
+    entered = threading.Event()
+    release = threading.Event()
+    launches = 0
+
+    def fake(run_id, statement, proof):
+        nonlocal launches
+        launches += 1
+        entered.set()
+        assert release.wait(5)
+        return _CANNED_OK
+
+    with _fake_run(fake):
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(
+                lambda: _client().post(
+                    "/verify", json=_verify_json(statement=_STMT, proof=_PROOF)
+                )
+            )
+            assert entered.wait(2)
+            second = pool.submit(
+                lambda: _client().post(
+                    "/verify", json=_verify_json(statement=_STMT, proof=_PROOF)
+                )
+            )
+            deadline = time.monotonic() + 2
+            while service._SCHEDULER.snapshot()["waiting_clients"] != 1:
+                assert time.monotonic() < deadline
+                time.sleep(0.01)
+            release.set()
+            responses = [first.result(2), second.result(2)]
+
+        cached = _client().post(
+            "/verify", json=_verify_json(statement=_STMT, proof=_PROOF)
+        )
+
+    assert launches == 1
+    assert {response.headers[service.SCHEDULER_SOURCE_HEADER] for response in responses} == {
+        "launched",
+        "coalesced",
+    }
+    assert cached.headers[service.SCHEDULER_SOURCE_HEADER] == "cache_hit"
+    assert all(response.json() == _CANNED_OK for response in [*responses, cached])
+
+
+def test_queued_duplicate_timeout_returns_same_429_reason_and_launches_no_work():
+    entered = threading.Event()
+    release = threading.Event()
+    launches = 0
+
+    def fake(run_id, statement, proof):
+        nonlocal launches
+        launches += 1
+        entered.set()
+        assert release.wait(5)
+        return _CANNED_OK
+
+    running_payload = _verify_json(statement=_STMT, proof=_PROOF)
+    queued_payload = _verify_json(
+        statement=_STMT,
+        proof=_PROOF + " This exact request has a distinct scheduler key.",
+    )
+    with _fake_run(fake):
+        service._SCHEDULER = VerificationScheduler(
+            instance_nonce=service.VERIFY_INSTANCE_NONCE,
+            limits=SchedulerLimits(queue_wait_seconds=0.05),
+        )
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            running = pool.submit(
+                lambda: _client().post("/verify", json=running_payload)
+            )
+            assert entered.wait(2)
+            queued_leader = pool.submit(
+                lambda: _client().post("/verify", json=queued_payload)
+            )
+            deadline = time.monotonic() + 2
+            while service._SCHEDULER.snapshot()["distinct_queue_depth"] != 1:
+                assert time.monotonic() < deadline
+                time.sleep(0.005)
+            queued_duplicate = pool.submit(
+                lambda: _client().post("/verify", json=queued_payload)
+            )
+            deadline = time.monotonic() + 2
+            while service._SCHEDULER.snapshot()["waiting_clients"] != 2:
+                assert time.monotonic() < deadline
+                time.sleep(0.005)
+
+            timed_out = [queued_leader.result(2), queued_duplicate.result(2)]
+            release.set()
+            assert running.result(2).status_code == 200
+
+    assert launches == 1
+    for response in timed_out:
+        assert response.status_code == 429
+        assert response.headers[service.SCHEDULER_REJECTION_HEADER] == (
+            "queue_wait_timeout"
+        )
+        assert response.json()["detail"] == (
+            "verification scheduler queue wait timed out"
+        )
+    assert {
+        response.headers[service.SCHEDULER_SOURCE_HEADER] for response in timed_out
+    } == {"rejected", "coalesced"}
+
+
+def test_execution_profile_drift_changes_key_and_launches_again(monkeypatch):
+    launches = 0
+
+    def fake(run_id, statement, proof):
+        nonlocal launches
+        launches += 1
+        return _CANNED_OK
+
+    with _fake_run(fake):
+        first = _client().post(
+            "/verify", json=_verify_json(statement=_STMT, proof=_PROOF)
+        )
+        cached = _client().post(
+            "/verify", json=_verify_json(statement=_STMT, proof=_PROOF)
+        )
+        monkeypatch.setenv("DANUS_VERIFY_MODEL", "profile-drift-model")
+        drifted = _client().post(
+            "/verify", json=_verify_json(statement=_STMT, proof=_PROOF)
+        )
+
+    assert launches == 2
+    assert cached.headers[service.SCHEDULER_SOURCE_HEADER] == "cache_hit"
+    assert first.headers[service.SCHEDULER_KEY_HEADER] != drifted.headers[
+        service.SCHEDULER_KEY_HEADER
+    ]
+
+
+def test_scheduler_key_binds_every_exact_request_component():
+    profile = verify_launcher.capture_execution_profile().canonical()
+    baseline = service.VerifyRequest.model_validate(
+        _verify_json(
+            statement=_STMT,
+            proof=_PROOF,
+            glossary_introduces={"X": "definition"},
+            fact_context=_FACT_CONTEXT,
+        )
+    )
+    baseline_key = service._scheduler_key(baseline, execution_profile=profile)
+    variants = [
+        baseline.model_copy(update={"statement": _STMT + " Exact drift."}),
+        baseline.model_copy(update={"proof": _PROOF + " Exact drift."}),
+        baseline.model_copy(update={"glossary_introduces": {"X": "changed"}}),
+        baseline.model_copy(
+            update={"fact_context": _make_context(candidate_fact_id="dddddddddddddddd")}
+        ),
+    ]
+    assert all(
+        service._scheduler_key(variant, execution_profile=profile) != baseline_key
+        for variant in variants
+    )
+    drifted_profile = dict(profile, model=profile["model"] + "-different")
+    assert service._scheduler_key(
+        baseline, execution_profile=drifted_profile
+    ) != baseline_key
+
+
+def test_valid_needs_context_is_cached_after_independent_validation():
+    launches = 0
+    needs_context = {
+        "output_schema_version": 3,
+        "verification_status": "needs_context",
+        "verification_report": {"summary": "", "critical_errors": [], "gaps": []},
+        "verdict": "wrong",
+        "needs_expanded_proofs": [{"id": "aaaaaaaaaaaaaaaa", "reason": "needed"}],
+        "repair_hints": "",
+    }
+
+    def fake(run_id, statement, proof):
+        nonlocal launches
+        launches += 1
+        return needs_context
+
+    with _fake_run(fake):
+        first = _client().post(
+            "/verify", json=_verify_json(statement=_STMT, proof=_PROOF)
+        )
+        second = _client().post(
+            "/verify", json=_verify_json(statement=_STMT, proof=_PROOF)
+        )
+    assert first.status_code == second.status_code == 200
+    assert second.headers[service.SCHEDULER_SOURCE_HEADER] == "cache_hit"
+    assert launches == 1
+
+
+def test_invalid_completed_result_fails_and_is_never_cached():
+    launches = 0
+    invalid = dict(_CANNED_OK, verdict="wrong")
+
+    def fake(run_id, statement, proof):
+        nonlocal launches
+        launches += 1
+        return invalid
+
+    with _fake_run(fake):
+        responses = [
+            _client().post(
+                "/verify", json=_verify_json(statement=_STMT, proof=_PROOF)
+            )
+            for _ in range(2)
+        ]
+    assert [response.status_code for response in responses] == [500, 500]
+    assert all(
+        response.headers[service.SCHEDULER_SOURCE_HEADER] == "launched"
+        for response in responses
+    )
+    assert launches == 2
+
+
+def test_scheduler_snapshot_is_read_only_and_has_no_request_keys():
+    response = _client().get("/scheduler")
+    assert response.status_code == 200
+    body = response.json()
+    assert set(body) == {
+        "schema_version",
+        "instance_nonce",
+        "paid_concurrency_limit",
+        "running",
+        "distinct_queue_depth",
+        "active_keys",
+        "waiting_clients",
+        "cache_entries",
+        "cache_bytes",
+        "limits",
+        "counters",
+    }
+    assert body["instance_nonce"] == service.VERIFY_INSTANCE_NONCE
+    assert body["paid_concurrency_limit"] == 1
+    assert "running_key" not in body and "queued_keys" not in body
+    assert _STMT not in json.dumps(body)
 
 
 def test_verify_reject_verdict_still_200():
@@ -545,7 +845,6 @@ def test_verify_rejects_when_preparse_admission_is_full(monkeypatch):
 
 def test_paid_lease_survives_asgi_cancellation_until_sync_job_terminal(monkeypatch):
     """A disconnected caller cannot free capacity while its paid job runs."""
-    paid_slots = threading.BoundedSemaphore(1)
     entered = threading.Event()
     release = threading.Event()
     finished = threading.Event()
@@ -557,7 +856,6 @@ def test_paid_lease_survives_asgi_cancellation_until_sync_job_terminal(monkeypat
         finished.set()
         return _CANNED_OK
 
-    monkeypatch.setattr(service, "_PAID_JOB_SLOTS", paid_slots)
     monkeypatch.setattr(service, "require_gateway_runtime", lambda: None)
     monkeypatch.setattr(
         service,
@@ -600,19 +898,27 @@ def test_paid_lease_survives_asgi_cancellation_until_sync_job_terminal(monkeypat
         assert await asyncio.to_thread(entered.wait, 2)
         first.cancel()  # model an ASGI/client cancellation after paid work began
 
-        second = await asyncio.to_thread(
+        # An exact duplicate joins the still-owned paid flight.  Cancellation of
+        # the ASGI task must neither launch again nor release the paid slot.
+        second_task = asyncio.create_task(asyncio.to_thread(
             lambda: _client().post(
                 "/verify", json=_verify_json(statement=_STMT, proof=_PROOF)
             )
-        )
-        assert second.status_code == 429
-        assert len(allocations) == 1  # 429 happened before run-dir allocation
+        ))
+        deadline = asyncio.get_running_loop().time() + 2
+        while service._SCHEDULER.snapshot()["waiting_clients"] != 1:
+            assert asyncio.get_running_loop().time() < deadline
+            await asyncio.sleep(0.01)
+        assert len(allocations) == 1
 
         health = await asyncio.to_thread(lambda: _client().get("/health"))
         assert health.status_code == 200
         assert not finished.is_set()
 
         release.set()
+        second = await asyncio.wait_for(second_task, 2)
+        assert second.status_code == 200
+        assert second.headers[service.SCHEDULER_SOURCE_HEADER] == "coalesced"
         try:
             await asyncio.wait_for(first, 2)
         except asyncio.CancelledError:
@@ -625,7 +931,8 @@ def test_paid_lease_survives_asgi_cancellation_until_sync_job_terminal(monkeypat
             )
         )
         assert third.status_code == 200
-        assert len(allocations) == 2
+        assert third.headers[service.SCHEDULER_SOURCE_HEADER] == "cache_hit"
+        assert len(allocations) == 1
 
     try:
         asyncio.run(scenario())

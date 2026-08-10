@@ -30,7 +30,7 @@ public interface). Project dir resolved at call time from `--project` /
 
 ## Gotcha
 
-`CHANNELS` (the 11 kinds) is a **hand-maintained data copy** of `core.GLOBAL_KINDS`
+`CHANNELS` (the 12 kinds) is a **hand-maintained data copy** of `core.GLOBAL_KINDS`
 (the module deliberately imports no core runtime). If `GLOBAL_KINDS` changes,
 re-sync `CHANNELS` by hand.
 

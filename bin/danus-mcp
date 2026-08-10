@@ -7,4 +7,4 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/../scripts/env.sh" >/dev/null 2>&1
 export DANUS_ROLE="${DANUS_ROLE:-main}"
 export DANUS_AUTHOR="${DANUS_AUTHOR:-main_agent}"
-exec "$DANUS_PY" -m danus.gateway "$@"
+exec "$DANUS_PY" -I -B -m danus.gateway "$@"

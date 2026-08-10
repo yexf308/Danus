@@ -33,11 +33,22 @@ re-reads your `OPERATOR.md` and the project's `PROBLEM.md`.
 
 Tell the main agent the problem. It will:
 
-1. **Ask the worker roster** — how many `high` + `xhigh` workers (default
-   `high:3,xhigh:4` = 3 + 4).
+1. **Confirm any roster override** — reasoning-first defaults to
+   `max:2,high:5`: two deep workers become the fixed root and independent critic,
+   and five `high` workers remain dormant observers—not seven simultaneous paid
+   turns and not an automatic rotation/failover pool. Explicit legacy defaults
+   to `high:3,xhigh:4`; an explicit `--roles` overrides either default.
 2. **Write `PROBLEM.md`** — your goal, verbatim, under `runtime/projects/<p>/`.
-3. **Scaffold** — `danus new <p> --roles high:N,xhigh:M` (creates the workers, the
-   empty `global_memory/` + `fact_graph/`).
+3. **Scaffold** — `danus new <p> [--roles ROLE:N,...]` (creates the workers, the
+   empty `global_memory/` + `fact_graph/`, and a durable coordinator). The
+   coordinator admits at most one root and one independent critic. Use
+   `--coordination legacy` only as an explicit compatibility choice.
+
+Each new terminal reasoning-first coordination slot starts a fresh app-server
+thread. Only crash recovery of that same pinned slot resumes its exact thread.
+The 2700-second cap applies to each paid turn, not completion of the whole
+root/critic phase. Legacy `exec` and explicit legacy app-server continuation are
+separate compatibility semantics.
 
 A **project** is the unit of work: one problem, its own memory and fact graph. You
 can run several at once; every operation names a project.
@@ -49,17 +60,59 @@ new state:
 
 1. **Elaborate** — distill the shared stores into a high-signal synthesis (verdict,
    closed routes, dangers, the missing bridge lemmas). *(the `elaboration` skill)*
-2. **Consult** — send that to a strong model. *(the `consult` skill; `gpt_pro`
-   by default, `claude_api`, `claude_code`, or `off`)*
-3. **Assign** — record the reply as `master_guidance` and give each worker its
-   per-round task (`danus assign`).
+2. **Optionally consult** — `off` is the default; `gpt_pro`, `claude_api`, and
+   `claude_code` are explicit opt-ins. *(the `consult` skill)*
+3. **Assign** — record an actual reviewed consult reply as `master_guidance`, or
+   dispatch directly from the elaboration when consult is off. Assign the fixed
+   root/critic lanes (`danus assign`); dormant observers remain unpaid.
 4. **Monitor** — watch `danus status` / the dashboard; repeat when there is new
    state.
 
-Cadence is roughly: a strategy consult every ~2h, a human-readable summary every
-~1h, while your session is active. **When your session is inactive, only the
-workers keep looping** — no auto strategy beats fire (there is no resident cron).
-For unattended operation see `operations.md` (the tmux example).
+Consult and human-summary cadence is event-driven while your session is active,
+not a two-hour timer. When your session is inactive, the worker processes and
+their deterministic admission gate keep running, but no model-generated strategy
+consult or Pro browser action starts automatically. `danus status` distinguishes
+physical `live_processes`, `paid_active`, and `waiting_admission`; do not infer
+model concurrency from the process count. For unattended operation see
+`operations.md` (the tmux example).
+
+As a separate late intervention, the active main agent may write one bounded
+`advisor_checkpoint` only after the coordinator exposes its exact current
+recommendation derived from the fixed root obstruction and independent critic
+confirmation. Broad evidence that routes are blocked, dead-ended, slow,
+expensive, or near exhaustion is insufficient. It may prepare that exact question
+locally, then must stop for the owner's per-question authorization. This is never
+a timer, unattended loop, or cost-gate action, and preparation never opens Chrome or
+transmits. `chatgpt_pro_browser` is not the `gpt_pro` API. A browser import is
+untrusted and cannot be guidance until the main agent reviews, synthesizes, and
+records `adopt`. Adoption or `master_guidance` does not release
+`owner_action_required`: audited owner-only resolution of the exact recommendation
+is required before that generation can resume. The owner runs
+`danus resolve-recommendation` with exact-id and paid-resume acknowledgements;
+adopted guidance must link the same recommendation. Later interventions in the
+same Danus conversation retain a stable context but use a new recommendation,
+prompt/request, and verified local terminal predecessor, with the exact URL
+supplied by file/stdin at prepare and dispatch. Preparation still stops for a
+fresh owner decision; lineage never triggers or inherits Send authority. See
+`browser-advisor.md`.
+
+If a worker crashes while a verification candidate is active and the paid
+outcome cannot be reconstructed, the candidate overlay remains frozen with no
+TTL. After fail-stopping/reconciling the source worker, inspect the exact receipt
+in `danus status <project> --json` and use the owner-only recovery seam:
+
+```bash
+danus resolve-candidate <project> \
+  --receipt <exact-candidate-receipt> \
+  --outcome known-no-promotion \
+  --acknowledge-paid-outcome-unknown
+```
+
+Use `known-no-promotion` only when the bound fact is absent; use
+`abandon-unknown` to accept irreducible ambiguity. Both choices require
+`--acknowledge-paid-outcome-unknown`, preserve the
+unknown paid outcome and audit whether the fact was active at resolution. They
+never call the verifier or infer success from elapsed time.
 
 ## 3. Workers prove; facts accumulate
 

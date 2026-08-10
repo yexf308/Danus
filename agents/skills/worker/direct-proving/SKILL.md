@@ -25,30 +25,38 @@ Read:
 4. If the adapted theorem is only a partial result with extra hypotheses, first analyze why its method needs those hypotheses and where it fails for the current subgoal — do not skip this by merely trying to show the current object satisfies the extra hypotheses and applying the partial result directly.
 5. First attempt to prove all subgoals in that plan directly.
 6. Try to carry the whole plan through before switching into failure diagnosis mode.
-7. For each subgoal, record whether it is:
+7. In local memory, record for each subgoal whether it is:
    - already solved directly
    - partially advanced
    - blocked
-8. If a subgoal is blocked or you get stuck on it, FIRST invoke `$construct-counterexamples` for that subgoal — test whether it is false, too strong, or missing hypotheses (not merely hard). If no counterexample emerges and the subgoal still resists after at least two genuine direct attempts, do not grind indefinitely: record the stuck point as an `obstacle`/`dead_end` finding (`gm_add`) so siblings skip it and the next round's `master_guidance` can bring fresh direction.
+8. If a subgoal is blocked or you get stuck on it, FIRST invoke `$construct-counterexamples` for that subgoal — test whether it is false, too strong, or missing hypotheses (not merely hard). If no counterexample emerges and the subgoal still resists after at least two genuine direct attempts, do not grind indefinitely: keep the subgoal-level details local and include the decisive stuck point in the single consolidated phase checkpoint below.
 9. If a proof adaptation attempt fails, identify why the migration fails. Be concrete: for example, note which hypothesis is missing, which construction does not transfer, which step breaks, which counterexample blocks the migration, or which part of the searched proof depends on structure absent in the current setting.
-10. If a subgoal is solved with a self-contained partial result that the rest of the plan will USE downstream, partial-verify that result with `$verify-proof` in partial-candidate mode before treating it as established. Adopting unverified partial results as building blocks is the single biggest correctness risk; the verifier is the sole authority on whether the partial result really holds.
+10. If a subgoal is solved with a self-contained partial result that the rest of the plan will USE downstream, include that candidate and its complete proof in the consolidated `proof_attempt`, retain the returned global-memory `id`, and partial-verify it with `$verify-proof` using that exact id as `source_id` before treating it as established. Adopting unverified partial results as building blocks is the single biggest correctness risk; the verifier is the sole authority on whether the partial result really holds.
 11. If all subgoals are solved directly AND the partial results that compose into a full proof have each been partial-verified as needed, mark the plan as solved and assemble the proof draft.
 12. If the plan does not fully go through, then identify the key stuck points as concretely as possible.
 13. Focus on locating the decisive failure modes of the plan after this first full attempt, not on polishing a full proof.
 
 ## Output Contract
 
-Publish one record per attempted subgoal to global memory with `gm_add` (kind
-`proof_attempt`): `claim` = the subgoal + its status, `evidence` = the attempt /
-the partial proof if solved, plus these fields:
+In a `reasoning_first_v1` phase, publish **one consolidated record for the whole
+attempted plan**, not one record per subgoal, with `gm_add(kind="proof_attempt")`.
+Use local memory for the per-subgoal scratch history. `claim` is the strongest
+candidate or the plan-level status; `evidence` contains the complete proof of any
+candidate being sent to `fact_submit` plus these fields:
 
 ```json
 {
   "plan_id": "...",
   "attempt_type": "direct",
-  "subgoal": "...",
-  "attempt_summary": "...",
   "status": "solved|partial|stuck",
+  "subgoals": [
+    {
+      "subgoal": "...",
+      "status": "solved|partial|stuck",
+      "attempt_summary": "...",
+      "key_stuck_points": ["..."]
+    }
+  ],
   "used_examples": ["..."],
   "used_counterexamples": ["..."],
   "counterexample_search_for_stuck_subgoal": {
@@ -56,7 +64,7 @@ the partial proof if solved, plus these fields:
     "summary": "...",
     "result": "refuted|not_refuted|inconclusive|not_needed"
   },
-  "key_stuck_points": ["..."],
+  "decisive_stuck_points": ["..."],
   "used_results": ["..."],
   "adapted_from": ["relevant statements or proofs whose ideas were migrated"],
   "migration_failures": ["why a proof adaptation or migration failed"],
@@ -64,16 +72,31 @@ the partial proof if solved, plus these fields:
 }
 ```
 
-Record the plan's updated status (`screening` / `screened` / `solved`) in your
-local memory or as a follow-up `plan` finding.
+In `reasoning_first_v1`, do not self-report the protected generation, lane, or
+slot inside this evidence JSON. The gateway appends exact
+`links.coordination` from the paid slot. A critic confirmation must pass the
+root checkpoint id in the actual tool argument
+`links={"confirms_entry_id":"<exact returned root gm id>"}`; putting that id
+only inside the evidence JSON does not confirm anything. A root omits this link.
+Never supply or overwrite `links.coordination` yourself. Before confirming, the
+critic retrieves the designated record with `gm_get` using that exact id; BM25
+`gm_search` is discovery and cannot substitute for exact review.
+
+Use the returned global-memory `id` as the `source_id` for any `fact_submit` of
+this candidate. Record the plan's updated status (`screening` / `screened` / `solved`)
+in local memory; do not add a second global-memory status record.
 
 ## Tools
 
 - `gm_add` (publish the proof-attempt finding)
+- `gm_get` (exact designated-checkpoint hydration; 16-hex id, unique, 16 KiB cap)
 - `gm_search` (recall examples, counterexamples, dead-ends, and verified facts)
 - `fact_submit` (verify any self-contained partial result before building on it; see `$verify-proof`)
 - `search_arxiv_theorems`
 
 ## Failure Logging
 
-If a decomposition plan does not solve the problem directly after attempting all of its subgoals, publish a `dead_end` finding (`gm_add`) that summarizes the plan-local stuck points and any important proof-migration failures, so siblings skip them.
+If the plan produces no candidate worth verifying, the single consolidated
+record may instead be `dead_end` or `obstacle`. It must summarize the decisive
+failure mechanism and the attempted escape routes. Do not publish both a
+`proof_attempt` and a duplicate `dead_end` for the same phase.

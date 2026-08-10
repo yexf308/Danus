@@ -34,7 +34,7 @@ fact graph      project-shared   fully structured   a VERIFIED fact      YES (on
 A finding flows **left → right**, getting more structured and more trusted:
 
 ```
-local memory  ──(worker auto-publishes a formed claim)──▶  global memory
+local memory  ──(one consolidated shareable phase checkpoint)──▶  global memory
 global memory ──(verifiable=true → send to verifier → fix until correct)──▶  fact graph
 ```
 
@@ -75,10 +75,11 @@ unformed content."
 (BM25), `read(channel)`.
 
 **When a worker writes it.** Continuously, as it works — raw reasoning into
-`notes`, actions into `events`. The moment a thought becomes a *formed claim*
-(a conclusion, an example, a counterexample, a dead end, a direction), the
-worker **auto-publishes** it to **global memory** instead (see §2). Local memory
-keeps only the process, not the shareable findings.
+`notes`, actions into `events`. In `reasoning_first_v1`, intermediate claims,
+searches, and failed micro-steps stay local. An admitted worker publishes at most
+one consolidated shareable result/candidate checkpoint for the phase and, only
+if the line genuinely fails, one consolidated obstruction checkpoint. Global
+memory is a coordination surface, not an automatic transcript.
 
 ---
 
@@ -117,10 +118,18 @@ this one's).
   "links":      { "subgoal": "...", "predecessors": ["<id|fact_id>", "..."] },
   "glossary":   { }                              // symbol → definition introduced with this finding
   // …plus any kind-specific free-form fields (**extra) — e.g. a verification
-  // entry's verdict/fact_id/write_error, or a master_guidance entry's
-  // input_tokens/cost_usd — also flattened at the top level, NOT inside a record.
+  // entry's verdict/fact_id/write_error, or a master_guidance entry's bounded
+  // consult_provenance/input_tokens/cost_usd — also flattened at the top level,
+  // NOT inside a record.
 }
 ```
+
+For reasoning-first worker writes, the gateway injects protected
+`links.coordination` from the paid slot. A model never self-reports or overrides
+generation/lane/slot fields. A critic confirmation supplies only
+`links.confirms_entry_id` with the exact returned root global-memory id. After its
+independent analysis, the designated critic retrieves that record with exact
+`gm_get`, not a BM25 search result.
 
 ### 2.1 Kinds (categorization)
 
@@ -134,9 +143,10 @@ this one's).
 | `dead_end` | usually false | worker | why a path failed; if killed by a counterexample it can be verifiable |
 | `direction` | false | worker | "worth exploring X" — an unverifiable judgment |
 | `obstacle` | false | worker | "X seems to block this route" — an unverifiable judgment |
-| `master_guidance` | false | **main agent (via GPT-5.5-pro)** | the periodic high-intelligence strategic steer: critical decomposition, direction judgment, core thinking. Authoritative — workers heed it (but it is still not a correctness source). |
+| `master_guidance` | false | **main agent (after an actual consult review)** | an optional consulted strategic steer. It is absent when consult is off; workers heed its mathematical direction when present, but it is never a correctness or control source. |
 | `verification` | false | the worker's `fact_submit` (auto) | a trace of a verification outcome: `verification_verdict` records mathematical judgment, while `promoted` / `submission_status` and `fact_id` record whether the graph write completed; `write_error` explains a verified-but-not-promoted or rare promotion-unknown result and `repair_hints` explains rejection. `fact_submit` attempts a durable append; a failure is returned as `trace_error` without hiding a written fact id. Siblings read traces to learn from rejections and failed or ambiguous promotions. |
-| `elaboration` | false | **main agent** | the periodic, high-signal-to-noise progress synthesis the main agent writes before consulting GPT-5.5-pro: mathematical verdict, closed/obsolete routes, interface contracts, dangerous heuristics, missing bridge lemmas (§2.4). It is the *input* prepared for the pro consult; `master_guidance` is pro's *reply*. Same cadence. |
+| `elaboration` | false | **main agent** | an event-driven high-signal synthesis: mathematical verdict, closed/obsolete routes, interface contracts, dangerous heuristics, missing bridge lemmas (§2.4). It drives direct assignment when consult is off and is the input if an API/CLI consult is explicitly selected. |
+| `advisor_checkpoint` | false | **main agent** | a bounded late-intervention summary created only from the exact current coordinator recommendation derived from root obstruction plus independent critic confirmation. Broad blocked/dead-ended evidence alone is insufficient. It records verified fact ids, failed routes with evidence, the unresolved bottleneck, and one candidate decision question; it is not permission to transmit. |
 
 Process-only categories (`branch_states`, `events`) stay in
 **local memory**, not here — they are not findings. `verification_reports` is
@@ -172,24 +182,61 @@ correct — then the gateway attempts its locked context-CAS/add (§3, §4). A
 stale snapshot is not promoted. The verify-and-repair loop operates per-claim on
 the shared store.
 
-### 2.3 master_guidance — the strategic channel
+### 2.3 master_guidance — the optional strategic channel
 
-The main agent operates and schedules N parallel workers. On a fixed cadence
-(e.g. hourly, or whenever all workers finish a round) it consults **GPT-5.5-pro**
-for the most critical decomposition, direction judgment, and core thinking
-(high intelligence, expensive ⇒ periodic, not per-round). It records the result
-as a `master_guidance` entry. Workers read `master_guidance` and follow it as
-authoritative steering. (Consequence for skills, decided later: this concentrates
-the expensive intelligence at the strategic level, shrinking per-worker peer
-consults.)
+New projects default to `reasoning_first_v1` with roster `max:2,high:5`: the
+coordinator pins the two `max` workers as root and independent critic for a
+generation. The five dormant `high` workers wait without a paid turn and are not
+automatically rotated, promoted, or used as failover. Explicit roles override
+this roster; explicit legacy without roles retains `high:3,xhigh:4`. Each
+new terminal coordination slot receives a fresh app-server thread; only crash
+recovery of that same pinned slot resumes its exact thread. The 2700-second cap
+bounds each paid turn, not completion of the whole root/critic phase. Legacy
+`exec` and explicitly legacy app-server continuation remain separate semantics.
+
+On an event with genuinely new shared state, the main agent writes an
+`elaboration`. Strategy consult defaults to `off`, in which case it assigns the
+fixed root/critic from that synthesis without fabricating `master_guidance`.
+`gpt_pro`, `claude_api`, and `claude_code` are explicit attended opt-ins. Only an
+actual reviewed reply is recorded as `master_guidance`. Workers treat it as
+strategic steering, never correctness or control authority.
+
+API/CLI consult replies follow the consult skill's normal recording contract. A
+`chatgpt_pro_browser` completion is different: its receipt stores response
+SHA-256/size and attestations, never page plaintext. `import` requires the owner
+to resupply exact matching bytes and exposes them only transiently as untrusted
+page content with no authorities. The main agent/owner must review and synthesize
+strategy-only text distinct from the raw response, then record the broker's
+explicit `adopt` transition. Only
+that adopted text may be written as `master_guidance`, accompanied by the bounded
+`consult_provenance` receipt validated in `danus.core.schema`, a
+`links.recommendation_id` equal to the exact current coordinator recommendation,
+and binding by the gateway to the same project's actual adopted broker row. For
+the browser transport this receipt requires the exact request, stable context,
+per-intervention recommendation, binding, receipt, prompt, reply, and
+adopted-strategy hashes, `trust="adopted_strategy"`, UI mode `Pro`,
+`billing_basis="subscription"`, and null model/token/cost telemetry. Raw imported
+text is not eligible, and the stored guidance evidence must hash exactly to the
+adopted synthesis. Runtime main/all role is required for `master_guidance` and
+`elaboration`; an author label is not authority. None of this changes the
+FactGraph write gate.
+
+The gateway digest-fences every `gm_add` kind against the same project's raw
+browser reply/clarification digests across claim, evidence, glossary, and links;
+an exact raw scalar cannot be hidden in another global-memory channel. The only
+exempt evidence is an exact adopted synthesis whose full broker provenance has
+already validated. Semantic paraphrase is not string-guessed: trusted main review
+and explicit synthesis remain the authority boundary.
 
 **Operations.** `append(kind, claim, evidence, verifiable, author, links, **extra) -> id`,
 `set_status(id, status, fact_id=None)`, `read(kind)` (entries, status folded),
-`search(query, kinds, limit)` (BM25).
+`get(id)` (exact canonical 16-lowercase-hex id, absent/duplicate rejected,
+serialized result capped at 16 KiB), `search(query, kinds, limit)` (BM25
+discovery). Designated critic review uses `get(id)`; search cannot substitute.
 
-### 2.4 elaboration — the synthesis channel (input to the pro consult)
+### 2.4 elaboration — the synthesis and optional-consult input
 
-On the same cadence as the strategic consult (§2.3), the main agent first writes
+On an event cadence driven by genuinely new state, the main agent writes
 an **elaboration**: a single high-signal-to-noise synthesis of the project's
 current state, read **only from the shared stores** — global memory (findings,
 dead ends, recent verifications) and the fact graph (verified facts, the DAG,
@@ -201,11 +248,54 @@ distance estimates, no process telemetry). The *how* lives in the **`elaboration
 main-agent skill**, not in code.
 
 The elaboration is recorded as an `elaboration` entry (`claim` = the one-line
-verdict, `evidence` = the full templated body, `links` = cited `fact_id`s), then
-handed to GPT-5.5-pro; pro's reply becomes the next `master_guidance` (§2.3).
-Instead of peer workers reviewing each other, the main agent distills the shared
-state and a single high-intelligence model reasons over it. Operationally it is
-also what the main agent draws on to keep the human informed.
+verdict, `evidence` = the full templated body, `links` = cited `fact_id`s). With
+consult off, it drives direct fixed-lane assignment. If a configured API/CLI
+transport is explicitly selected, the exact elaboration becomes its prompt and
+the reviewed reply may become `master_guidance` (§2.3). It is also what the main
+agent draws on to keep the human informed.
+
+### 2.5 advisor_checkpoint — attended late intervention
+
+Only an exact current coordinator recommendation—derived from the pinned root
+obstruction and an independent critic confirmation linked to that exact root
+entry—permits the active main agent to create one bounded
+`advisor_checkpoint`. Broad evidence that routes are blocked, dead-ended, slow,
+expensive, or near exhaustion is insufficient. This is a possible Pro advisor
+question, not a regular strategy beat. It must contain exactly these
+ordered sections: `Verified facts`, `Failed routes and evidence`, `Unresolved
+bottleneck`, and `Candidate decision question`. The whole evidence is at most
+16 KiB, `links.fact_ids` contains at most 12 valid verified fact ids, and no
+worker-local memory or secrets are included.
+
+The gateway enforces that only the runtime `main` authority (not a caller-chosen
+author string) can append this kind, resolves an explicit/pinned project, and
+checks every cited id against the active integrity-validated FactGraph before the
+append. Phantom, revoked, malformed, duplicate, or unscoped ids fail closed.
+
+The main agent may create a durable browser `prepared` receipt only from that
+exact current recommendation and checkpoint, then must stop and ask the owner to
+authorize that exact question.
+Neither a timer, an unattended loop, the cost gate, nor the prepared receipt may
+authorize Chrome or Send. Only the owner's per-question acknowledgement advances
+the broker to `authorized`; import/review/adopt then follows §2.3. None of
+prepare, import, adopt, or `master_guidance` releases a coordinator in
+`owner_action_required`. Resuming the generation requires an audited owner-only
+`resolve-recommendation` exact CAS. The owner must repeat the recommendation id
+and explicitly acknowledge paid reasoning resume. Adopted guidance must link the
+same recommendation; continue-without-advisor also requires no active,
+delivery-ambiguous, or completed-but-unimported browser request. A browser
+conversation may keep its stable `context_id`, but a later intervention always
+uses the new current `recommendation_id`.
+
+### 2.6 Verification-candidate overlay
+
+Reasoning-first verification admission is a project-level live-slot overlay, not
+a global-memory status guess. While a candidate is active, new paid admission is
+frozen. If its durable outcome is `outcome_unknown`, the source worker stops and
+must not retry or resubmit the exact question. The overlay has no TTL and elapsed
+time never implies success or failure. Only the owner-only `resolve-candidate`
+transition, bound to the exact receipt/source slot and checked against FactGraph
+identity, may release it; resolution never re-calls the verifier.
 
 ---
 
@@ -362,7 +452,7 @@ external_refs=[]) -> fact_id`, `get_raw(fact_id)`, `list()`, `search(query, limi
             ┌─────────────── per worker (private) ───────────────┐
  worker  →  │ local memory: notes / events  (rough recall log)    │
             └───────────────────────┬────────────────────────────┘
-                    auto-publish a formed claim
+                    publish one consolidated phase checkpoint
             ┌───────────────────────▼──────────── project-shared ─┐
  all     →  │ global memory: <kind>.jsonl                         │
  workers    │   conclusion/example/counterexample/proof_attempt   │
@@ -403,7 +493,7 @@ gate.
 
 | code (this library — touches the fixed JSONL / fact-graph files) | prose (prompts/skills — agent behavior) |
 | --- | --- |
-| local/global memory: append / read / search (BM25) | when to publish local→global; which `kind`/`verifiable` |
+| local/global memory: append / exact bounded get / read / search (BM25) | when to publish a consolidated local→global checkpoint; which `kind`/`verifiable` |
 | fact node: serialize/parse, `compute_fact_id`, integrity-checked lazy context, atomic add/revoke | proof strategy and repair choices |
 | evidence-required-for-verifiable check; unknown/revoked-predecessor refusal | "global memory is awareness, never a brick — cite `fact_id`" |
 | | "facts must be self-contained; no handwave / chart-position refs" |
@@ -413,19 +503,24 @@ is prose.
 
 ---
 
-## 5. Usage logic (typical round)
+## 5. Usage logic (typical reasoning-first generation)
 
-1. **Main agent**, periodically: consult GPT-5.5-pro → append a `master_guidance`
-   entry to global memory.
-2. **Worker**, each round:
-   - read `master_guidance` + recent global memory (others' findings, dead ends)
-     + relevant fact graph entries; recall own `local memory`.
-   - reason; log raw thoughts/actions to `local memory`.
-   - when a finding forms, auto-publish it to `global memory` with the right
-     `kind` + `verifiable` + evidence.
-   - push `verifiable=true` findings through the verifier; on accept, **promote**
-     to the fact graph and build further work by citing the new `fact_id`.
-   - record dead ends as `dead_end`/`obstacle` so siblings skip them.
+1. **Coordinator:** pin one root and one independent critic; leave observers
+   dormant without paid turns. A new terminal coordination slot gets a fresh
+   app-server thread, and only same-slot crash recovery resumes.
+2. **Main agent, on material new state:** append an `elaboration`; dispatch the
+   fixed lanes directly by default (`off`) or explicitly opt into an API/CLI
+   consult and record only its actual reviewed reply as `master_guidance`.
+3. **Root:** reason deeply within the 2700-second paid-turn cap, keep intermediate
+   work local, and publish one consolidated candidate or obstruction.
+4. **Critic:** first preserve independent analysis. If directed to review a root
+   checkpoint, retrieve its exact 16-hex id with `gm_get` (never a BM25 substitute),
+   then publish one consolidated response. Confirmation uses only
+   `links.confirms_entry_id`; the gateway injects protected coordination links.
+5. **Verification:** submit a consolidated verifiable candidate through
+   `fact_submit`; build further work only on `promoted:true` plus a non-null
+   `fact_id`. On `outcome_unknown`, stop without retry and surface exact owner
+   resolution.
 
 This document is the contract those behaviors are written against. The Python
 implementation lives next to it in `danus/core/` (`local_memory.py`,

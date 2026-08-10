@@ -36,6 +36,39 @@ global planning and coordination, the workers carry out the detailed proof
 search, the verifier is the sole authority on correctness, and the fact graph
 holds every verified result and is the system's only source of truth.
 
+New projects use `reasoning_first_v1` coordination by default. The physical
+roster defaults to `max:2,high:5`: the durable project-wide admission gate pins
+the two `max` workers as deep root and independent critic. The five `high` loops
+stay dormant in `waiting_admission`: they consume no paid round and do not start
+Codex. They are observers, not an automatic rotation or failover pool. Explicit
+`--roles` still overrides the roster. Each admitted paid turn has a 2700-second
+cap; that is not a promise that the whole root/critic phase completes in 2700
+seconds. An active verification candidate temporarily freezes new admission.
+Pass `--coordination legacy` only when the old open-loop behavior is intentionally
+required; legacy without explicit roles retains `high:3,xhigh:4`.
+
+Each new reasoning-first terminal coordination slot starts on a fresh app-server
+thread so the active reasoning context stays bounded. Only crash recovery of
+that same pinned slot resumes its exact thread. Legacy `exec` rounds remain
+fresh processes; explicit legacy app-server projects retain their separately
+documented continuation semantics.
+
+When the root records an exact `obstacle` or `dead_end`, the generation enters
+`critic_obstacle_review`. Normal root/critic admission stops; the same fixed
+critic receives one fresh review-phase thread and independently confirms or
+rejects that exact root entry. Only an exact confirmation can create
+`owner_action_required` and its per-intervention recommendation. An unconfirmed
+terminal review advances to a fresh reasoning generation without Pro advice.
+
+The single verifier remains the mathematical authority, but it is no longer a
+reject-on-busy bottleneck. Distinct submissions wait in a bounded FIFO queue,
+exact in-flight duplicates coalesce, and validated successful replies use a
+nonce-bound bounded cache. An exact already-active fact is reused before any
+verifier call. App-server turns also publish content-free, root-thread-only
+diagnostics for reasoning, tool/control, waiting, memory, retrieval, compaction,
+and token usage. Missing telemetry is reported as unavailable/partial, never as
+zero and never as proof state.
+
 For large graphs, agents do not inject the graph wholesale. They discover facts
 through full-text search that returns statement-only summaries, then hydrate only
 explicit ids. Verification round zero carries the complete candidate proof plus
@@ -66,11 +99,10 @@ toy example — rather than an entire proof. It repeatedly submits the claim wit
 supporting proof and revises it under the verifier's feedback until it passes. The
 gateway then rechecks the exact context under the graph lock and, if still current,
 adds the claim as a fact with the facts its proof depends on as incoming edges.
-The verifier is stateless: a fresh instance
-judges each submission and retains nothing afterwards. Because each worker draws
-on only the facts it needs for its current claim and submits one fact at a time,
-the working context stays small even as the proof grows to many pages — and many
-workers' contributions accumulate into one shared structure.
+The verifier is stateless: a fresh instance judges each submission and retains
+nothing afterwards. Because each admitted terminal phase gets a bounded fresh
+reasoning context and durable progress lives in the shared stores, working
+context stays small even as the proof grows to many pages.
 
 The graph below is the fact graph of a real research run: **3,157 verified facts
 and 8,616 dependency edges**, in dependency chains up to 54 facts deep (nodes
@@ -91,7 +123,7 @@ danus/                 the engine (installable Python package)
   verify/              cold-start mathematical authority behind the write-gate
   execution/           worker swarm: the autonomous per-worker round loop + scaffolding
   orchestration/       lifecycle plus durable human hot-join (`say`/`messages`)
-  strategy/            consult gateway (elaboration → strong model → master_guidance)
+  strategy/            consult gateway + owner-only durable browser-advisor handoff
   integrations/        arXiv theorem search
   observability/       read-only dashboard
   authoring/           shared one-shot isolated-codex driver for the two renderers below
@@ -126,10 +158,32 @@ bash scripts/services.sh up verify
 claude --dangerously-skip-permissions
 ```
 
-Everything runs on your own keys (BYO). Workers and the verifier run on your codex
-backend; the strategy consult runs on a top-tier reasoning model over the `gpt_pro`
-transport (paid), `claude_api` (the Anthropic API, per-token), or `claude_code`
-(your Claude subscription), or `off` to skip it.
+Everything runs on your own keys (BYO). Workers and the verifier run on your
+codex backend. Strategy consult is optional and defaults to `off`; `gpt_pro`
+(paid OpenAI-compatible API), `claude_api` (Anthropic API), and `claude_code`
+(Claude subscription) are explicit opt-ins.
+
+Only an exact current coordinator recommendation—derived from the pinned root
+obstruction and independent critic confirmation—allows the attended main agent
+to record one bounded `advisor_checkpoint` and prepare its exact question.
+General evidence that work is blocked, dead-ended, slow, costly, or near
+exhaustion is insufficient. Preparation then stops for fresh owner
+authorization. For that owner-approved question, `bin/consult-browser` can
+durably hand off to the existing signed-in ChatGPT Pro Chrome skill. This is the explicit
+`chatgpt_pro_browser` path—not the `gpt_pro` API, and not an environment/loop
+transport. Danus never opens Chrome itself; imported page text is untrusted until
+the owner/main agent reviews and adopts strategy-only guidance. See
+[`docs/browser-advisor.md`](docs/browser-advisor.md).
+Import, adoption, or `master_guidance` does not release a coordinator in
+`owner_action_required`. Resuming that generation requires an audited owner-only
+`danus resolve-recommendation` of the exact recommendation, with explicit
+exact-id and paid-resume acknowledgements. Adopted guidance must link the
+recommendation; continuing without guidance fails while its browser request is
+active, delivery-ambiguous, or completed but not imported. Repeated Danus
+interventions may continue the same verified local conversation: the context id
+stays stable, but each uses a new coordinator recommendation, current-evidence
+prompt/request, fresh owner authorization, and one-shot dispatch; the broker
+retains only the predecessor URL hash.
 
 To let the human owner join a running worker's native Codex turn, start that
 worker with the app-server transport and use the durable mailbox:
@@ -163,7 +217,8 @@ CAS serialized under `start`'s `.pid.lock`. It is also refused while a paid
 round is unfinished or has unknown delivery. Resolving an ambiguous paid round
 remains a separate incident decision; reset never retries or abandons it.
 
-For a different failure mode, a multi-hour terminal thread can make 0.147's
+For a different failure mode, same-slot crash recovery—or an explicitly legacy
+app-server project—can make 0.147's
 mandatory full-history `thread/resume` response exceed Danus's 8 MiB JSONL
 ceiling. Danus first checks `thread/read(includeTurns=false)` to attest that the
 thread is inactive, then attempts the configured continuation round. If the

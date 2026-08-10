@@ -27,19 +27,32 @@ verifier) decides; and a result only *exists* once that authority has accepted i
   **steers — it does not do the mathematics.** It sets up projects, runs the
   strategy loop, assigns work, monitors, and drives the report/paper skills. It
   *structurally cannot* fabricate a result (it has no `fact_submit` tool).
-- **The codex workers.** A swarm of autonomous `codex` sessions that actually
-  prove lemmas. Each runs a round loop: it reads its assignment and the shared
-  state, picks proving skills, works, and submits results for verification. Workers
-  run detached and resume from persisted memory, so no single crash loses verified
-  work.
-- **The verifier.** A **cold-start** `codex` judge, started fresh for each check,
+- **The codex workers.** A roster of autonomous proof workers. In the default
+    reasoning-first mode the roster is `max:2,high:5`: durable admission pins
+    the two `max` workers as root and independent critic, while the five `high`
+    loops stay dormant. Dormant loops do not start Codex and are not
+    automatically rotated, promoted, or used as failover. Explicit roles may
+    override the roster; legacy retains its `high:3,xhigh:4` default. Each new
+    terminal coordination slot starts a fresh
+    app-server thread; only crash recovery of that same pinned slot resumes. Each
+    paid turn has a 2700-second cap, which does not promise whole-phase
+    completion. Each admitted worker reads its bounded
+  directive and shared state, reasons deeply, and submits consolidated results;
+  an active candidate freezes new branch admission. An `outcome_unknown`
+  candidate has no TTL or retry path and remains frozen until exact owner
+  resolution.
+- **The verifier.** A **cold-start** `codex` judge, started fresh for each distinct uncached check,
   that is the **sole authority on mathematical correctness**. A `correct` verdict
   authorizes the gateway to recheck the exact context and add under the graph
   mutation lock; a stale snapshot is not written. It is an LLM, not a formal
-  proof assistant — see `security-and-trust.md`.
-- **The strategy consult.** The main agent's high-intelligence step: it distills
-  the project's state (an *elaboration*) and consults a strong reasoning model,
-  whose reply becomes the swarm's steering (`master_guidance`).
+  proof assistant. Exact concurrent requests coalesce behind one paid leader,
+  distinct work queues FIFO, and validated results use a bounded process-local
+  cache; none of these performance paths changes the correctness gate. See
+  `security-and-trust.md`.
+- **The optional strategy consult.** The main agent always distills the project's
+  state (an *elaboration*). It may explicitly opt into a strong reasoning model;
+  only an actual reviewed reply becomes `master_guidance`. The default is off,
+  so the main agent normally dispatches from its own synthesis.
 
 ## The three memory tiers, and the one truth boundary
 
@@ -92,17 +105,33 @@ new state:
 1. **Elaborate** — distill the shared stores into a high-signal synthesis (verdict,
    closed routes, interfaces, dangers, missing bridge lemmas). *(the `elaboration`
    skill)*
-2. **Consult** — send that synthesis to a strong reasoning model. *(the
-   `consult` skill)*
-3. **Record & dispatch** — store the reply verbatim as `master_guidance` and give
-   each worker its per-round assignment (`danus assign`).
+2. **Optionally consult** — a strong reasoning model is an attended explicit
+   opt-in. *(the `consult` skill)*
+3. **Record & dispatch** — store an actual API/CLI reply under the consult
+   contract, or explicitly review/adopt an authorized browser report. When off,
+   dispatch directly from the elaboration. Assign the fixed root/critic lanes
+   (`danus assign`).
 4. **Monitor** — watch progress; repeat when there is genuinely new state.
 
-The consult transport is configurable: **`gpt_pro`** (a paid OpenAI-compatible
-model, the default), **`claude_api`** (the Anthropic API, per-token BYO key),
-**`claude_code`** (your Claude subscription via the Claude Code CLI), or **`off`** (the
-main agent reasons on its own, no spend). Workers and the verifier always run on
-your own codex backend.
+The consult transport defaults to **`off`** (the main agent reasons from its
+synthesis, no consult). **`gpt_pro`** (paid OpenAI-compatible API),
+**`claude_api`** (Anthropic API), and **`claude_code`** (Claude subscription via
+the CLI) are explicit opt-ins. Workers and the verifier always run on your own
+codex backend.
+
+Only the exact current coordinator recommendation, derived from the fixed root
+obstruction and independent critic confirmation, permits the active main agent
+to record a bounded `advisor_checkpoint` and prepare its exact question locally.
+Broad evidence that routes are blocked, dead-ended, slow, costly, or near
+exhaustion is insufficient. It then stops for owner authorization. This
+late `chatgpt_pro_browser` intervention is not the `gpt_pro` API and is never
+timer-, cost-gate-, or unattended-loop-driven. Repository code only records the
+durable handoff; imported page text has no authority until reviewed and adopted
+as strategy. Adoption does not release `owner_action_required`; the owner must
+run the exact `resolve-recommendation` CAS and acknowledge paid reasoning resume.
+Adopted guidance links the exact recommendation; a browser conversation may keep
+its stable context across later interventions, but each intervention binds a new
+recommendation. See `browser-advisor.md`.
 
 ## The lifecycle of a project
 

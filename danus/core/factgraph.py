@@ -29,7 +29,12 @@ from typing import Deque, Dict, Iterator, List, Optional, Set, Tuple
 from . import bm25
 from . import glossary as _glossary
 from ._util import utc_now
-from .schema import Fact, clean_external_refs, compute_fact_id
+from .schema import (
+    Fact,
+    clean_external_refs,
+    compute_fact_id,
+    compute_fact_identity,
+)
 
 _PRED_RE = re.compile(r"^predecessors:\s*\[(.*)\]\s*$")
 _GLOSS_LINE_RE = re.compile(r"^\s{2}([^:]+):\s*(.*)$")
@@ -39,6 +44,7 @@ _GLOSS_LINE_RE = re.compile(r"^\s{2}([^:]+):\s*(.*)$")
 # stricter and accepts only content-addressed ids.
 _SAFE_FACT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _CONTENT_FACT_ID_RE = re.compile(r"^[0-9a-f]{16}$")
+_FULL_FACT_IDENTITY_RE = re.compile(r"^[0-9a-f]{64}$")
 _LINE_BREAK_RE = re.compile(r"[\n\r\v\f\x1c-\x1e\x85\u2028\u2029]")
 FACT_CONTEXT_SCHEMA_VERSION = 1
 VERIFICATION_CONTEXT_SCHEMA_VERSION = 3
@@ -106,6 +112,186 @@ def verification_context_digest(
         allow_nan=False,
     )
     return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def fact_identity_from_verification_context(
+    *,
+    verification_context: Dict[str, object],
+    problem_id: str,
+    predecessors: List[str],
+    glossary_introduces: Dict[str, str],
+    statement: str,
+    proof: str,
+) -> str:
+    """Derive one full fact identity from an authenticated round-zero snapshot.
+
+    This is deliberately pure: callers pass the exact context object returned by
+    :meth:`FactGraph.verification_context`, so candidate admission never takes a
+    second, potentially racy graph snapshot.  Transport-only budget accounting
+    and glossary entries selected solely by ``intuition`` do not affect the
+    semantic identity.
+    """
+
+    if not isinstance(verification_context, dict):
+        raise ValueError("fact_identity_context_error: context must be an object")
+    if not isinstance(problem_id, str) or not problem_id:
+        raise ValueError("fact_identity_context_error: problem_id is invalid")
+    if not isinstance(predecessors, list) or any(
+        not isinstance(item, str) or _CONTENT_FACT_ID_RE.fullmatch(item) is None
+        for item in predecessors
+    ):
+        raise ValueError("fact_identity_context_error: predecessors are invalid")
+    if len(predecessors) != len(set(predecessors)):
+        raise ValueError("fact_identity_context_error: predecessors contain duplicates")
+    if not isinstance(glossary_introduces, dict) or any(
+        not isinstance(term, str) or not isinstance(definition, str)
+        for term, definition in glossary_introduces.items()
+    ):
+        raise ValueError("fact_identity_context_error: definitions are invalid")
+    if not isinstance(statement, str) or not isinstance(proof, str):
+        raise ValueError("fact_identity_context_error: statement/proof are invalid")
+
+    digest = verification_context.get("digest")
+    context_without_digest = {
+        key: value for key, value in verification_context.items() if key != "digest"
+    }
+    if (
+        not isinstance(digest, str)
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None
+        or verification_context_digest(context=context_without_digest) != digest
+    ):
+        raise ValueError("fact_identity_context_error: context digest is invalid")
+
+    scope = verification_context.get("scope")
+    facts = verification_context.get("facts")
+    glossary = verification_context.get("glossary")
+    expected_fact_id = compute_fact_id(
+        problem_id=problem_id,
+        predecessors=predecessors,
+        glossary_introduces=glossary_introduces,
+        statement=statement,
+        proof=proof,
+    )
+    if (
+        verification_context.get("schema_version")
+        != VERIFICATION_CONTEXT_SCHEMA_VERSION
+        or not isinstance(scope, dict)
+        or scope.get("projection") != VERIFICATION_CONTEXT_PROJECTION
+        or scope.get("candidate_fact_id") != expected_fact_id
+        or scope.get("requested_fact_ids") != predecessors
+        or scope.get("predecessor_depth") is not None
+        or scope.get("proof_mode") != "adaptive"
+        or scope.get("include_project_glossary") is not False
+        or scope.get("expansion_round") != 0
+        or scope.get("expanded_proof_ids") != []
+        or verification_context.get("expanded_proofs") != []
+        or verification_context.get("complete") is not True
+        or verification_context.get("truncated") is not False
+        or any(
+            verification_context.get(field) != []
+            for field in (
+                "missing_fact_ids",
+                "revoked_fact_ids",
+                "omitted_fact_ids",
+                "omitted_glossary_terms",
+                "omitted_expanded_proof_ids",
+            )
+        )
+        or not isinstance(facts, list)
+        or not isinstance(glossary, dict)
+        or any(
+            not isinstance(term, str) or not isinstance(definition, str)
+            for term, definition in glossary.items()
+        )
+        or any(term in glossary for term in glossary_introduces)
+    ):
+        raise ValueError(
+            "fact_identity_context_error: context is not an exact complete "
+            "round-zero candidate snapshot"
+        )
+
+    closure_fact_ids = scope.get("closure_fact_ids")
+    if not isinstance(closure_fact_ids, list) or any(
+        not isinstance(item, str) or _CONTENT_FACT_ID_RE.fullmatch(item) is None
+        for item in closure_fact_ids
+    ):
+        raise ValueError("fact_identity_context_error: closure binding is invalid")
+    if len(closure_fact_ids) != len(set(closure_fact_ids)):
+        raise ValueError("fact_identity_context_error: closure binding has duplicates")
+
+    canonical_facts: List[Dict[str, object]] = []
+    semantic_glossary_texts = [
+        statement,
+        proof,
+        *(str(value) for value in glossary_introduces.values()),
+    ]
+    observed_fact_ids: List[str] = []
+    for record in facts:
+        if not isinstance(record, dict) or set(record) != {
+            "fact_id",
+            "statement",
+            "predecessors",
+            "glossary_introduces",
+        }:
+            raise ValueError("fact_identity_context_error: malformed fact-card binding")
+        record_id = record.get("fact_id")
+        record_statement = record.get("statement")
+        record_predecessors = record.get("predecessors")
+        record_glossary = record.get("glossary_introduces")
+        if (
+            not isinstance(record_id, str)
+            or _CONTENT_FACT_ID_RE.fullmatch(record_id) is None
+            or not isinstance(record_statement, str)
+            or not isinstance(record_predecessors, list)
+            or any(
+                not isinstance(item, str) or _CONTENT_FACT_ID_RE.fullmatch(item) is None
+                for item in record_predecessors
+            )
+            or len(record_predecessors) != len(set(record_predecessors))
+            or not isinstance(record_glossary, dict)
+            or any(
+                not isinstance(term, str) or not isinstance(definition, str)
+                for term, definition in record_glossary.items()
+            )
+        ):
+            raise ValueError("fact_identity_context_error: malformed fact-card binding")
+        observed_fact_ids.append(record_id)
+        semantic_glossary_texts.append(record_statement)
+        semantic_glossary_texts.extend(str(value) for value in record_glossary.values())
+        canonical_facts.append(
+            {
+                "fact_id": record_id,
+                "statement": re.sub(r"\s+", " ", record_statement).strip(),
+                "predecessors": sorted(record_predecessors),
+                "glossary_introduces": {
+                    str(term): re.sub(r"\s+", " ", str(definition)).strip()
+                    for term, definition in record_glossary.items()
+                },
+            }
+        )
+    if observed_fact_ids != closure_fact_ids:
+        raise ValueError("fact_identity_context_error: closure/fact binding differs")
+
+    canonical_facts.sort(key=lambda record: str(record["fact_id"]))
+    semantic_glossary = select_referenced_definitions(
+        semantic_glossary_texts,
+        {str(term): str(definition) for term, definition in glossary.items()},
+    )
+    context_bindings = {
+        "schema_version": verification_context["schema_version"],
+        "projection": scope["projection"],
+        "closure_fact_ids": sorted(observed_fact_ids),
+        "facts": canonical_facts,
+    }
+    return compute_fact_identity(
+        problem_id=problem_id,
+        predecessors=sorted(predecessors),
+        glossary_introduces=glossary_introduces,
+        statement=statement,
+        proof=proof,
+        context_bindings=context_bindings,
+        glossary_bindings=semantic_glossary,
+    )
 
 
 def dependency_closure_digest(records: List[Dict[str, object]]) -> str:
@@ -178,7 +364,8 @@ def _proof_of(text: str) -> str:
             continue
         out.append(line)
     intuition_headings = [
-        index for index, line in enumerate(out)
+        index
+        for index, line in enumerate(out)
         if line.strip().lower() == "## intuition"
     ]
     # New files explicitly say whether an intuition section exists. The final
@@ -186,9 +373,9 @@ def _proof_of(text: str) -> str:
     # an earlier ``## intuition`` subsection. Legacy files keep the historical
     # first-heading boundary; files marked false treat every heading as proof.
     if intuition_headings and intuition_flag is True:
-        out = out[:intuition_headings[-1]]
+        out = out[: intuition_headings[-1]]
     elif intuition_headings and intuition_flag is None:
-        out = out[:intuition_headings[0]]
+        out = out[: intuition_headings[0]]
     return "\n".join(out).strip()
 
 
@@ -209,11 +396,20 @@ def serialize_fact(fact: Fact) -> str:
         "glossary_introduces: "
         + json.dumps(dict(sorted(fact.glossary_introduces.items())), ensure_ascii=True)
     )
+    if fact.fact_identity:
+        lines.append(f"fact_identity: {fact.fact_identity}")
     # external_refs: a JSON flow-array on one line (valid YAML, trivially parsed).
     # Always emitted (`[]` when empty), like glossary_introduces.
     lines.append("external_refs: " + json.dumps(fact.external_refs, ensure_ascii=True))
-    lines += ["---", "", "## statement", fact.statement.strip(),
-              "", "## proof", fact.proof.strip()]
+    lines += [
+        "---",
+        "",
+        "## statement",
+        fact.statement.strip(),
+        "",
+        "## proof",
+        fact.proof.strip(),
+    ]
     if fact.intuition.strip():
         lines += ["", "## intuition", fact.intuition.strip()]
     lines.append("")
@@ -231,6 +427,7 @@ def parse_frontmatter(text: str) -> Dict[str, object]:
     preds: List[str] = []
     gloss: Dict[str, str] = {}
     refs: List[Dict[str, object]] = []
+    fact_identity: Optional[str] = None
     in_gloss = False
     lines = text.splitlines()
     for i, line in enumerate(lines):
@@ -248,7 +445,7 @@ def parse_frontmatter(text: str) -> Dict[str, object]:
             in_gloss = False
             continue
         if line.strip().startswith("glossary_introduces:"):
-            payload = line.strip()[len("glossary_introduces:"):].strip()
+            payload = line.strip()[len("glossary_introduces:") :].strip()
             if payload:
                 try:
                     parsed_gloss = json.loads(payload)
@@ -262,11 +459,15 @@ def parse_frontmatter(text: str) -> Dict[str, object]:
             continue
         if line.strip().startswith("external_refs:"):
             in_gloss = False
-            payload = line.strip()[len("external_refs:"):].strip()
+            payload = line.strip()[len("external_refs:") :].strip()
             try:
                 refs = json.loads(payload) if payload else []
             except json.JSONDecodeError:
                 refs = []
+            continue
+        if line.startswith("fact_identity:"):
+            fact_identity = line.split(":", 1)[1].strip()
+            in_gloss = False
             continue
         if in_gloss:
             gm = _GLOSS_LINE_RE.match(line)
@@ -279,6 +480,7 @@ def parse_frontmatter(text: str) -> Dict[str, object]:
         "problem_id": problem_id,
         "predecessors": preds,
         "glossary_introduces": gloss,
+        "fact_identity": fact_identity,
         "external_refs": refs,
     }
 
@@ -443,7 +645,17 @@ class FactGraph:
             return
         problem_id = frontmatter.get("problem_id")
         if recorded_id != fact_id or not isinstance(problem_id, str) or not problem_id:
-            raise ValueError(f"fact_integrity_error: incomplete frontmatter for {fact_id}")
+            raise ValueError(
+                f"fact_integrity_error: incomplete frontmatter for {fact_id}"
+            )
+        recorded_identity = frontmatter.get("fact_identity")
+        if recorded_identity is not None and (
+            not isinstance(recorded_identity, str)
+            or _FULL_FACT_IDENTITY_RE.fullmatch(recorded_identity) is None
+        ):
+            raise ValueError(
+                f"fact_integrity_error: invalid full fact identity for {fact_id}"
+            )
         expected = compute_fact_id(
             problem_id=problem_id,
             predecessors=frontmatter["predecessors"],  # type: ignore[arg-type]
@@ -506,7 +718,9 @@ class FactGraph:
         try:
             payload = json.loads(self.pending_add_path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError) as exc:
-            raise ValueError("fact_graph_recovery_error: unreadable pending add") from exc
+            raise ValueError(
+                "fact_graph_recovery_error: unreadable pending add"
+            ) from exc
         if not isinstance(payload, dict):
             raise ValueError("fact_graph_recovery_error: malformed pending add")
         fact_id = payload.get("fact_id")
@@ -541,9 +755,7 @@ class FactGraph:
                 and not isinstance(payload.get("previous_glossary_text"), str)
             )
             or not isinstance(payload.get("expected_fact_sha256"), str)
-            or not re.fullmatch(
-                r"[0-9a-f]{64}", str(payload["expected_fact_sha256"])
-            )
+            or not re.fullmatch(r"[0-9a-f]{64}", str(payload["expected_fact_sha256"]))
             or (
                 payload.get("expected_glossary_sha256") is not None
                 and (
@@ -581,9 +793,7 @@ class FactGraph:
             or not isinstance(payload.get("fact_id"), str)
             or not _CONTENT_FACT_ID_RE.fullmatch(str(payload["fact_id"]))
             or not isinstance(payload.get("expected_fact_sha256"), str)
-            or not re.fullmatch(
-                r"[0-9a-f]{64}", str(payload["expected_fact_sha256"])
-            )
+            or not re.fullmatch(r"[0-9a-f]{64}", str(payload["expected_fact_sha256"]))
             or (
                 payload.get("expected_glossary_sha256") is not None
                 and (
@@ -620,9 +830,7 @@ class FactGraph:
             or not isinstance(payload.get("fact_id"), str)
             or not _CONTENT_FACT_ID_RE.fullmatch(str(payload["fact_id"]))
         ):
-            raise ValueError(
-                "fact_graph_recovery_error: malformed add rollback marker"
-            )
+            raise ValueError("fact_graph_recovery_error: malformed add rollback marker")
         return payload
 
     @staticmethod
@@ -743,7 +951,10 @@ class FactGraph:
             fact_id = str(committed["fact_id"])
             fact_path = self._path(fact_id)
             raw_bytes = fact_path.read_bytes()
-            if hashlib.sha256(raw_bytes).hexdigest() != committed["expected_fact_sha256"]:
+            if (
+                hashlib.sha256(raw_bytes).hexdigest()
+                != committed["expected_fact_sha256"]
+            ):
                 raise ValueError("committed fact bytes do not match marker")
             raw = raw_bytes.decode("utf-8")
             self._validate_fact_integrity(fact_id, raw, parse_frontmatter(raw))
@@ -751,7 +962,9 @@ class FactGraph:
             expected_glossary_sha256 = committed["expected_glossary_sha256"]
             if expected_glossary_sha256 is None:
                 if self.glossary_path.exists():
-                    raise ValueError("committed glossary existence does not match marker")
+                    raise ValueError(
+                        "committed glossary existence does not match marker"
+                    )
             else:
                 glossary_bytes = self.glossary_path.read_bytes()
                 if (
@@ -807,6 +1020,243 @@ class FactGraph:
     def _recover_pending_transactions_unlocked(self) -> Optional[Dict[str, object]]:
         self._rollback_pending_add_unlocked()
         return self._resume_pending_revocation_unlocked()
+
+    def _canonical_fact_identity_unlocked(
+        self,
+        *,
+        problem_id: str,
+        predecessors: List[str],
+        glossary_introduces: Dict[str, str],
+        statement: str,
+        proof: str,
+        fact_id: str,
+    ) -> str:
+        """Bind a candidate to one complete authenticated dependency snapshot."""
+
+        stable_predecessors = sorted(predecessors)
+        context = self._verification_context_unlocked(
+            stable_predecessors,
+            max_chars=None,
+            candidate_fact_id=fact_id,
+            expanded_proof_ids=[],
+            expansion_round=0,
+            expanded_proof_max_chars=None,
+            glossary_texts=[
+                statement,
+                proof,
+                *(str(value) for value in glossary_introduces.values()),
+            ],
+            glossary_exclude_terms=[str(term) for term in glossary_introduces],
+        )
+        if (
+            context.get("complete") is not True
+            or context.get("truncated") is not False
+            or context.get("missing_fact_ids")
+            or context.get("revoked_fact_ids")
+            or context.get("omitted_fact_ids")
+            or context.get("omitted_glossary_terms")
+            or context.get("omitted_expanded_proof_ids")
+        ):
+            raise ValueError(
+                "fact_identity_context_error: dependency context is not complete"
+            )
+        return fact_identity_from_verification_context(
+            verification_context=context,
+            problem_id=problem_id,
+            predecessors=stable_predecessors,
+            glossary_introduces=glossary_introduces,
+            statement=statement,
+            proof=proof,
+        )
+
+    def _lookup_active_exact_identity_unlocked(
+        self,
+        *,
+        problem_id: str,
+        predecessors: List[str],
+        glossary_introduces: Dict[str, str],
+        statement: str,
+        proof: str,
+        fact_id: str,
+    ) -> Optional[Tuple[str, str]]:
+        """Return the exact short/full identity under the caller's graph lock."""
+
+        raw = self._get_raw_unchecked(fact_id)
+        if raw is None:
+            return None
+        frontmatter = parse_frontmatter(raw)
+        self._validate_fact_integrity(fact_id, raw, frontmatter)
+        existing_problem_id = frontmatter.get("problem_id")
+        existing_predecessors = frontmatter.get("predecessors")
+        existing_glossary = frontmatter.get("glossary_introduces")
+        if (
+            not isinstance(existing_problem_id, str)
+            or not isinstance(existing_predecessors, list)
+            or any(not isinstance(item, str) for item in existing_predecessors)
+            or not isinstance(existing_glossary, dict)
+            or any(
+                not isinstance(term, str) or not isinstance(definition, str)
+                for term, definition in existing_glossary.items()
+            )
+        ):
+            raise ValueError(
+                f"fact_integrity_error: malformed identity fields for {fact_id}"
+            )
+        candidate_identity = self._canonical_fact_identity_unlocked(
+            problem_id=problem_id,
+            predecessors=predecessors,
+            glossary_introduces=glossary_introduces,
+            statement=statement,
+            proof=proof,
+            fact_id=fact_id,
+        )
+        existing_identity = self._canonical_fact_identity_unlocked(
+            problem_id=existing_problem_id,
+            predecessors=existing_predecessors,
+            glossary_introduces=existing_glossary,  # type: ignore[arg-type]
+            statement=statement_of(raw),
+            proof=_proof_of(raw),
+            fact_id=fact_id,
+        )
+        recorded_identity = frontmatter.get("fact_identity")
+        if recorded_identity is not None and recorded_identity != existing_identity:
+            raise ValueError(
+                f"fact_integrity_error: full identity mismatch for {fact_id}"
+            )
+        if candidate_identity != existing_identity:
+            raise ValueError(
+                "fact_identity_collision: short fact_id "
+                f"{fact_id} maps to a different full identity"
+            )
+        return fact_id, existing_identity
+
+    def _active_fact_identity_unlocked(self, fact_id: str) -> Optional[str]:
+        """Return one active fact's authenticated full identity under graph lock."""
+
+        if (
+            not isinstance(fact_id, str)
+            or _CONTENT_FACT_ID_RE.fullmatch(fact_id) is None
+        ):
+            raise ValueError("fact_id must be a 16-hex content identity")
+        raw = self._get_raw_unchecked(fact_id)
+        if raw is None:
+            return None
+        frontmatter = parse_frontmatter(raw)
+        self._validate_fact_integrity(fact_id, raw, frontmatter)
+        problem_id = frontmatter.get("problem_id")
+        predecessors = frontmatter.get("predecessors")
+        glossary_introduces = frontmatter.get("glossary_introduces")
+        if (
+            not isinstance(problem_id, str)
+            or not isinstance(predecessors, list)
+            or any(not isinstance(item, str) for item in predecessors)
+            or not isinstance(glossary_introduces, dict)
+            or any(
+                not isinstance(term, str) or not isinstance(definition, str)
+                for term, definition in glossary_introduces.items()
+            )
+        ):
+            raise ValueError(
+                f"fact_integrity_error: malformed identity fields for {fact_id}"
+            )
+        identity = self._canonical_fact_identity_unlocked(
+            problem_id=problem_id,
+            predecessors=predecessors,
+            glossary_introduces=glossary_introduces,  # type: ignore[arg-type]
+            statement=statement_of(raw),
+            proof=_proof_of(raw),
+            fact_id=fact_id,
+        )
+        recorded_identity = frontmatter.get("fact_identity")
+        if recorded_identity is not None and recorded_identity != identity:
+            raise ValueError(
+                f"fact_integrity_error: full identity mismatch for {fact_id}"
+            )
+        return identity
+
+    def lookup_active_exact_identity(
+        self,
+        *,
+        problem_id: str,
+        statement: str,
+        proof: str,
+        predecessors: Optional[List[str]] = None,
+        glossary_introduces: Optional[Dict[str, str]] = None,
+    ) -> Optional[Tuple[str, str]]:
+        """Return exact short/full identity from one linearizable graph snapshot."""
+
+        with self.locked_active_exact_identity(
+            problem_id=problem_id,
+            statement=statement,
+            proof=proof,
+            predecessors=predecessors,
+            glossary_introduces=glossary_introduces,
+        ) as identity:
+            return identity
+
+    @contextmanager
+    def locked_active_exact_identity(
+        self,
+        *,
+        problem_id: str,
+        statement: str,
+        proof: str,
+        predecessors: Optional[List[str]] = None,
+        glossary_introduces: Optional[Dict[str, str]] = None,
+    ) -> Iterator[Optional[Tuple[str, str]]]:
+        """Yield an exact identity while retaining the shared graph lock."""
+
+        roots = [item for item in (predecessors or []) if item]
+        definitions = dict(glossary_introduces or {})
+        fact_id = compute_fact_id(
+            problem_id=problem_id,
+            predecessors=roots,
+            glossary_introduces=definitions,
+            statement=statement,
+            proof=proof,
+        )
+        with self._snapshot_lock():
+            yield self._lookup_active_exact_identity_unlocked(
+                problem_id=problem_id,
+                predecessors=roots,
+                glossary_introduces=definitions,
+                statement=statement,
+                proof=proof,
+                fact_id=fact_id,
+            )
+
+    def lookup_active_exact(
+        self,
+        *,
+        problem_id: str,
+        statement: str,
+        proof: str,
+        predecessors: Optional[List[str]] = None,
+        glossary_introduces: Optional[Dict[str, str]] = None,
+    ) -> Optional[str]:
+        """Find an exact active fact without mutating graph or fact metadata.
+
+        The active-path test, revocation exclusion, short/full identity check,
+        dependency reads, and integrity validation all occur under one shared
+        graph snapshot.  A revoked or absent candidate returns ``None``.  An
+        active short-id collision fails closed instead of being overwritten.
+        """
+
+        identity = self.lookup_active_exact_identity(
+            problem_id=problem_id,
+            statement=statement,
+            proof=proof,
+            predecessors=predecessors,
+            glossary_introduces=glossary_introduces,
+        )
+        return identity[0] if identity is not None else None
+
+    @contextmanager
+    def locked_active_fact_identity(self, fact_id: str) -> Iterator[Optional[str]]:
+        """Yield an active full identity while retaining the shared graph lock."""
+
+        with self._snapshot_lock():
+            yield self._active_fact_identity_unlocked(fact_id)
 
     # ------------------------------------------------------------------ write
     def add(
@@ -867,11 +1317,17 @@ class FactGraph:
         if not isinstance(statement, str) or not isinstance(proof, str):
             raise ValueError("statement and proof must be strings")
         if any(line.strip().lower() == "## proof" for line in statement.splitlines()):
-            raise ValueError("statement may not contain the reserved '## proof' boundary")
+            raise ValueError(
+                "statement may not contain the reserved '## proof' boundary"
+            )
         if not isinstance(intuition, str):
             raise ValueError("intuition must be a string")
-        if any(line.strip().lower() == "## intuition" for line in intuition.splitlines()):
-            raise ValueError("intuition may not contain the reserved '## intuition' boundary")
+        if any(
+            line.strip().lower() == "## intuition" for line in intuition.splitlines()
+        ):
+            raise ValueError(
+                "intuition may not contain the reserved '## intuition' boundary"
+            )
         predecessors = [p for p in (predecessors or []) if p]
         if len(predecessors) != len(set(predecessors)):
             raise ValueError("duplicate predecessor fact_id")
@@ -881,7 +1337,6 @@ class FactGraph:
             for symbol, definition in glossary_introduces.items()
         ):
             raise ValueError("glossary_introduces must map strings to strings")
-        merged_glossary = self._prepare_glossary_merge(glossary_introduces)
         external_refs = clean_external_refs(external_refs)
         for pid in predecessors:
             if self._revoked_path(pid).exists():
@@ -897,10 +1352,38 @@ class FactGraph:
         )
         if self._revoked_path(fact_id).exists():
             raise ValueError(f"fact_revoked: {fact_id}")
+        existing = self._lookup_active_exact_identity_unlocked(
+            problem_id=problem_id,
+            predecessors=predecessors,
+            glossary_introduces=glossary_introduces,
+            statement=statement,
+            proof=proof,
+            fact_id=fact_id,
+        )
+        if existing is not None:
+            # The full semantic identity deliberately excludes author,
+            # intuition, and mutable bibliography.  Exact active reuse is a
+            # read: never rewrite those fields or perturb the fact mtime.
+            return existing[0]
+        fact_identity = self._canonical_fact_identity_unlocked(
+            problem_id=problem_id,
+            predecessors=predecessors,
+            glossary_introduces=glossary_introduces,
+            statement=statement,
+            proof=proof,
+            fact_id=fact_id,
+        )
+        merged_glossary = self._prepare_glossary_merge(glossary_introduces)
         fact = Fact(
-            fact_id=fact_id, problem_id=problem_id, author=author,
-            predecessors=predecessors, statement=statement, proof=proof,
-            glossary_introduces=glossary_introduces, intuition=intuition,
+            fact_id=fact_id,
+            problem_id=problem_id,
+            author=author,
+            predecessors=predecessors,
+            statement=statement,
+            proof=proof,
+            glossary_introduces=glossary_introduces,
+            intuition=intuition,
+            fact_identity=fact_identity,
             external_refs=external_refs,
         )
         fact_path = self._path(fact_id)
@@ -916,28 +1399,19 @@ class FactGraph:
         previous_fact = self._get_raw_unchecked(fact_id)
         glossary_existed = self.glossary_path.exists()
         previous_glossary_text = (
-            self.glossary_path.read_text(encoding="utf-8")
-            if glossary_existed
-            else None
+            self.glossary_path.read_text(encoding="utf-8") if glossary_existed else None
         )
         if glossary_introduces:
-            expected_glossary_text = json.dumps(
-                dict(sorted(merged_glossary.items())),
-                ensure_ascii=False,
-                indent=2,
-            ) + "\n"
+            expected_glossary_text = (
+                json.dumps(
+                    dict(sorted(merged_glossary.items())),
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n"
+            )
         else:
             expected_glossary_text = previous_glossary_text
-        # Lost-response retries are a normal production path.  If this exact
-        # fact and its exact derived-glossary bytes are already authoritative,
-        # return the content id without opening a second write transaction.  A
-        # redundant rewrite could fail and falsely report non-promotion while
-        # the previously committed fact remains visible.
-        if (
-            previous_fact == serialized
-            and previous_glossary_text == expected_glossary_text
-        ):
-            return fact_id
         transaction_id = uuid.uuid4().hex
         pending_add = {
             "schema_version": 2,
@@ -1067,7 +1541,9 @@ class FactGraph:
             self._recover_pending_transactions_unlocked()
             scope = expected_context.get("scope", {})
             if not isinstance(scope, dict):
-                raise ValueError("verification_context_changed: malformed expected scope")
+                raise ValueError(
+                    "verification_context_changed: malformed expected scope"
+                )
             if (
                 expected_context.get("schema_version")
                 == VERIFICATION_CONTEXT_SCHEMA_VERSION
@@ -1144,7 +1620,9 @@ class FactGraph:
             loaded = json.loads(self.glossary_path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError) as exc:
             if strict:
-                raise ValueError("glossary_integrity_error: project glossary is unreadable") from exc
+                raise ValueError(
+                    "glossary_integrity_error: project glossary is unreadable"
+                ) from exc
             return {}
         if not isinstance(loaded, dict) or any(
             not isinstance(term, str) or not isinstance(definition, str)
@@ -1179,7 +1657,8 @@ class FactGraph:
         current = self._read_project_glossary(strict=True)
         global_definitions = _glossary.global_glossary()
         conflicts = sorted(
-            term for term, definition in new.items()
+            term
+            for term, definition in new.items()
             if (
                 (term in current and current[term] != definition)
                 or (
@@ -1201,9 +1680,7 @@ class FactGraph:
         """Durably replace the derived project glossary under the mutation lock."""
         self._atomic_write_text(
             self.glossary_path,
-            json.dumps(
-                dict(sorted(glossary.items())), ensure_ascii=False, indent=2
-            )
+            json.dumps(dict(sorted(glossary.items())), ensure_ascii=False, indent=2)
             + "\n",
         )
 
@@ -1215,7 +1692,9 @@ class FactGraph:
                 continue
             raw = self._get_raw_unchecked(active_id)
             if raw is None:
-                raise ValueError(f"fact_integrity_error: missing active fact {active_id}")
+                raise ValueError(
+                    f"fact_integrity_error: missing active fact {active_id}"
+                )
             frontmatter = parse_frontmatter(raw)
             self._validate_fact_integrity(active_id, raw, frontmatter)
             local = frontmatter["glossary_introduces"]
@@ -1272,7 +1751,7 @@ class FactGraph:
         project_glossary = self._read_project_glossary(strict=True)
         introduced = set(glossary_introduces or {})
         predecessor_definitions: Dict[str, Set[str]] = {}
-        for predecessor_id in (predecessors or []):
+        for predecessor_id in predecessors or []:
             if self._revoked_path(predecessor_id).exists():
                 raise ValueError(f"predecessor_revoked: {predecessor_id}")
             raw = self._get_raw_unchecked(predecessor_id)
@@ -1356,7 +1835,9 @@ class FactGraph:
         for fid, raw, score in sorted(zip(fids, raws, scores), key=lambda t: -t[2]):
             if score <= 0:
                 break
-            ranked.append({"fact_id": fid, "score": score, "statement": statement_of(raw)})
+            ranked.append(
+                {"fact_id": fid, "score": score, "statement": statement_of(raw)}
+            )
             if len(ranked) >= limit:
                 break
         return ranked
@@ -1432,6 +1913,37 @@ class FactGraph:
                 include_project_glossary=include_project_glossary,
             )
 
+    @contextmanager
+    def locked_context(
+        self,
+        fact_ids: List[str],
+        predecessor_depth: Optional[int] = 0,
+        proof_mode: str = "none",
+        max_chars: Optional[int] = None,
+        glossary_texts: Optional[List[str]] = None,
+        glossary_exclude_terms: Optional[List[str]] = None,
+        include_project_glossary: bool = True,
+    ) -> Iterator[Dict[str, object]]:
+        """Yield a verified context while retaining the shared snapshot lock.
+
+        This narrow transactional seam lets a caller append metadata whose fact
+        links must remain active through the append itself.  Callers must not
+        acquire a FactGraph mutation lock from inside the block.  The supported
+        lock order is FactGraph shared snapshot, then an independent append-only
+        store lock; no GlobalMemory path acquires a FactGraph lock.
+        """
+
+        with self._snapshot_lock():
+            yield self._context_unlocked(
+                fact_ids,
+                predecessor_depth=predecessor_depth,
+                proof_mode=proof_mode,
+                max_chars=max_chars,
+                glossary_texts=glossary_texts,
+                glossary_exclude_terms=glossary_exclude_terms,
+                include_project_glossary=include_project_glossary,
+            )
+
     def _context_unlocked(
         self,
         fact_ids: List[str],
@@ -1451,10 +1963,14 @@ class FactGraph:
         if proof_mode not in ("none", "selected", "all"):
             raise ValueError("proof_mode must be one of: none, selected, all")
         if max_chars is not None and (
-            isinstance(max_chars, bool) or not isinstance(max_chars, int) or max_chars < 0
+            isinstance(max_chars, bool)
+            or not isinstance(max_chars, int)
+            or max_chars < 0
         ):
             raise ValueError("max_chars must be a non-negative integer or None")
-        if not isinstance(fact_ids, list) or any(not isinstance(fid, str) for fid in fact_ids):
+        if not isinstance(fact_ids, list) or any(
+            not isinstance(fid, str) for fid in fact_ids
+        ):
             raise ValueError("fact_ids must be a list of strings")
         if glossary_texts is not None and (
             not isinstance(glossary_texts, list)
@@ -1509,7 +2025,9 @@ class FactGraph:
             if isinstance(local_glossary, dict):
                 local_glossary_terms.update(str(k) for k in local_glossary)
                 glossary_reference_texts.extend(str(v) for v in local_glossary.values())
-            if proof_mode == "all" or (proof_mode == "selected" and fact_id in selected):
+            if proof_mode == "all" or (
+                proof_mode == "selected" and fact_id in selected
+            ):
                 proof_text = _proof_of(raw)
                 record["proof"] = proof_text
                 glossary_reference_texts.append(proof_text)
@@ -1531,9 +2049,11 @@ class FactGraph:
         omitted: List[str] = []
         characters_used = 0
         for index, record in enumerate(records):
-            record_chars = len(json.dumps(
-                record, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-            ))
+            record_chars = len(
+                json.dumps(
+                    record, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                )
+            )
             if max_chars is not None and characters_used + record_chars > max_chars:
                 omitted = [str(item["fact_id"]) for item in records[index:]]
                 break
@@ -1547,13 +2067,18 @@ class FactGraph:
         else:
             for index, term in enumerate(glossary_terms):
                 definition = resolved_glossary[term]
-                glossary_chars = len(json.dumps(
-                    {"term": term, "definition": definition},
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ))
-                if max_chars is not None and characters_used + glossary_chars > max_chars:
+                glossary_chars = len(
+                    json.dumps(
+                        {"term": term, "definition": definition},
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                )
+                if (
+                    max_chars is not None
+                    and characters_used + glossary_chars > max_chars
+                ):
                     omitted_glossary_terms = glossary_terms[index:]
                     break
                 included_glossary[term] = definition
@@ -1631,10 +2156,14 @@ class FactGraph:
         glossary_exclude_terms: Optional[List[str]] = None,
     ) -> Dict[str, object]:
         if max_chars is not None and (
-            isinstance(max_chars, bool) or not isinstance(max_chars, int) or max_chars < 0
+            isinstance(max_chars, bool)
+            or not isinstance(max_chars, int)
+            or max_chars < 0
         ):
             raise ValueError("max_chars must be a non-negative integer or None")
-        if not isinstance(fact_ids, list) or any(not isinstance(fid, str) for fid in fact_ids):
+        if not isinstance(fact_ids, list) or any(
+            not isinstance(fid, str) for fid in fact_ids
+        ):
             raise ValueError("fact_ids must be a list of strings")
         if candidate_fact_id is not None and (
             not isinstance(candidate_fact_id, str)
@@ -1719,7 +2248,9 @@ class FactGraph:
             self._validate_fact_integrity(fact_id, raw, frontmatter)
             predecessors = frontmatter["predecessors"]
             if not isinstance(predecessors, list):
-                raise ValueError(f"fact_integrity_error: invalid predecessors for {fact_id}")
+                raise ValueError(
+                    f"fact_integrity_error: invalid predecessors for {fact_id}"
+                )
             if any(
                 not isinstance(predecessor, str)
                 or not _CONTENT_FACT_ID_RE.fullmatch(predecessor)
@@ -1730,7 +2261,9 @@ class FactGraph:
                 )
             local_glossary = frontmatter["glossary_introduces"]
             if not isinstance(local_glossary, dict):
-                raise ValueError(f"fact_integrity_error: invalid glossary for {fact_id}")
+                raise ValueError(
+                    f"fact_integrity_error: invalid glossary for {fact_id}"
+                )
             record: Dict[str, object] = {
                 "fact_id": fact_id,
                 "statement": statement_of(raw),
@@ -1755,7 +2288,9 @@ class FactGraph:
                 + ", ".join(outside_closure)
             )
         if candidate_fact_id is not None and candidate_fact_id in discovered:
-            raise ValueError("candidate_fact_id must not belong to its ancestor closure")
+            raise ValueError(
+                "candidate_fact_id must not belong to its ancestor closure"
+            )
 
         expanded_set = set(expanded_proof_ids)
         stable_expanded_ids = [fid for fid in closure_order if fid in expanded_set]
@@ -1782,12 +2317,14 @@ class FactGraph:
                     f"fact_integrity_error: expanded fact {fact_id} has an empty proof"
                 )
             proof_record = {"fact_id": fact_id, "proof": proof_text}
-            proof_record_chars = len(json.dumps(
-                proof_record,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ))
+            proof_record_chars = len(
+                json.dumps(
+                    proof_record,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
             if (
                 expanded_proof_max_chars is not None
                 and proof_characters_considered + proof_record_chars
@@ -1813,9 +2350,11 @@ class FactGraph:
         characters_used = 0
 
         for index, record in enumerate(full_records):
-            record_chars = len(json.dumps(
-                record, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-            ))
+            record_chars = len(
+                json.dumps(
+                    record, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                )
+            )
             if max_chars is not None and characters_used + record_chars > max_chars:
                 omitted_fact_ids = [
                     str(item["fact_id"]) for item in full_records[index:]
@@ -1830,19 +2369,20 @@ class FactGraph:
             omitted_glossary_terms = list(all_glossary)
         else:
             for index, proof_record in enumerate(expanded_proof_records):
-                proof_record_chars = len(json.dumps(
-                    proof_record,
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ))
+                proof_record_chars = len(
+                    json.dumps(
+                        proof_record,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                )
                 if (
                     max_chars is not None
                     and characters_used + proof_record_chars > max_chars
                 ):
                     omitted_expanded_proof_ids.extend(
-                        str(item["fact_id"])
-                        for item in expanded_proof_records[index:]
+                        str(item["fact_id"]) for item in expanded_proof_records[index:]
                     )
                     break
                 included_expanded_proofs.append(proof_record)
@@ -1861,12 +2401,14 @@ class FactGraph:
                 glossary_terms = list(all_glossary)
                 for index, term in enumerate(glossary_terms):
                     definition = all_glossary[term]
-                    definition_chars = len(json.dumps(
-                        {"term": term, "definition": definition},
-                        ensure_ascii=False,
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    ))
+                    definition_chars = len(
+                        json.dumps(
+                            {"term": term, "definition": definition},
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                    )
                     if (
                         max_chars is not None
                         and characters_used + definition_chars > max_chars
@@ -1877,9 +2419,7 @@ class FactGraph:
                     characters_used += definition_chars
 
         truncated = bool(
-            omitted_fact_ids
-            or omitted_glossary_terms
-            or omitted_expanded_proof_ids
+            omitted_fact_ids or omitted_glossary_terms or omitted_expanded_proof_ids
         )
         scope: Dict[str, object] = {
             "candidate_fact_id": candidate_fact_id,
@@ -1931,7 +2471,9 @@ class FactGraph:
         raw = self.get_raw(fact_id) or ""
         return parse_frontmatter(raw)["external_refs"]  # type: ignore[return-value]
 
-    def set_external_refs(self, fact_id: str, external_refs: List[Dict[str, object]]) -> List[Dict[str, object]]:
+    def set_external_refs(
+        self, fact_id: str, external_refs: List[Dict[str, object]]
+    ) -> List[Dict[str, object]]:
         """Replace a fact's ``external_refs`` in place — the reference auditor's
         write path. Touches only this mutable frontmatter line; the body and the
         content-addressed ``fact_id`` are unchanged (refs are not hashed). Returns
@@ -1950,10 +2492,14 @@ class FactGraph:
         new_line = "external_refs: " + json.dumps(refs, ensure_ascii=False)
         lines = p.read_text(encoding="utf-8").splitlines()
         # frontmatter is between the first '---' (line 0) and the next '---'
-        close = next((i for i in range(1, len(lines)) if lines[i].strip() == "---"), None)
+        close = next(
+            (i for i in range(1, len(lines)) if lines[i].strip() == "---"), None
+        )
         if close is None:
             raise ValueError(f"malformed fact file (no frontmatter close): {fact_id}")
-        idx = next((i for i in range(1, close) if lines[i].startswith("external_refs:")), None)
+        idx = next(
+            (i for i in range(1, close) if lines[i].startswith("external_refs:")), None
+        )
         if idx is not None:
             lines[idx] = new_line
         else:
@@ -1977,9 +2523,7 @@ class FactGraph:
         # filesystem I/O (and holding the mutation lock for that entire time
         # when called by ``revoke``).
         reverse_edges: Dict[str, List[str]] = {}
-        for active_id in (
-            self._list_unchecked() if active_ids is None else active_ids
-        ):
+        for active_id in self._list_unchecked() if active_ids is None else active_ids:
             raw = self._get_raw_unchecked(active_id)
             if raw is None:
                 # A read-only caller can race a cross-process revoke between the
@@ -2038,7 +2582,7 @@ class FactGraph:
         defined = _glossary.global_terms()  # universal notation, all projects
         defined |= set(self._read_project_glossary(strict=False))
         defined |= set(glossary_introduces or {})
-        for pid in (predecessors or []):
+        for pid in predecessors or []:
             raw = self._get_raw_unchecked(pid)
             if raw:
                 defined |= set(parse_frontmatter(raw)["glossary_introduces"])  # type: ignore[arg-type]
@@ -2059,9 +2603,7 @@ class FactGraph:
                 "fact_graph_recovery_error: unreadable pending revocation"
             ) from exc
         if not isinstance(payload, dict):
-            raise ValueError(
-                "fact_graph_recovery_error: malformed pending revocation"
-            )
+            raise ValueError("fact_graph_recovery_error: malformed pending revocation")
         root_id = payload.get("root_fact_id")
         fact_ids = payload.get("fact_ids")
         if (
@@ -2080,9 +2622,7 @@ class FactGraph:
                 for item in fact_ids
             )
         ):
-            raise ValueError(
-                "fact_graph_recovery_error: malformed pending revocation"
-            )
+            raise ValueError("fact_graph_recovery_error: malformed pending revocation")
         return payload
 
     def _read_revocation_log_strict(self) -> List[Dict[str, object]]:

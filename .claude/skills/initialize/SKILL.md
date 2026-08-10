@@ -39,11 +39,15 @@ clicks; put the recommended option first):
   - *OpenAI-compatible API key* (recommended): the key you place in
     `config/codex.env` — works immediately, no login.
   - *My own ChatGPT subscription*: device-code login.
-- **strategy consults transport** (the periodic high-intelligence steer) —
-  - *Paid OpenAI-compatible API key* (`gpt_pro`, recommended): a Responses endpoint.
+- **optional strategy consult transport** (used only at a genuine strategic event) —
+  - *Off* (`off`, recommended): you reason from the durable synthesis; no external consult.
+  - *Paid OpenAI-compatible API key* (`gpt_pro`): a Responses endpoint.
   - *Anthropic API key* (`claude_api`): the native Anthropic API, per-token.
   - *Claude subscription* (`claude_code`): the Claude Code CLI's login; no separate key.
-  - *Off*: you reason on your own; no external consults.
+
+Do not offer `chatgpt_pro_browser` as this environment choice. It is available
+later only after the coordinator emits an exact current recommendation and the
+owner authorizes that exact Chrome question; `gpt_pro` here remains the paid API.
 
 Then ask, as plain text questions (not the popup):
 - How to address them (name), and their **language** (default English) — this sets

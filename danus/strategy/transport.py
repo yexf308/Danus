@@ -1,7 +1,8 @@
 """Consult transports — the abstract gateway + the OpenAI-compatible API impl.
 
 A ``Transport`` takes a prompt and returns a uniform JSON envelope (see
-``shape_envelope``). ``GptProTransport`` is the default: it drives an
+``shape_envelope``). The configured default is ``off``. When explicitly
+selected, ``GptProTransport`` drives an
 OpenAI-compatible **Responses** API in ``background=True, stream=True`` mode
 (required — a synchronous xhigh call hangs the proxy) and steps its params down
 only on a 400. ``OffTransport`` short-circuits to a disabled result.
@@ -84,6 +85,7 @@ def shape_envelope(
         "seconds": round(seconds, 1),
         "usage": {"input": in_tok, "output": out_tok, "reasoning": reasoning_tok},
         "cost_usd": round(cost, 4),
+        "billing_basis": "metered_api",
         "tool_calls": tool_calls,
         "reasoning_summary": "\n\n---\n\n".join(summaries),
         "reply": output_text,
@@ -123,6 +125,7 @@ class OffTransport(Transport):
             "seconds": 0.0,
             "usage": {"input": 0, "output": 0, "reasoning": None},
             "cost_usd": 0.0,
+            "billing_basis": "disabled",
             "tool_calls": [],
             "reasoning_summary": "",
             "reply": "",
@@ -347,6 +350,7 @@ class ClaudeCodeTransport(Transport):
                       "output": out_tok,
                       "reasoning": None},
             "cost_usd": cost,  # tokens × per-1M rate (DANUS_CONSULT_CLAUDE_CODE_PRICE_IN/_OUT)
+            "billing_basis": "subscription_estimate",
             "tool_calls": ["web_search"] * int(web_searches or 0),
             "reasoning_summary": "",
             "reply": reply,
@@ -622,6 +626,7 @@ class ClaudeApiTransport(Transport):
                     "seconds": round(seconds, 1),
                     "usage": {"input": in_tok, "output": out_tok, "reasoning": None},
                     "cost_usd": cost,  # REAL usage × per-1M rate (DANUS_CONSULT_CLAUDE_API_PRICE_IN/_OUT)
+                    "billing_basis": "metered_api",
                     "tool_calls": calls,
                     "reasoning_summary": "\n\n---\n\n".join(thinks),
                     "reply": "".join(texts).strip(),

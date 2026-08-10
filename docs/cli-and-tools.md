@@ -20,27 +20,42 @@ there is no default project.
 
 | verb | form | what it does |
 |---|---|---|
-| `list` | `danus list [--json]` | all projects + live worker counts + model |
-| `new` | `danus new <project> [--roles high:3,xhigh:4] [--model M]` | scaffold a project + worker dirs; default roster 3 `high` + 4 `xhigh` |
+| `list` | `danus list [--json]` | all projects + physical liveness and reasoning-first paid/waiting counts |
+| `new` | `danus new <project> [--roles ROLES] [--model M] [--coordination reasoning-first\|legacy]` | scaffold a project + worker dirs; reasoning-first defaults to two `max` root/critic workers plus five dormant `high` observers, while explicit legacy defaults to `high:3,xhigh:4` |
 | `assign` | `danus assign <project>/<worker> (--task "…" \| --file P \| --stdin)` | write that worker's per-round `TASK.md` (**replaces**, not appends) |
-| `say` | `danus say <project>/<worker> (--text "…" \| --file P \| --stdin)` | durably hot-join owner guidance into the exact active app-server turn |
-| `messages` | `danus messages <project>[/<worker>] [--json]` | inspect human-message delivery receipts |
-| `interrupt-turn` | `danus interrupt-turn <project>/<worker>` | explicit owner-only active-turn interrupt |
+| `say` | `danus say <project>/<worker> (--text "…" \| --file P \| --stdin) [--client-id ID] [--fallback queue\|fail]` | durably hot-join owner guidance into the exact active app-server turn; fallback defaults to `queue` |
+| `messages` | `danus messages <project>[/<worker>] [--limit N] [--json]` | inspect human-message delivery receipts |
+| `interrupt-turn` | `danus interrupt-turn <project>/<worker> [--client-id ID]` | explicit owner-only active-turn interrupt |
 | `cancel-prepared-intent` | `danus cancel-prepared-intent <project>/<worker> --thread-id ID --client-id ID --reason TEXT` | exact-CAS cancellation of an authoritatively unspent prepared intent under the worker lifecycle lock; append-only receipt, then reset/rotate separately |
 | `abandon-intent` | `danus abandon-intent <project>/<worker> --thread-id ID --client-id ID --expected-state STATE --reason TEXT --acknowledge-paid-outcome-unknown` | fail-stopped exact-CAS of one unreconcilable paid outcome; append-only risk receipt, no retry/deletion, and old-thread dispatch remains fenced until reset/rotation |
+| `resolve-candidate` | `danus resolve-candidate <project> --receipt ID --outcome known-no-promotion\|abandon-unknown --acknowledge-paid-outcome-unknown` | explicitly reconcile an `outcome_unknown` reasoning-first verification candidate; explicit unknown-outcome acknowledgement is required for either resolution; checks the bound FactGraph identity under lock, writes an owner audit, and never retries verification |
+| `resolve-recommendation` | `danus resolve-recommendation <project> --recommendation-id ID --resolution adopted-master-guidance\|continue-without-advisor --acknowledge-recommendation-id ID --acknowledge-resume-paid-reasoning [--master-guidance-entry-id ID]` | exact owner CAS that closes the current reviewed recommendation and starts a fresh paid generation; adopted guidance must link the exact recommendation, while continue-without-advisor requires no live/ambiguous/unreleased browser request |
 | `reset-thread` | `danus reset-thread <project>/<worker> --expected-thread-id ID` | CAS-fenced reset of a server-deleted thread mapping; fail closed for a live/busy worker and share `start`'s `.pid.lock` |
 | `rotate-thread` | `danus rotate-thread <project>/<worker> --expected-thread-id ID --reason TEXT` | explicitly accept terminal conversation-context loss after bounded resume failure; fail closed for a live/busy worker, share `start`'s `.pid.lock`, and preserve research stores |
 | `finalize` | `danus finalize <project> [--paper <paper_id>] [<fact_id> …]` | record the approved target theorem(s) in the paper's `TARGET.md` (what write-paper reads; default paper → `<project>/TARGET.md`, a non-default `--paper` → `<project>/papers/<paper_id>/TARGET.md`). **With no id:** print candidate terminal facts as suggestions (writes nothing) |
-| `start` | `danus start <project>[/<worker>]` | launch the autonomous worker loop(s) |
-| `status` | `danus status <project>[/<worker>] [--json]` | per-worker liveness + round + last activity (`stuck?` is a soft signal) |
+| `start` | `danus start <project>[/<worker>]` | launch the autonomous worker loop(s); a live loop is not necessarily a paid model turn |
+| `status` | `danus status <project>[/<worker>] [--json]` | liveness, round, lane/generation, paid-active vs waiting admission, candidate/recovery state, and last-turn telemetry |
 | `stop` | `danus stop <project>[/<worker>] [--force]` | graceful (finish the round, exit at the boundary) or `--force` (durably request the worker to interrupt its active turn/direct child and exit) |
 
 Notes:
+- In reasoning-first JSON status, `advisor_reachable` is only the structural
+  fact that the roster has an independent critic and can eventually produce an
+  advisor recommendation. It does not mean one exists or may be prepared.
+  `advisor_recommendation_present` means the current generation has a durable
+  exact recommendation; `advisor_recommendation_ready` additionally means its
+  review and every paid slot in that generation are terminal and the exact open
+  gate currently passes. Browser prepare requires the exact ready
+  recommendation id, not merely `advisor_reachable=true`.
 - `finalize` only **records** the answer; it does not stop workers. Deciding a
   verified fact is *the answer* is your call (the main agent surfaces it).
 - `start` launches each worker detached in its own process group, so it survives
   your session. `stop --force` does not signal an externally inspected numeric
   PID; the worker owns and stops its in-flight direct child itself.
+- Reasoning telemetry in `status --json` is content-free, root-thread-only, and
+  diagnostic. Missing data is `unavailable`/`partial`, never inferred as zero and
+  never used as proof state or browser authority.
+- An `outcome_unknown` candidate has no TTL. Do not retry or resubmit it; use the
+  exact owner-only `resolve-candidate` command after inspecting its receipt.
 
 ---
 
@@ -49,11 +64,12 @@ Notes:
 The gateway is **role-gated**: what a caller can see depends on `DANUS_ROLE`. The
 main agent runs as `role=main`.
 
-**The seven tools** (a trailing `?` marks an optional argument):
+**The eight tools** (a trailing `?` marks an optional argument):
 
 | tool | args | what it does |
 |---|---|---|
-| `gm_add` | `kind, claim, evidence, verifiable?, glossary?, links?, project?` | publish a finding to shared global memory |
+| `gm_add` | `kind, claim, evidence, verifiable?, glossary?, links?, consult_provenance?, input_tokens?, output_tokens?, cost_usd?, project?` | publish a finding to shared global memory; consult metadata is master-guidance-only, and browser provenance is accepted only after explicit adoption |
+| `gm_get` | `entry_id, project?` | retrieve exactly one global-memory record by its canonical 16-lowercase-hex id; absent/duplicate ids fail, serialized output is capped at 16 KiB; designated critic review must use this rather than BM25 search |
 | `gm_search` | `query, kinds?, limit_per_kind?, project?` | search global-memory findings |
 | `fact_submit` | `statement, proof, predecessors?, glossary_introduces?, intuition?, source_id?, external_refs?` | **the write-gate** — after `correct`, recheck the exact context and add under the graph lock; `promoted` + non-null `fact_id` mean publication, while a write failure preserves the correct `verification_verdict` but returns `promoted: false` + `write_error`; audit-trace failures never hide a written fact id |
 | `fact_search` | `query, limit?, project?` | full-text BM25 discovery whose result payload contains statement summaries only |
@@ -65,8 +81,8 @@ main agent runs as `role=main`.
 
 | role | tools |
 |---|---|
-| **worker** | `gm_add`, `gm_search`, `fact_submit`, `fact_search`, `fact_context`, `search_arxiv_theorems` |
-| **main** | `gm_add`, `gm_search`, `fact_search`, `fact_context`, `fact_revoke`, `search_arxiv_theorems` (**no `fact_submit`**) |
+| **worker** | `gm_add`, `gm_get`, `gm_search`, `fact_submit`, `fact_search`, `fact_context`, `search_arxiv_theorems` |
+| **main** | `gm_add`, `gm_get`, `gm_search`, `fact_search`, `fact_context`, `fact_revoke`, `search_arxiv_theorems` (**no `fact_submit`**) |
 | **verifier** (the fact-checking verifier behind `fact_submit`) | `search_arxiv_theorems` only (read-only) |
 
 The main agent thus **cannot write a fact** and **cannot** even see `fact_submit`;
@@ -129,6 +145,48 @@ The main agent also has Claude Code **skills** under `.claude/skills/`:
 `consult` (the strategy consult), `human-summary`, and `write-paper`. These
 orchestrate the tools and CLI above; see `operating-guide.md` for how they fit the
 lifecycle.
+
+### Owner-only ChatGPT Pro browser advisor
+
+`bin/consult-browser` is a durable receipt CLI for an owner-controlled
+`query-chatgpt-pro` Chrome skill. It never opens or controls Chrome, calls an API,
+or invokes a model. Its verbs are:
+
+`prepare`, `authorize`, `dispatch-started`, `submitted`, `complete`,
+`needs-input`, `import`, `adopt`, `recover`, `fail-not-submitted`, `abandon`, and
+`status`.
+
+Only an exact current coordinator recommendation derived from the fixed root
+obstruction and independent critic confirmation permits the attended main agent
+to write one matching bounded `advisor_checkpoint` and call `prepare`. Broad
+blocked/dead-ended/slow/costly evidence alone is insufficient. It must then stop
+for owner authorization of that exact question. No timer, unattended loop, or
+cost gate may trigger or advance it. Reasoning-first `prepare` requires both a
+stable conversation `--context-id` and the exact current per-intervention
+`--recommendation-id`, plus the immutable checkpoint's exact
+`--checkpoint-id`, `--checkpoint-sha256`, and `--checkpoint-bytes`; generic
+prepare spells these `--browser-context-id`, `--browser-recommendation-id`,
+`--browser-checkpoint-id`, `--browser-checkpoint-sha256`, and
+`--browser-checkpoint-bytes`. The prompt bytes must equal the checkpoint
+`evidence` bytes. Import/adopt does not
+unlock `owner_action_required`; run the audited `resolve-recommendation` verb
+with exact-id and paid-resume acknowledgements before generation work resumes.
+
+Run `bin/consult-browser <verb> --help` for the exact mandatory arguments, and
+follow `browser-advisor.md` for the required ordering, exit codes, no-resend
+recovery, hashed URL handling, and imported-versus-adopted trust boundary. The
+older `gpt_pro` consult name is still the paid API. The browser path is selected
+only by an explicit per-question owner invocation; it is not a valid automatic
+`DANUS_CONSULT_TRANSPORT` mode. Supply conversation URLs through the documented
+file/stdin flags, not argv. Completion stores response digest/size only; `import`
+requires the exact response again via `--response-file` or `--response-stdin`.
+For a verified same-Danus conversation follow-up, prepare a new dynamic prompt
+with `--predecessor-request-id` plus
+`--predecessor-conversation-url-file|--predecessor-conversation-url-stdin`, then
+stop for fresh owner authorization. The fresh `dispatch-started` must resupply
+that URL source. Each follow-up keeps the stable context but has a new current
+recommendation, request/hash, and one-shot Send; unknown or
+cross-project/context predecessors fail closed.
 
 ---
 

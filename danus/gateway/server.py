@@ -39,10 +39,12 @@ is testable and reconfigurable:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
 import re
+import sqlite3
 import stat
 import urllib.error
 import urllib.parse
@@ -56,27 +58,62 @@ from danus.core import (
     FactPromotionOutcomeUnknown,
     GlobalMemory,
     VERIFICATION_OUTPUT_PROTOCOL_VERSION,
+    canonical_global_memory_record,
     compute_fact_id,
+    fact_identity_from_verification_context,
     validate_verification_output,
 )
 from danus.integrations import search as _arxiv_search
 from danus.redaction import redact_external_error
+from danus.core.schema import (
+    GLOBAL_KINDS,
+    clean_consult_provenance,
+    validate_advisor_checkpoint,
+)
 
 from .roles import tools_for
 
 _PROJECT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _FACT_ID_RE = re.compile(r"^[0-9a-f]{16}$")
+_COORDINATION_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 _VERIFY_HTTP_ERROR_BODY_MAX_BYTES = 4096
 _VERIFY_HTTP_ERROR_DETAIL_MAX_CHARS = 1024
 _VERIFY_HTTP_SUCCESS_BODY_MAX_BYTES = 8 * 1024 * 1024
 _VERIFY_HEALTH_BODY_MAX_BYTES = 4096
 _VERIFY_HEALTH_TIMEOUT_SECONDS = 10
 _GATEWAY_EXCEPTION_DETAIL_MAX_CHARS = 1024
+_VERIFY_SCHEDULER_METADATA_FIELD = "_danus_gateway_scheduler"
+_VERIFY_SCHEDULER_WAIT_MAX_MS = 2_147_483_647
+_VERIFY_HEALTH_FIELDS = {
+    "status",
+    "pid",
+    "instance_nonce",
+    "output_protocol_version",
+    "verifier_bundle_digest",
+}
+_VERIFY_SCHEDULER_SOURCES = {"launched", "coalesced", "cache_hit", "rejected"}
+_VERIFY_SCHEDULER_REJECTIONS = {
+    "per_key_waiters_full",
+    "total_waiters_full",
+    "distinct_queue_full",
+    "queue_wait_timeout",
+}
+
+
+class _VerifierRequestError(RuntimeError):
+    """Bounded verify transport failure with optional safe scheduler metadata."""
+
+    def __init__(
+        self, message: str, scheduler: Optional[Dict[str, Any]] = None
+    ) -> None:
+        super().__init__(message)
+        self.scheduler = scheduler
 
 
 # --------------------------------------------------------------------------- #
 # config resolution (env read at call time — testable / reconfigurable)       #
 # --------------------------------------------------------------------------- #
+
 
 def _author() -> str:
     return os.environ.get("DANUS_AUTHOR", "unknown")
@@ -103,7 +140,9 @@ def _project(project: Optional[str] = None) -> Path:
     project_dir = os.environ.get("DANUS_PROJECT_DIR", "")
     if project:
         if not agents_root:
-            raise RuntimeError("DANUS_AGENTS_ROOT is not set; cannot resolve a project by name")
+            raise RuntimeError(
+                "DANUS_AGENTS_ROOT is not set; cannot resolve a project by name"
+            )
         if not _PROJECT_NAME_RE.match(project):
             raise RuntimeError(f"invalid project name: {project!r}")
         try:
@@ -186,12 +225,15 @@ def _verify(
     if timeout <= 0:
         timeout = 3600
 
-    # Fail closed before constructing or sending the paid POST.  An old service
-    # exposes only status/pid and is rejected here; a service restart between
-    # GET and POST is caught when the POST echoes this exact bundle digest.
-    bundle_digest = _verify_service_health_preflight(verify_url, timeout=timeout)
+    # Fail closed before constructing or sending the paid POST.  The exact
+    # instance nonce prevents a restart between this GET and the POST from
+    # inheriting the previous process's preflight authorization.
+    instance_nonce, bundle_digest = _verify_service_health_preflight(
+        verify_url, timeout=timeout
+    )
 
     payload: Dict[str, Any] = {
+        "expected_verifier_instance_nonce": instance_nonce,
         "expected_output_protocol_version": VERIFICATION_OUTPUT_PROTOCOL_VERSION,
         "expected_verifier_bundle_digest": bundle_digest,
         "statement": statement,
@@ -210,14 +252,25 @@ def _verify(
             req, timeout=timeout
         ) as resp:
             raw = resp.read(_VERIFY_HTTP_SUCCESS_BODY_MAX_BYTES + 1)
+            scheduler = _parse_verify_scheduler_headers(
+                getattr(resp, "headers", None), allow_rejected=False
+            )
         if len(raw) > _VERIFY_HTTP_SUCCESS_BODY_MAX_BYTES:
             raise RuntimeError("verify service success response is too large")
-        return json.loads(raw.decode("utf-8"))
+        decoded = json.loads(raw.decode("utf-8"))
+        if isinstance(decoded, dict) and scheduler is not None:
+            if _VERIFY_SCHEDULER_METADATA_FIELD in decoded:
+                raise RuntimeError("verify service returned a reserved gateway field")
+            decoded[_VERIFY_SCHEDULER_METADATA_FIELD] = scheduler
+        return decoded
     except urllib.error.HTTPError as exc:
         # FastAPI's bounded string ``detail`` carries actionable preflight errors
         # (for example, one mistyped fact citation).  urllib otherwise discards
         # it and leaves only "Bad Request".  Never persist arbitrary HTML,
         # structured validation input, or an unbounded service response.
+        scheduler = _parse_verify_scheduler_headers(
+            getattr(exc, "headers", None), allow_rejected=True
+        )
         try:
             raw = exc.read(_VERIFY_HTTP_ERROR_BODY_MAX_BYTES + 1)
         finally:
@@ -233,7 +286,9 @@ def _verify(
                 if candidate:
                     detail = candidate[:_VERIFY_HTTP_ERROR_DETAIL_MAX_CHARS]
         suffix = f": {detail}" if detail is not None else ""
-        raise RuntimeError(f"verify service HTTP {exc.code}{suffix}") from exc
+        raise _VerifierRequestError(
+            f"verify service HTTP {exc.code}{suffix}", scheduler=scheduler
+        ) from exc
 
 
 def _verify_health_url(verify_url: str) -> str:
@@ -244,13 +299,13 @@ def _verify_health_url(verify_url: str) -> str:
     if not path.endswith("/verify"):
         raise RuntimeError("DANUS_VERIFY_URL path must end in /verify")
     health_path = path[: -len("/verify")] + "/health"
-    return urllib.parse.urlunsplit(
-        (parsed.scheme, parsed.netloc, health_path, "", "")
-    )
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, health_path, "", ""))
 
 
-def _verify_service_health_preflight(verify_url: str, *, timeout: int) -> str:
-    """Attest service protocol and return its exact import-time bundle digest."""
+def _verify_service_health_preflight(
+    verify_url: str, *, timeout: int
+) -> tuple[str, str]:
+    """Attest one exact service instance; return ``(nonce, bundle_digest)``."""
     request = urllib.request.Request(
         _verify_health_url(verify_url),
         headers={"Accept": "application/json"},
@@ -280,11 +335,18 @@ def _verify_service_health_preflight(verify_url: str, *, timeout: int) -> str:
     if not isinstance(health, dict) or health.get("status") != "ok":
         raise RuntimeError("verify service health did not report status=ok")
 
-    protocol = health.get("output_protocol_version")
-    if (
-        isinstance(protocol, bool)
-        or protocol != VERIFICATION_OUTPUT_PROTOCOL_VERSION
+    pid = health.get("pid")
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        raise RuntimeError("verify service health omitted an exact positive pid")
+    instance_nonce = health.get("instance_nonce")
+    if not isinstance(instance_nonce, str) or not (
+        instance_nonce == "standalone"
+        or re.fullmatch(r"[0-9a-f]{32}", instance_nonce) is not None
     ):
+        raise RuntimeError("verify service health omitted a valid instance nonce")
+
+    protocol = health.get("output_protocol_version")
+    if isinstance(protocol, bool) or protocol != VERIFICATION_OUTPUT_PROTOCOL_VERSION:
         raise RuntimeError(
             "verify service output protocol mismatch: expected "
             f"{VERIFICATION_OUTPUT_PROTOCOL_VERSION}, got {protocol!r}"
@@ -292,7 +354,69 @@ def _verify_service_health_preflight(verify_url: str, *, timeout: int) -> str:
     digest = health.get("verifier_bundle_digest")
     if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
         raise RuntimeError("verify service health omitted a valid bundle digest")
-    return digest
+    if set(health) != _VERIFY_HEALTH_FIELDS:
+        raise RuntimeError("verify service health returned an inexact contract")
+    return instance_nonce, digest
+
+
+def _parse_verify_scheduler_headers(
+    headers: Any, *, allow_rejected: bool
+) -> Optional[Dict[str, Any]]:
+    """Parse only the scheduler's bounded digest/count telemetry headers."""
+
+    if headers is None or not hasattr(headers, "get"):
+        return None
+    source = headers.get("X-Danus-Verify-Scheduler")
+    key = headers.get("X-Danus-Verify-Key")
+    wait = headers.get("X-Danus-Verify-Wait-Ms")
+    rejection = headers.get("X-Danus-Verify-Rejection")
+    if source is None and key is None and wait is None and rejection is None:
+        return None
+    if (
+        source not in _VERIFY_SCHEDULER_SOURCES
+        or (source == "rejected" and not allow_rejected)
+        or not isinstance(key, str)
+        or re.fullmatch(r"[0-9a-f]{64}", key) is None
+        or not isinstance(wait, str)
+        or re.fullmatch(r"0|[1-9][0-9]{0,9}", wait) is None
+    ):
+        raise RuntimeError("verify service returned invalid scheduler headers")
+    wait_ms = int(wait)
+    if wait_ms > _VERIFY_SCHEDULER_WAIT_MAX_MS:
+        raise RuntimeError("verify service returned invalid scheduler wait telemetry")
+    if source == "rejected":
+        if rejection not in _VERIFY_SCHEDULER_REJECTIONS or wait_ms != 0:
+            raise RuntimeError(
+                "verify service returned inconsistent scheduler rejection telemetry"
+            )
+    elif rejection is not None:
+        raise RuntimeError(
+            "verify service returned scheduler rejection telemetry for "
+            "non-rejected work"
+        )
+    if source == "cache_hit" and (wait_ms != 0 or allow_rejected):
+        raise RuntimeError(
+            "verify service returned inconsistent scheduler cache telemetry"
+        )
+    if source == "cache_hit":
+        outcome = "cache"
+    elif source == "coalesced":
+        outcome = "coalesced"
+    elif source == "rejected":
+        outcome = "rejected"
+    elif wait_ms > 0:
+        outcome = "queued"
+    else:
+        outcome = "launched"
+    parsed: Dict[str, Any] = {
+        "outcome": outcome,
+        "source": source,
+        "request_key_sha256": key,
+        "wait_ms": wait_ms,
+    }
+    if rejection is not None:
+        parsed["rejection"] = rejection
+    return parsed
 
 
 def _bounded_exception_detail(exc: Exception) -> str:
@@ -356,7 +480,9 @@ def _verify_context_max_chars() -> int:
             f"DANUS_VERIFY_CONTEXT_MAX_CHARS must be a non-negative integer, got {raw!r}"
         ) from exc
     if value < 0:
-        raise ValueError("DANUS_VERIFY_CONTEXT_MAX_CHARS must be a non-negative integer")
+        raise ValueError(
+            "DANUS_VERIFY_CONTEXT_MAX_CHARS must be a non-negative integer"
+        )
     return value
 
 
@@ -391,9 +517,13 @@ def _verification_context_error(context: Dict[str, Any]) -> str:
     omitted_glossary = context.get("omitted_glossary_terms") or []
     omitted_expanded = context.get("omitted_expanded_proof_ids") or []
     if missing:
-        reasons.append("missing predecessor fact_ids: " + ", ".join(str(x) for x in missing))
+        reasons.append(
+            "missing predecessor fact_ids: " + ", ".join(str(x) for x in missing)
+        )
     if revoked:
-        reasons.append("revoked predecessor fact_ids: " + ", ".join(str(x) for x in revoked))
+        reasons.append(
+            "revoked predecessor fact_ids: " + ", ".join(str(x) for x in revoked)
+        )
     if omitted:
         reasons.append(
             "required context exceeds character budget "
@@ -418,6 +548,96 @@ def _verification_context_error(context: Dict[str, Any]) -> str:
     if not context.get("complete") and not reasons:
         reasons.append("required context is incomplete")
     return "verification context error: " + "; ".join(reasons)
+
+
+def _reconcile_exact_reuse_candidate(
+    *,
+    graph: FactGraph,
+    project_dir: Path,
+    author: str,
+    candidate_fact_id: str,
+    candidate_fact_identity: str,
+    source_id: Optional[str],
+    statement: str,
+    proof: str,
+    predecessors: List[str],
+    glossary_introduces: Dict[str, str],
+) -> Dict[str, Any]:
+    """Close only the exact candidate overlay left by a post-add crash."""
+
+    if _role() != "worker":
+        return {}
+    try:
+        from danus.coordination import (
+            CoordinationStore,
+            candidate_receipt_id,
+            coordination_config,
+        )
+        from danus.coordination.store import load_project_metadata
+
+        config = coordination_config(load_project_metadata(project_dir))
+        if not config.reasoning_first:
+            return {}
+        store = CoordinationStore.open_existing(project_dir)
+        if store is None:
+            raise RuntimeError(
+                "reasoning-first project has no canonical coordination store"
+            )
+        active = store.project_status().get("candidate")
+        if not isinstance(active, dict) or active.get("state") != "active":
+            return {}
+        if (
+            active.get("worker") != author
+            or active.get("candidate_fact_id") != candidate_fact_id
+            or active.get("candidate_fact_identity") != candidate_fact_identity
+            or active.get("source_id") != source_id
+            or not isinstance(active.get("slot_id"), str)
+        ):
+            return {}
+        bare_context_digest = active.get("context_digest")
+        if (
+            not isinstance(bare_context_digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", bare_context_digest) is None
+        ):
+            raise RuntimeError("candidate receipt has no canonical bound context")
+        receipt = candidate_receipt_id(
+            slot_id=active["slot_id"],
+            candidate_fact_id=candidate_fact_id,
+            candidate_fact_identity=candidate_fact_identity,
+            source_id=source_id,
+            context_digest=bare_context_digest,
+        )
+        if active.get("candidate_receipt_id") != receipt:
+            return {}
+        # Re-attest the short and full active identity while retaining the graph
+        # snapshot through the coordination transition. A concurrent revoke,
+        # semantic drift, or forced short-id collision cannot release another
+        # candidate overlay.
+        with graph.locked_active_exact_identity(
+            problem_id=os.environ.get("DANUS_PROBLEM_ID", project_dir.name),
+            predecessors=predecessors,
+            glossary_introduces=glossary_introduces,
+            statement=statement,
+            proof=proof,
+        ) as active_identity:
+            if active_identity != (candidate_fact_id, candidate_fact_identity):
+                return {}
+            terminal = store.terminalize_candidate(
+                author,
+                receipt,
+                slot_id=active["slot_id"],
+                outcome="correct",
+            )
+        if terminal.get("state") != "terminal" or terminal.get("outcome") != "correct":
+            raise RuntimeError("candidate reconciliation did not become terminal")
+        return {
+            "candidate_receipt_id": receipt,
+            "candidate_outcome": "correct",
+        }
+    except Exception as exc:
+        return {
+            "candidate_terminalization_error": _bounded_exception_detail(exc),
+        }
 
 
 _SERVICE_RESULT_FIELDS = {
@@ -452,7 +672,31 @@ def _validate_service_result(
         raise ValueError(
             f"verify service returned a non-dict body ({type(result).__name__})"
         )
-    actual_fields = set(result)
+    wire_result = dict(result)
+    scheduler = wire_result.pop(_VERIFY_SCHEDULER_METADATA_FIELD, None)
+    if scheduler is not None:
+        required = {"outcome", "source", "request_key_sha256", "wait_ms"}
+        allowed = required | {"rejection"}
+        if (
+            not isinstance(scheduler, dict)
+            or not required.issubset(scheduler)
+            or not set(scheduler).issubset(allowed)
+            or scheduler.get("outcome")
+            not in {"launched", "queued", "coalesced", "cache", "rejected"}
+            or scheduler.get("source") not in _VERIFY_SCHEDULER_SOURCES
+            or not isinstance(scheduler.get("request_key_sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", str(scheduler["request_key_sha256"]))
+            is None
+            or isinstance(scheduler.get("wait_ms"), bool)
+            or not isinstance(scheduler.get("wait_ms"), int)
+            or not 0 <= scheduler["wait_ms"] <= _VERIFY_SCHEDULER_WAIT_MAX_MS
+            or (
+                "rejection" in scheduler
+                and scheduler["rejection"] not in _VERIFY_SCHEDULER_REJECTIONS
+            )
+        ):
+            raise ValueError("verify service returned invalid scheduler metadata")
+    actual_fields = set(wire_result)
     allowed_fields = (
         _SERVICE_RESULT_FIELDS,
         _SERVICE_RESULT_FIELDS | {"verification_metrics"},
@@ -470,7 +714,7 @@ def _validate_service_result(
             "verify service returned an invalid response envelope; expected "
             + ", ".join(sorted(_SERVICE_RESULT_FIELDS))
         )
-    verdict_payload = {key: result[key] for key in _OUTPUT_RESULT_FIELDS}
+    verdict_payload = {key: wire_result[key] for key in _OUTPUT_RESULT_FIELDS}
     try:
         validate_verification_output(
             verdict_payload,
@@ -481,12 +725,12 @@ def _validate_service_result(
         raise ValueError(
             f"verify service returned an invalid verdict payload: {exc}"
         ) from exc
-    if result.get("verification_context_digest") != context.get("digest"):
+    if wire_result.get("verification_context_digest") != context.get("digest"):
         raise ValueError(
             "verify service did not attest the supplied fact context digest; "
             "refusing a possibly context-free verdict"
         )
-    metrics = result.get("verification_metrics")
+    metrics = wire_result.get("verification_metrics")
     if metrics is not None:
         if not isinstance(metrics, dict) or set(metrics) != _METRICS_FIELDS:
             raise ValueError("verify service returned invalid verification_metrics")
@@ -501,25 +745,384 @@ def _validate_service_result(
             or not math.isfinite(float(elapsed))
             or elapsed < 0
         ):
-            raise ValueError("verification_metrics.elapsed_seconds must be non-negative")
+            raise ValueError(
+                "verification_metrics.elapsed_seconds must be non-negative"
+            )
         tokens = metrics.get("tokens_used")
         if tokens is not None and (
             isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 0
         ):
-            raise ValueError("verification_metrics.tokens_used must be non-negative or null")
+            raise ValueError(
+                "verification_metrics.tokens_used must be non-negative or null"
+            )
         scope = context.get("scope", {})
         if metrics.get("context_round") != scope.get("expansion_round"):
-            raise ValueError("verification_metrics.context_round does not match context")
+            raise ValueError(
+                "verification_metrics.context_round does not match context"
+            )
         if metrics.get("expanded_proof_ids") != scope.get("expanded_proof_ids"):
             raise ValueError(
                 "verification_metrics.expanded_proof_ids does not match context"
             )
-    return _redact_verifier_result(result)
+    safe = _redact_verifier_result(wire_result)
+    if scheduler is not None:
+        safe[_VERIFY_SCHEDULER_METADATA_FIELD] = dict(scheduler)
+    return safe
 
 
 # --------------------------------------------------------------------------- #
 # global memory                                                               #
 # --------------------------------------------------------------------------- #
+
+
+def _append_global_memory_guarded(
+    memory: GlobalMemory,
+    project_dir: Path,
+    kind: str,
+    *,
+    claim: str,
+    evidence: str,
+    author: str,
+    verifiable: Optional[bool] = None,
+    glossary: Optional[Dict[str, str]] = None,
+    links: Optional[Dict[str, Any]] = None,
+    **extra: Any,
+) -> str:
+    """The sanctioned gateway seam for non-``gm_add`` GM publications."""
+
+    from danus.strategy.browser_advisor import BrowserAdvisorBroker
+
+    durable_fields: dict[str, object] = {
+        "kind": kind,
+        "claim": claim,
+        "evidence": evidence,
+        "author": author,
+        "glossary": glossary,
+        "links": links,
+        **extra,
+    }
+    with BrowserAdvisorBroker.project_memory_fence(project_dir):
+        BrowserAdvisorBroker.reject_raw_project_text_locked(
+            project_dir, fields=durable_fields
+        )
+        return memory.append(
+            kind,
+            claim=claim,
+            evidence=evidence,
+            author=author,
+            verifiable=verifiable,
+            glossary=glossary,
+            links=links,
+            **extra,
+        )
+
+
+def _validate_bounded_review_memory_record(
+    kind: str,
+    *,
+    claim: str,
+    evidence: str,
+    author: str,
+    verifiable: Optional[bool],
+    glossary: Optional[Dict[str, str]],
+    links: Optional[Dict[str, Any]],
+    extra: Dict[str, Any],
+) -> None:
+    """Bound the exact review-sensitive GM record before durable append."""
+
+    from danus.coordination.policy import MAX_REVIEW_RECORD_BYTES
+
+    effective_verifiable = GLOBAL_KINDS[kind] if verifiable is None else verifiable
+    projected = {
+        "id": "0" * 16,
+        "timestamp_utc": "9999-12-31T23:59:59.999999+00:00",
+        "author": author,
+        "kind": kind,
+        "claim": claim,
+        "evidence": evidence,
+        "verifiable": effective_verifiable,
+        "status": "unverified" if effective_verifiable else "open",
+        "fact_id": None,
+        "links": links or {},
+        "glossary": glossary or {},
+        **extra,
+    }
+    try:
+        encoded = json.dumps(
+            projected,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError) as exc:
+        raise ValueError("review memory record is not strict canonical JSON") from exc
+    if len(encoded) > MAX_REVIEW_RECORD_BYTES:
+        raise ValueError("review memory record exceeds its 16 KiB hard limit")
+
+
+def _strict_canonical_json(value: object, *, label: str) -> bytes:
+    try:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError) as exc:
+        raise ValueError(f"{label} is not strict canonical JSON") from exc
+
+
+def _reasoning_sensitive_memory_replay(
+    memory: GlobalMemory,
+    publication: Dict[str, Any],
+    *,
+    kind: str,
+    claim: str,
+    evidence: str,
+    author: str,
+    verifiable: Optional[bool],
+    glossary: Optional[Dict[str, str]],
+    links: Optional[Dict[str, Any]],
+    extra: Dict[str, Any],
+) -> Optional[str]:
+    """Reuse one exact GM orphan or authorize the sole new sensitive append."""
+
+    expected = {
+        "author": author,
+        "kind": kind,
+        "claim": claim,
+        "evidence": evidence,
+        "verifiable": GLOBAL_KINDS[kind] if verifiable is None else verifiable,
+        "links": links or {},
+        "glossary": glossary or {},
+        **extra,
+    }
+    expected_bytes = _strict_canonical_json(
+        expected,
+        label="sensitive global-memory replay identity",
+    )
+    expected_provenance = {
+        "slot_id": publication["slot_id"],
+        "generation": publication["generation"],
+        "lane": publication["lane"],
+    }
+    matches: list[Dict[str, Any]] = []
+    for evidence_kind in ("obstacle", "dead_end"):
+        for entry in memory.read(evidence_kind):
+            if not isinstance(entry, dict) or entry.get("author") != author:
+                continue
+            entry_links = entry.get("links")
+            if (
+                not isinstance(entry_links, dict)
+                or entry_links.get("coordination") != expected_provenance
+            ):
+                continue
+            if publication["lane"] == "critic" and entry_links.get(
+                "confirms_entry_id"
+            ) is None:
+                continue
+            matches.append(entry)
+            if len(matches) > 1:
+                raise RuntimeError(
+                    "sensitive global-memory slot has multiple orphan entries"
+                )
+
+    if not matches:
+        if publication["requires_existing_replay"]:
+            raise RuntimeError(
+                "coordination registration has no exact durable memory entry"
+            )
+        return None
+
+    match = matches[0]
+    entry_id = match.get("id")
+    if not isinstance(entry_id, str) or _FACT_ID_RE.fullmatch(entry_id) is None:
+        raise RuntimeError("sensitive global-memory orphan has invalid entry id")
+    registered_entry_id = publication.get("registered_entry_id")
+    if registered_entry_id is not None and registered_entry_id != entry_id:
+        raise RuntimeError(
+            "coordination registration conflicts with durable memory entry id"
+        )
+    observed = {
+        key: value
+        for key, value in match.items()
+        if key not in {"id", "timestamp_utc", "status", "fact_id"}
+    }
+    observed_bytes = _strict_canonical_json(
+        observed,
+        label="durable sensitive global-memory orphan",
+    )
+    if observed_bytes != expected_bytes:
+        raise RuntimeError(
+            "sensitive global-memory retry conflicts with the durable orphan"
+        )
+    return entry_id
+
+
+def _bind_advisor_checkpoint_recommendation(
+    project_dir: Path,
+    links: Optional[Dict[str, Any]],
+    *,
+    require_current: bool,
+) -> tuple[Dict[str, Any], Optional[str]]:
+    """Parse, and optionally attest, a checkpoint recommendation binding."""
+
+    from danus.coordination import CoordinationStore, coordination_config
+    from danus.coordination.store import load_project_metadata
+
+    protected_links = dict(links or {})
+    config = coordination_config(load_project_metadata(project_dir))
+    if not config.reasoning_first:
+        if "recommendation_id" in protected_links:
+            raise RuntimeError(
+                "legacy advisor_checkpoint cannot claim a coordinator recommendation"
+            )
+        return protected_links, None
+    recommendation_id = protected_links.get("recommendation_id")
+    if (
+        not isinstance(recommendation_id, str)
+        or _COORDINATION_IDENTIFIER_RE.fullmatch(recommendation_id) is None
+    ):
+        raise RuntimeError(
+            "reasoning-first advisor_checkpoint requires an exact current "
+            "recommendation id"
+        )
+    if not require_current:
+        return protected_links, recommendation_id
+    store = CoordinationStore.open_existing(project_dir)
+    if store is None:
+        raise RuntimeError(
+            "reasoning-first project has no canonical coordination store"
+        )
+    try:
+        recommendation = store.validate_open_recommendation(recommendation_id)
+    except (OSError, RuntimeError, sqlite3.Error, ValueError) as exc:
+        raise RuntimeError(
+            "reasoning-first advisor_checkpoint requires the exact current ready "
+            "recommendation"
+        ) from exc
+    if (
+        recommendation.get("recommendation_id") != recommendation_id
+        or recommendation.get("state") != "owner_action_required"
+        or recommendation.get("ready") is not True
+        or recommendation.get("browser_dispatch_authorized") is not False
+        or recommendation.get("advisor_request_id") is not None
+    ):
+        raise RuntimeError(
+            "reasoning-first advisor_checkpoint recommendation binding is inexact"
+        )
+    # The caller must name the exact recommendation, while the gateway owns the
+    # canonical durable link that reaches GlobalMemory.append.
+    protected_links["recommendation_id"] = recommendation_id
+    return protected_links, recommendation_id
+
+
+def _advisor_checkpoint_replay(
+    memory: GlobalMemory,
+    *,
+    recommendation_id: Optional[str],
+    claim: str,
+    evidence: str,
+    author: str,
+    verifiable: Optional[bool],
+    glossary: Optional[Dict[str, str]],
+    links: Dict[str, Any],
+    extra: Dict[str, Any],
+) -> Optional[str]:
+    """Reuse one exact checkpoint for a recommendation or fail closed."""
+
+    expected = {
+        "author": author,
+        "kind": "advisor_checkpoint",
+        "claim": claim,
+        "evidence": evidence,
+        "verifiable": (
+            GLOBAL_KINDS["advisor_checkpoint"]
+            if verifiable is None
+            else verifiable
+        ),
+        "links": links,
+        "glossary": glossary or {},
+        **extra,
+    }
+    expected_bytes = _strict_canonical_json(
+        expected,
+        label="advisor checkpoint replay identity",
+    )
+    matches: list[Dict[str, Any]] = []
+    for projected in memory.iter_immutable("advisor_checkpoint"):
+        projected_links = projected.get("links")
+        if not isinstance(projected_links, dict):
+            raise RuntimeError("advisor checkpoint has invalid durable links")
+        if recommendation_id is None:
+            if "recommendation_id" in projected_links:
+                raise RuntimeError(
+                    "legacy advisor checkpoint has an invalid recommendation link"
+                )
+        elif projected_links.get("recommendation_id") != recommendation_id:
+            continue
+        entry_id = projected.get("id")
+        if not isinstance(entry_id, str) or _FACT_ID_RE.fullmatch(entry_id) is None:
+            raise RuntimeError("advisor checkpoint has an invalid durable entry id")
+        observed = {
+            key: value
+            for key, value in projected.items()
+            if key not in {"id", "timestamp_utc", "status", "fact_id"}
+        }
+        observed_bytes = _strict_canonical_json(
+            observed,
+            label="durable advisor checkpoint replay",
+        )
+        if recommendation_id is not None and observed_bytes != expected_bytes:
+            raise RuntimeError(
+                "advisor checkpoint retry conflicts with the durable checkpoint"
+            )
+        if observed_bytes == expected_bytes:
+            matches.append(projected)
+            if len(matches) > 1:
+                raise RuntimeError(
+                    "advisor checkpoint has multiple exact durable replays"
+                )
+
+    if not matches:
+        return None
+    match = matches[0]
+    return str(match["id"])
+
+
+def _validate_advisor_checkpoint_projected_record(
+    *,
+    claim: str,
+    evidence: str,
+    author: str,
+    verifiable: Optional[bool],
+    glossary: Optional[Dict[str, str]],
+    links: Dict[str, Any],
+    extra: Dict[str, Any],
+) -> None:
+    """Reject an unbindable checkpoint before the append can become durable."""
+
+    effective_verifiable = (
+        GLOBAL_KINDS["advisor_checkpoint"] if verifiable is None else verifiable
+    )
+    projected = {
+        "id": "0" * 16,
+        "timestamp_utc": "9999-12-31T23:59:59.999999+00:00",
+        "author": author,
+        "kind": "advisor_checkpoint",
+        "claim": claim,
+        "evidence": evidence,
+        "verifiable": effective_verifiable,
+        "status": "unverified" if effective_verifiable else "open",
+        "fact_id": None,
+        "links": links,
+        "glossary": glossary or {},
+        **extra,
+    }
+    canonical_global_memory_record(projected)
+
 
 def gm_add(
     kind: str,
@@ -528,6 +1131,10 @@ def gm_add(
     verifiable: Optional[bool] = None,
     glossary: Optional[Dict[str, str]] = None,
     links: Optional[Dict[str, Any]] = None,
+    consult_provenance: Optional[Dict[str, Any]] = None,
+    input_tokens: Optional[int] = None,
+    output_tokens: Optional[int] = None,
+    cost_usd: Optional[float] = None,
     project: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Publish a finding to shared global memory (claim + evidence). Verifiable
@@ -537,24 +1144,349 @@ def gm_add(
 
     Main agent: pass ``project`` to target one of several projects by name;
     workers omit it (pinned to their own project)."""
-    entry_id = _gm(project).append(
-        kind, claim=claim, evidence=evidence, author=_author(),
-        verifiable=verifiable, glossary=glossary, links=links,
+    role = _role()
+    if kind in {
+        "master_guidance",
+        "elaboration",
+        "advisor_checkpoint",
+    } and role not in {
+        "main",
+        "all",
+    }:
+        raise RuntimeError(f"only the main role may create {kind}")
+    target_project_dir = _project(project)
+
+    checkpoint_project_dir: Optional[Path] = None
+    checkpoint_fact_ids: list[str] = []
+    checkpoint_recommendation_id: Optional[str] = None
+    checkpoint_identity: Optional[Dict[str, Any]] = None
+    if kind == "advisor_checkpoint":
+        validate_advisor_checkpoint(claim, evidence, links)
+        if verifiable is not None and verifiable is not False:
+            raise ValueError("advisor_checkpoint must remain non-verifiable strategy")
+        checkpoint_project_dir = target_project_dir
+        checkpoint_fact_ids = list((links or {}).get("fact_ids", []))
+
+    has_consult_metrics = any(
+        value is not None for value in (input_tokens, output_tokens, cost_usd)
     )
-    return {"id": entry_id, "kind": kind}
+    if (
+        consult_provenance is not None or has_consult_metrics
+    ) and kind != "master_guidance":
+        raise ValueError(
+            "consult provenance/metrics are valid only for master_guidance"
+        )
+    for label, value in (
+        ("input_tokens", input_tokens),
+        ("output_tokens", output_tokens),
+    ):
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+        ):
+            raise ValueError(f"{label} must be a non-negative integer or null")
+    if cost_usd is not None and (
+        isinstance(cost_usd, bool)
+        or not isinstance(cost_usd, (int, float))
+        or not math.isfinite(float(cost_usd))
+        or float(cost_usd) < 0
+    ):
+        raise ValueError("cost_usd must be a finite non-negative number or null")
+    provenance = (
+        clean_consult_provenance(consult_provenance)
+        if consult_provenance is not None
+        else None
+    )
+    from danus.strategy.browser_advisor import BrowserAdvisorBroker
+
+    author = _author()
+    extra = {"consult_provenance": provenance} if provenance is not None else {}
+    if has_consult_metrics:
+        extra.update(
+            {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cost_usd": None if cost_usd is None else float(cost_usd),
+            }
+        )
+    memory = GlobalMemory(target_project_dir)
+    coordination_store: Any = None
+    coordination_slot: Optional[Dict[str, Any]] = None
+    coordination_publication: Optional[Dict[str, Any]] = None
+    coordination_pending_reconciliation = False
+
+    def append_memory() -> str:
+        return memory.append(
+            kind,
+            claim=claim,
+            evidence=evidence,
+            author=author,
+            verifiable=verifiable,
+            glossary=glossary,
+            links=links,
+            **extra,
+        )
+
+    # Lock order is supervisor browser-output fence -> optional FactGraph
+    # snapshot -> one GlobalMemory JSONL lock.  Browser completion/clarification
+    # uses the same outer fence before registering its digest, making the raw
+    # output check and append linearizable across processes.
+    with BrowserAdvisorBroker.project_memory_fence(target_project_dir):
+        if checkpoint_project_dir is not None:
+            links, checkpoint_recommendation_id = (
+                _bind_advisor_checkpoint_recommendation(
+                    checkpoint_project_dir,
+                    links,
+                    require_current=False,
+                )
+            )
+        if role == "worker":
+            from danus.coordination import CoordinationStore, coordination_config
+            from danus.coordination.store import load_project_metadata
+
+            config = coordination_config(load_project_metadata(target_project_dir))
+            if config.reasoning_first:
+                coordination_store = CoordinationStore.open_existing(target_project_dir)
+                if coordination_store is None:
+                    raise RuntimeError(
+                        "reasoning-first project has no canonical coordination store"
+                    )
+                coordination_slot = coordination_store.paid_slot_provenance(author)
+                if coordination_slot is None:
+                    raise RuntimeError(
+                        "worker has no canonical active reasoning-first paid slot"
+                    )
+                if links is not None and not isinstance(links, dict):
+                    raise ValueError("links must be an object")
+                protected_links = dict(links or {})
+                supplied = protected_links.get("coordination")
+                if supplied is not None and supplied != coordination_slot:
+                    raise ValueError(
+                        "links.coordination is protected canonical provenance"
+                    )
+                protected_links["coordination"] = dict(coordination_slot)
+                links = protected_links
+            elif isinstance(links, dict) and "coordination" in links:
+                raise ValueError("links.coordination is protected canonical provenance")
+        elif isinstance(links, dict) and "coordination" in links:
+            raise ValueError("links.coordination is protected canonical provenance")
+
+        confirms_entry_id = (
+            links.get("confirms_entry_id") if isinstance(links, dict) else None
+        )
+        if confirms_entry_id is not None and (
+            not isinstance(confirms_entry_id, str)
+            or _COORDINATION_IDENTIFIER_RE.fullmatch(confirms_entry_id) is None
+        ):
+            raise ValueError("links.confirms_entry_id must be a bounded entry id")
+
+        if coordination_store is not None and coordination_slot is not None:
+            coordination_publication = coordination_store.validate_memory_publication(
+                author,
+                slot_id=coordination_slot["slot_id"],
+                kind=kind,
+                confirms_entry_id=confirms_entry_id,
+            )
+            if coordination_publication["bounded_review_record"]:
+                _validate_bounded_review_memory_record(
+                    kind,
+                    claim=claim,
+                    evidence=evidence,
+                    author=author,
+                    verifiable=verifiable,
+                    glossary=glossary,
+                    links=links,
+                    extra=extra,
+                )
+
+        checkpoint_replay_entry_id = None
+        if checkpoint_project_dir is not None:
+            assert isinstance(links, dict)
+            _validate_advisor_checkpoint_projected_record(
+                claim=claim,
+                evidence=evidence,
+                author=author,
+                verifiable=verifiable,
+                glossary=glossary,
+                links=links,
+                extra=extra,
+            )
+            checkpoint_replay_entry_id = _advisor_checkpoint_replay(
+                memory,
+                recommendation_id=checkpoint_recommendation_id,
+                claim=claim,
+                evidence=evidence,
+                author=author,
+                verifiable=verifiable,
+                glossary=glossary,
+                links=links,
+                extra=extra,
+            )
+            if checkpoint_replay_entry_id is None:
+                links, checkpoint_recommendation_id = (
+                    _bind_advisor_checkpoint_recommendation(
+                        checkpoint_project_dir,
+                        links,
+                        require_current=True,
+                    )
+                )
+
+        browser_adopted = False
+        if provenance is not None and provenance["transport"] == "chatgpt_pro_browser":
+            BrowserAdvisorBroker.validate_adopted_master_guidance(
+                target_project_dir,
+                provenance=provenance,
+                evidence=evidence,
+            )
+            browser_adopted = True
+        raw_fence_fields: dict[str, object] = {
+            "kind": kind,
+            "claim": claim,
+            "glossary": glossary,
+            "links": links,
+            "author": author,
+            **extra,
+        }
+        if not browser_adopted:
+            raw_fence_fields["evidence"] = evidence
+        if checkpoint_replay_entry_id is None:
+            BrowserAdvisorBroker.reject_raw_project_text_locked(
+                target_project_dir,
+                fields=raw_fence_fields,
+            )
+
+        replay_entry_id = None
+        if (
+            coordination_publication is not None
+            and coordination_publication["bounded_review_record"]
+        ):
+            replay_entry_id = _reasoning_sensitive_memory_replay(
+                memory,
+                coordination_publication,
+                kind=kind,
+                claim=claim,
+                evidence=evidence,
+                author=author,
+                verifiable=verifiable,
+                glossary=glossary,
+                links=links,
+                extra=extra,
+            )
+
+        if replay_entry_id is not None:
+            entry_id = replay_entry_id
+        elif checkpoint_replay_entry_id is not None:
+            entry_id = checkpoint_replay_entry_id
+        elif checkpoint_project_dir is not None:
+            graph = FactGraph(checkpoint_project_dir)
+            # Keep the graph's shared snapshot lock through the append so a
+            # revoke cannot invalidate a link between validation and durable
+            # publication.
+            with graph.locked_context(
+                checkpoint_fact_ids,
+                predecessor_depth=0,
+                proof_mode="none",
+                include_project_glossary=False,
+            ) as context:
+                active_ids = {str(item["fact_id"]) for item in context["facts"]}
+                if not context["complete"] or active_ids != set(checkpoint_fact_ids):
+                    raise ValueError(
+                        "advisor_checkpoint fact ids must all be active verified facts; "
+                        f"missing={context['missing_fact_ids']}, "
+                        f"revoked={context['revoked_fact_ids']}"
+                    )
+                entry_id = append_memory()
+        else:
+            entry_id = append_memory()
+
+        if checkpoint_project_dir is not None:
+            immutable_checkpoint = memory.get_immutable_in_kind(
+                "advisor_checkpoint", entry_id
+            )
+            immutable_bytes = canonical_global_memory_record(immutable_checkpoint)
+            immutable_links = immutable_checkpoint.get("links")
+            if (
+                immutable_checkpoint.get("id") != entry_id
+                or immutable_checkpoint.get("kind") != "advisor_checkpoint"
+                or immutable_checkpoint.get("claim") != claim
+                or immutable_checkpoint.get("evidence") != evidence
+                or not isinstance(immutable_checkpoint.get("author"), str)
+                or not str(immutable_checkpoint["author"]).strip()
+                or immutable_links != (links or {})
+            ):
+                raise RuntimeError(
+                    "durable advisor checkpoint does not match its exact publication"
+                )
+            prompt_bytes = evidence.encode("utf-8")
+            checkpoint_identity = {
+                "checkpoint_id": entry_id,
+                "checkpoint_sha256": hashlib.sha256(immutable_bytes).hexdigest(),
+                "checkpoint_bytes": len(immutable_bytes),
+                "checkpoint_prompt_sha256": hashlib.sha256(prompt_bytes).hexdigest(),
+                "checkpoint_prompt_bytes": len(prompt_bytes),
+                "recommendation_id": checkpoint_recommendation_id,
+            }
+
+        if coordination_store is not None and coordination_slot is not None:
+            try:
+                if coordination_slot["lane"] == "root" and kind in {
+                    "obstacle",
+                    "dead_end",
+                }:
+                    coordination_store.record_root_evidence(
+                        author,
+                        kind,
+                        entry_id=entry_id,
+                        slot_id=coordination_slot["slot_id"],
+                    )
+                elif (
+                    coordination_slot["lane"] == "critic"
+                    and kind in {"obstacle", "dead_end"}
+                    and confirms_entry_id is not None
+                ):
+                    coordination_store.confirm_root_evidence(
+                        author,
+                        confirms_entry_id,
+                        entry_id=entry_id,
+                        slot_id=coordination_slot["slot_id"],
+                    )
+            except Exception:
+                # The GM append is already durable and carries the exact slot
+                # provenance needed by terminal reconciliation.  Preserve its
+                # ID instead of inviting an unbound duplicate after a cut.
+                coordination_pending_reconciliation = True
+    response = {"id": entry_id, "kind": kind}
+    if checkpoint_identity is not None:
+        response.update(checkpoint_identity)
+    if coordination_pending_reconciliation:
+        response["coordination_pending_reconciliation"] = True
+    return response
 
 
-def gm_search(query: str, kinds: Optional[List[str]] = None, limit_per_kind: int = 10,
-              project: Optional[str] = None) -> Dict[str, Any]:
+def gm_search(
+    query: str,
+    kinds: Optional[List[str]] = None,
+    limit_per_kind: int = 10,
+    project: Optional[str] = None,
+) -> Dict[str, Any]:
     """BM25 over shared global-memory findings. Use to reuse others' results,
     avoid duplicate work, and learn which paths already died. Main agent: pass
     ``project`` to search a specific project; workers omit it."""
     return _gm(project).search(query, kinds=kinds, limit_per_kind=limit_per_kind)
 
 
+def gm_get(entry_id: str, project: Optional[str] = None) -> Dict[str, Any]:
+    """Retrieve one exact, bounded global-memory entry by id.
+
+    Main agents may select a project by name; workers remain pinned to their
+    configured project and omit ``project``.
+    """
+    return _gm(project).get(entry_id)
+
+
 # --------------------------------------------------------------------------- #
 # fact graph                                                                  #
 # --------------------------------------------------------------------------- #
+
 
 def fact_submit(
     statement: str,
@@ -590,9 +1522,10 @@ def fact_submit(
     affect the ``fact_id``."""
     conversation_frontier = _conversation_frontier_at_action()
 
-    fg = _fg()
-    gm = _gm()
-    problem_id = os.environ.get("DANUS_PROBLEM_ID", Path(_project()).name)
+    target_project_dir = _project()
+    fg = FactGraph(target_project_dir)
+    gm = GlobalMemory(target_project_dir)
+    problem_id = os.environ.get("DANUS_PROBLEM_ID", target_project_dir.name)
     predecessors = list(dict.fromkeys(p for p in (predecessors or []) if p))
     glossary_introduces = dict(glossary_introduces or {})
     glossary_context_texts = [
@@ -606,11 +1539,104 @@ def fact_submit(
     # glossary coverage is advisory — never let a heuristic bug block submission
     try:
         undefined = fg.undefined_symbols(
-            statement=statement, proof=proof, intuition=intuition,
-            predecessors=predecessors, glossary_introduces=glossary_introduces,
+            statement=statement,
+            proof=proof,
+            intuition=intuition,
+            predecessors=predecessors,
+            glossary_introduces=glossary_introduces,
         )
     except Exception:
         undefined = []
+
+    candidate_fact_id = compute_fact_id(
+        problem_id=problem_id,
+        predecessors=predecessors,
+        glossary_introduces=glossary_introduces,
+        statement=statement,
+        proof=proof,
+    )
+    try:
+        reused_identity = fg.lookup_active_exact_identity(
+            problem_id=problem_id,
+            predecessors=predecessors,
+            glossary_introduces=glossary_introduces,
+            statement=statement,
+            proof=proof,
+        )
+    except Exception as exc:
+        return {
+            "accepted": False,
+            "promoted": False,
+            "submission_status": "error",
+            "verification_verdict": None,
+            "verdict": "error",
+            "error": "active fact reuse error: " + _bounded_exception_detail(exc),
+            "undefined_symbols": undefined,
+            "verification_calls": 0,
+        }
+    if reused_identity is not None:
+        reused_fact_id, reused_fact_identity = reused_identity
+        reuse_candidate = _reconcile_exact_reuse_candidate(
+            graph=fg,
+            project_dir=target_project_dir,
+            author=_author(),
+            candidate_fact_id=reused_fact_id,
+            candidate_fact_identity=reused_fact_identity,
+            source_id=source_id,
+            statement=statement,
+            proof=proof,
+            predecessors=predecessors,
+            glossary_introduces=glossary_introduces,
+        )
+        trace_error = None
+        try:
+            _append_global_memory_guarded(
+                gm,
+                target_project_dir,
+                "verification",
+                claim=f"active exact fact {reused_fact_id}",
+                evidence="active exact fact reused; verifier calls: 0",
+                author=_author(),
+                verifiable=False,
+                links={"source_id": source_id, "predecessors": predecessors},
+                verdict="correct",
+                fact_id=reused_fact_id,
+                write_error=None,
+                promoted=True,
+                submission_status="promoted",
+                verification_verdict="correct",
+                verification_report=None,
+                verification_context_digest=None,
+                verification_rounds=[],
+                final_math_verdict="correct",
+                expanded_proof_ids=[],
+                verification_calls=0,
+                verification_reuse="active_exact_fact",
+                verification_scheduler=[],
+                **reuse_candidate,
+                conversation_frontier_at_action=conversation_frontier,
+            )
+        except Exception as exc:
+            trace_error = _bounded_exception_detail(exc)
+        response = {
+            "accepted": True,
+            "promoted": True,
+            "submission_status": "promoted",
+            "verification_verdict": "correct",
+            "verdict": "correct",
+            "fact_id": reused_fact_id,
+            "undefined_symbols": undefined,
+            "adaptive_rounds": 0,
+            "verification_calls": 0,
+            "expanded_proof_ids": [],
+            "verification_metrics": [],
+            "verification_scheduler": [],
+            "verification_reuse": "active_exact_fact",
+            **reuse_candidate,
+        }
+        if trace_error:
+            response["trace_error"] = trace_error
+        return response
 
     try:
         context_max_chars = _verify_context_max_chars()
@@ -628,13 +1654,6 @@ def fact_submit(
             "undefined_symbols": undefined,
         }
 
-    candidate_fact_id = compute_fact_id(
-        problem_id=problem_id,
-        predecessors=predecessors,
-        glossary_introduces=glossary_introduces,
-        statement=statement,
-        proof=proof,
-    )
     expanded_proof_ids: List[str] = []
     expansion_round = 0
     verification_rounds: List[Dict[str, Any]] = []
@@ -642,6 +1661,34 @@ def fact_submit(
     result: Optional[Dict[str, Any]] = None
     protocol_error: Optional[str] = None
     verification_call_count = 0
+    candidate_registration_checked = False
+    candidate_coordination_store: Any = None
+    candidate_coordination_slot: Optional[Dict[str, Any]] = None
+    candidate_receipt: Optional[str] = None
+    candidate_outcome: Optional[str] = None
+    candidate_terminalization_error: Optional[str] = None
+    verification_delivery_unknown = False
+
+    def terminalize_candidate(outcome: str) -> None:
+        nonlocal candidate_outcome, candidate_terminalization_error
+        if candidate_outcome is not None:
+            return
+        if (
+            candidate_coordination_store is None
+            or candidate_coordination_slot is None
+            or candidate_receipt is None
+        ):
+            return
+        candidate_outcome = outcome
+        try:
+            candidate_coordination_store.terminalize_candidate(
+                _author(),
+                candidate_receipt,
+                slot_id=candidate_coordination_slot["slot_id"],
+                outcome=outcome,
+            )
+        except Exception as exc:
+            candidate_terminalization_error = _bounded_exception_detail(exc)
 
     # Each iteration reconstructs a canonical truth-layer snapshot and each
     # service call cold-starts a fresh verifier session. Round zero sends the
@@ -696,6 +1743,90 @@ def fact_submit(
             protocol_error = message
             break
 
+        if not candidate_registration_checked:
+            candidate_registration_checked = True
+            try:
+                from danus.coordination import (
+                    CoordinationStore,
+                    candidate_receipt_id,
+                    coordination_config,
+                )
+                from danus.coordination.store import load_project_metadata
+
+                coordination = coordination_config(
+                    load_project_metadata(target_project_dir)
+                )
+                if _role() == "worker" and coordination.reasoning_first:
+                    candidate_coordination_store = CoordinationStore.open_existing(
+                        target_project_dir
+                    )
+                    if candidate_coordination_store is None:
+                        raise RuntimeError(
+                            "reasoning-first project has no canonical coordination store"
+                        )
+                    candidate_coordination_slot = (
+                        candidate_coordination_store.paid_slot_provenance(_author())
+                    )
+                    if candidate_coordination_slot is None:
+                        raise RuntimeError(
+                            "worker has no canonical active reasoning-first paid slot"
+                        )
+                    digest = verification_context.get("digest")
+                    if (
+                        not isinstance(digest, str)
+                        or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None
+                    ):
+                        raise RuntimeError(
+                            "candidate verification context has no canonical digest"
+                        )
+                    bare_context_digest = digest.removeprefix("sha256:")
+                    candidate_fact_identity = fact_identity_from_verification_context(
+                        verification_context=verification_context,
+                        problem_id=problem_id,
+                        predecessors=predecessors,
+                        glossary_introduces=glossary_introduces,
+                        statement=statement,
+                        proof=proof,
+                    )
+                    candidate_receipt = candidate_receipt_id(
+                        slot_id=candidate_coordination_slot["slot_id"],
+                        candidate_fact_id=candidate_fact_id,
+                        candidate_fact_identity=candidate_fact_identity,
+                        source_id=source_id,
+                        context_digest=bare_context_digest,
+                    )
+                    registration = candidate_coordination_store.register_candidate(
+                        _author(),
+                        candidate_receipt,
+                        slot_id=candidate_coordination_slot["slot_id"],
+                        candidate_fact_id=candidate_fact_id,
+                        candidate_fact_identity=candidate_fact_identity,
+                        source_id=source_id,
+                        context_digest=bare_context_digest,
+                    )
+                    registration_state = registration.get("state")
+                    if registration_state in {"terminal", "outcome_unknown"}:
+                        prior_outcome = registration.get("outcome")
+                        candidate_outcome = (
+                            str(prior_outcome)
+                            if isinstance(prior_outcome, str)
+                            else "outcome_unknown"
+                        )
+                        protocol_error = (
+                            "candidate coordination error: exact candidate receipt "
+                            f"is already {registration_state}"
+                        )
+                        break
+                    if registration_state != "active":
+                        raise RuntimeError(
+                            "candidate coordination did not return an active receipt"
+                        )
+            except Exception as exc:
+                protocol_error = (
+                    "candidate coordination error: " + _bounded_exception_detail(exc)
+                )
+                break
+
         try:
             verification_call_count += 1
             raw_result = _verify(
@@ -711,30 +1842,13 @@ def fact_submit(
                 proof=proof,
             )
         except Exception as exc:
+            if isinstance(
+                exc,
+                (OSError, TimeoutError, urllib.error.URLError),
+            ):
+                verification_delivery_unknown = True
             message = _bounded_exception_detail(exc)
-            verification_rounds.append(
-                {
-                    "round": expansion_round,
-                    "context_fact_ids": list(
-                        verification_context["scope"]["closure_fact_ids"]
-                    ),
-                    "context_digest": verification_context["digest"],
-                    "expanded_proof_ids": list(
-                        verification_context["scope"]["expanded_proof_ids"]
-                    ),
-                    "verification_status": "error",
-                    "error_stage": "verify_call",
-                    "error": message,
-                    "needs_expanded_proofs": [],
-                    "verification_metrics": None,
-                }
-            )
-            protocol_error = message
-            break
-
-        requests = result["needs_expanded_proofs"]
-        verification_rounds.append(
-            {
+            failed_round = {
                 "round": expansion_round,
                 "context_fact_ids": list(
                     verification_context["scope"]["closure_fact_ids"]
@@ -743,12 +1857,36 @@ def fact_submit(
                 "expanded_proof_ids": list(
                     verification_context["scope"]["expanded_proof_ids"]
                 ),
-                "verification_status": result["verification_status"],
-                "verdict": result["verdict"],
-                "needs_expanded_proofs": [dict(request) for request in requests],
-                "verification_metrics": result.get("verification_metrics"),
+                "verification_status": "error",
+                "error_stage": "verify_call",
+                "error": message,
+                "needs_expanded_proofs": [],
+                "verification_metrics": None,
             }
-        )
+            failed_scheduler = getattr(exc, "scheduler", None)
+            if isinstance(failed_scheduler, dict):
+                failed_round["verification_scheduler"] = dict(failed_scheduler)
+            verification_rounds.append(failed_round)
+            protocol_error = message
+            break
+
+        round_scheduler = result.pop(_VERIFY_SCHEDULER_METADATA_FIELD, None)
+        requests = result["needs_expanded_proofs"]
+        completed_round = {
+            "round": expansion_round,
+            "context_fact_ids": list(verification_context["scope"]["closure_fact_ids"]),
+            "context_digest": verification_context["digest"],
+            "expanded_proof_ids": list(
+                verification_context["scope"]["expanded_proof_ids"]
+            ),
+            "verification_status": result["verification_status"],
+            "verdict": result["verdict"],
+            "needs_expanded_proofs": [dict(request) for request in requests],
+            "verification_metrics": result.get("verification_metrics"),
+        }
+        if isinstance(round_scheduler, dict):
+            completed_round["verification_scheduler"] = dict(round_scheduler)
+        verification_rounds.append(completed_round)
 
         if result["verification_status"] == "final":
             break
@@ -831,12 +1969,49 @@ def fact_submit(
             for round_trace in verification_rounds
             if round_trace.get("verification_metrics") is not None
         ],
+        "verification_scheduler": [
+            dict(round_trace["verification_scheduler"])
+            for round_trace in verification_rounds
+            if isinstance(round_trace.get("verification_scheduler"), dict)
+        ],
     }
 
     if protocol_error is not None:
+        if candidate_outcome is None:
+            if verification_delivery_unknown:
+                terminalize_candidate("outcome_unknown")
+            elif (
+                verification_rounds
+                and verification_rounds[-1].get("verification_status")
+                == "needs_context"
+            ):
+                terminalize_candidate("needs_context")
+            else:
+                terminalize_candidate("error")
+        if candidate_receipt is not None:
+            adaptive_metadata.update(
+                {
+                    "candidate_receipt_id": candidate_receipt,
+                    "candidate_outcome": candidate_outcome,
+                    "candidate_terminalization_error": (
+                        candidate_terminalization_error
+                    ),
+                }
+            )
+        candidate_trace = (
+            {
+                "candidate_receipt_id": candidate_receipt,
+                "candidate_outcome": candidate_outcome,
+                "candidate_terminalization_error": candidate_terminalization_error,
+            }
+            if candidate_receipt is not None
+            else {}
+        )
         trace_error = None
         try:
-            gm.append(
+            _append_global_memory_guarded(
+                gm,
+                target_project_dir,
                 "verification",
                 claim=statement,
                 evidence=protocol_error,
@@ -857,6 +2032,7 @@ def fact_submit(
                 ),
                 verification_rounds=verification_rounds,
                 final_math_verdict=None,
+                **candidate_trace,
                 conversation_frontier_at_action=conversation_frontier,
             )
         except Exception as exc:
@@ -895,9 +2071,14 @@ def fact_submit(
                 context_max_chars=context_max_chars,
                 context_glossary_texts=glossary_context_texts,
                 context_glossary_exclude_terms=glossary_context_exclude_terms,
-                problem_id=problem_id, author=_author(), statement=statement, proof=proof,
-                predecessors=predecessors, glossary_introduces=glossary_introduces,
-                intuition=intuition, external_refs=external_refs,
+                problem_id=problem_id,
+                author=_author(),
+                statement=statement,
+                proof=proof,
+                predecessors=predecessors,
+                glossary_introduces=glossary_introduces,
+                intuition=intuition,
+                external_refs=external_refs,
             )
         except FactPromotionOutcomeUnknown as e:
             promotion_unknown = True
@@ -917,10 +2098,38 @@ def fact_submit(
     else:
         submission_status = "rejected"
 
+    if promotion_unknown:
+        terminalize_candidate("promotion_unknown")
+    elif accepted and promoted:
+        terminalize_candidate("correct")
+    elif not accepted:
+        terminalize_candidate("wrong")
+    else:
+        terminalize_candidate("error")
+    if candidate_receipt is not None:
+        adaptive_metadata.update(
+            {
+                "candidate_receipt_id": candidate_receipt,
+                "candidate_outcome": candidate_outcome,
+                "candidate_terminalization_error": candidate_terminalization_error,
+            }
+        )
+    candidate_trace = (
+        {
+            "candidate_receipt_id": candidate_receipt,
+            "candidate_outcome": candidate_outcome,
+            "candidate_terminalization_error": candidate_terminalization_error,
+        }
+        if candidate_receipt is not None
+        else {}
+    )
+
     # 4) Record the outcome. A trace I/O failure must not hide an accepted fact id.
     trace_error = None
     try:
-        gm.append(
+        _append_global_memory_guarded(
+            gm,
+            target_project_dir,
             "verification",
             claim=statement,
             evidence=(
@@ -942,6 +2151,7 @@ def fact_submit(
             verification_rounds=verification_rounds,
             final_math_verdict=verdict,
             expanded_proof_ids=list(expanded_proof_ids),
+            **candidate_trace,
             conversation_frontier_at_action=conversation_frontier,
         )
     except Exception as exc:  # the caller must not lose an already-written fact id
@@ -1005,7 +2215,9 @@ def fact_submit(
     return response
 
 
-def fact_search(query: str, limit: int = 10, project: Optional[str] = None) -> Dict[str, Any]:
+def fact_search(
+    query: str, limit: int = 10, project: Optional[str] = None
+) -> Dict[str, Any]:
     """BM25 search over the verified fact graph (statement + proof + glossary),
     the derived fact index rebuilt on demand from the fact files — the fact graph
     stays the single source of truth. Use it **before proving** to check whether a
@@ -1040,7 +2252,9 @@ def fact_context(
     )
 
 
-def fact_revoke(fact_id: str, reason: str, project: Optional[str] = None) -> Dict[str, Any]:
+def fact_revoke(
+    fact_id: str, reason: str, project: Optional[str] = None
+) -> Dict[str, Any]:
     """Cascade-revoke a wrong fact and everything that depends on it. Destructive;
     operator / main-agent only. Main agent: pass ``project`` to target the project
     that owns the fact."""
@@ -1051,6 +2265,7 @@ def fact_revoke(fact_id: str, reason: str, project: Optional[str] = None) -> Dic
 # --------------------------------------------------------------------------- #
 # arXiv theorem search (external integration)                                 #
 # --------------------------------------------------------------------------- #
+
 
 def search_arxiv_theorems(query: str, num_results: int = 10) -> Dict[str, Any]:
     """Semantic search over arXiv theorem statements (Matlas). Returns
@@ -1069,6 +2284,7 @@ def search_arxiv_theorems(query: str, num_results: int = 10) -> Dict[str, Any]:
 
 _TOOLS = {
     "gm_add": gm_add,
+    "gm_get": gm_get,
     "gm_search": gm_search,
     "fact_submit": fact_submit,
     "fact_search": fact_search,

@@ -42,5 +42,15 @@ command -v "$TEX" >/dev/null 2>&1 && ok "latex: $TEX ($($TEX --version 2>/dev/nu
 # human-summary PDF render (soft): DANUS_CHROME_BIN, else chrome/chromium on PATH.
 CHROME="${DANUS_CHROME_BIN:-}"; [ -z "$CHROME" ] && CHROME="$(command -v chromium chromium-browser google-chrome google-chrome-stable 2>/dev/null | head -1)"
 { [ -n "$CHROME" ] && [ -x "$CHROME" ]; } && ok "chrome: $CHROME (human-summary PDF)" || wn "no Chrome/Chromium (human-summary PDF render needs it; set DANUS_CHROME_BIN or install)"
-echo "consult transport: $DANUS_CONSULT_TRANSPORT"
+case "$DANUS_CONSULT_TRANSPORT" in
+  gpt_pro|claude_api|claude_code|off)
+    ok "unattended consult transport: $DANUS_CONSULT_TRANSPORT"
+    ;;
+  chatgpt_pro_browser)
+    no "chatgpt_pro_browser cannot be selected by DANUS_CONSULT_TRANSPORT; use one explicit owner invocation"
+    ;;
+  *)
+    no "unknown consult transport: $DANUS_CONSULT_TRANSPORT (consult fails closed)"
+    ;;
+esac
 echo "done."

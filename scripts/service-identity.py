@@ -52,6 +52,10 @@ class GuardianError(RuntimeError):
     """An unsafe or unavailable guardian operation."""
 
 
+class ManagedFileUnlinked(GuardianError):
+    """A regular managed file was unlinked after it was opened."""
+
+
 class HealthUnavailable(GuardianError):
     """No process accepted the loopback health connection."""
 
@@ -183,6 +187,16 @@ def _open_regular_read(path: Path, max_bytes: int) -> tuple[bytes, os.stat_resul
     fd = os.open(str(path), flags)
     try:
         info = os.fstat(fd)
+        if (
+            stat.S_ISREG(info.st_mode)
+            and info.st_nlink == 0
+            and info.st_uid == os.geteuid()
+            and info.st_size <= max_bytes
+        ):
+            # A concurrent reader may open an authenticated guardian record
+            # just before its owner unlinks it.  Keep that vanished inode
+            # distinct from an unsafe extant file (including nlink > 1).
+            raise ManagedFileUnlinked("managed file was unlinked during read")
         if (
             not stat.S_ISREG(info.st_mode)
             or info.st_nlink != 1
@@ -573,7 +587,15 @@ def _validate_record(value: Any, path: Path) -> dict[str, Any]:
 
 
 def read_record(path: Path) -> dict[str, Any]:
-    raw, info = _open_regular_read(path, MAX_RECORD_BYTES)
+    try:
+        raw, info = _open_regular_read(path, MAX_RECORD_BYTES)
+    except ManagedFileUnlinked as exc:
+        # Record absence is authenticated by the lifecycle lock at every
+        # caller that acts on it.  Other managed files retain fail-closed
+        # handling for the same condition.
+        raise FileNotFoundError(
+            errno.ENOENT, "guardian record was unlinked", path
+        ) from exc
     if stat.S_IMODE(info.st_mode) & 0o077:
         raise GuardianError("guardian record permissions are not 0600")
     try:

@@ -45,15 +45,15 @@ def _wait_state(store: HotJoinStore, message_id: str, state: str) -> dict[str, A
         if row["state"] == state:
             return row
         time.sleep(0.01)
-    raise AssertionError(f"message did not reach state {state}: {store.get(message_id)}")
+    raise AssertionError(
+        f"message did not reach state {state}: {store.get(message_id)}"
+    )
 
 
 class _StubClient:
     def __init__(self, active_turn: str | None = "turn-1", read_payload: Any = None):
         self.turn = active_turn
-        self.read_payload = read_payload or {
-            "thread": {"id": "thread-1", "turns": []}
-        }
+        self.read_payload = read_payload or {"thread": {"id": "thread-1", "turns": []}}
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.terminals: dict[tuple[str, str], dict[str, Any]] = {}
 
@@ -133,9 +133,7 @@ def test_store_serializes_full_sqlite_lifecycle_across_threads_and_instances(
             local.list_messages(target="max", limit=5)
 
     threads = [
-        threading.Thread(
-            target=record_errors, args=(action,), daemon=True
-        )
+        threading.Thread(target=record_errors, args=(action,), daemon=True)
         for action in (writer, constructor_reader, broker_rate_reader)
     ]
     for thread in threads:
@@ -154,9 +152,7 @@ def test_frontier_commits_lifecycle_and_content_hash_without_message_body(
     project, _worker = _project(tmp_path)
     store = HotJoinStore(project)
     sentinel = "PRIVATE-HUMAN-GUIDANCE-7805"
-    message = store.enqueue(
-        target="max", body=sentinel, client_id="frontier-message"
-    )
+    message = store.enqueue(target="max", body=sentinel, client_id="frontier-message")
     persisted = store.frontier("max")
     assert persisted["schema_version"] == 1
     assert persisted["event_count"] == 1
@@ -189,8 +185,7 @@ def test_frontier_caps_visible_ids_and_commits_omitted_ids(tmp_path: Path):
     project, _worker = _project(tmp_path)
     store = HotJoinStore(project)
     messages = [
-        store.enqueue(target="max", body=f"guidance {index}")
-        for index in range(130)
+        store.enqueue(target="max", body=f"guidance {index}") for index in range(130)
     ]
     for message in messages:
         claimed = store.claim(target="max", owner="broker", allow_queued=True)
@@ -221,9 +216,7 @@ def test_expired_delivery_claim_is_fenced_and_never_overwritten(tmp_path: Path):
     )
     assert claimed is not None
     time.sleep(0.01)
-    assert (
-        store.claim(target="max", owner="new-broker", allow_queued=True) is None
-    )
+    assert store.claim(target="max", owner="new-broker", allow_queued=True) is None
     assert store.get(message["message_id"])["state"] == "delivery_unknown"
     with pytest.raises(StaleClaim):
         store.record(
@@ -337,6 +330,294 @@ def test_concurrent_legacy_round_intent_migration_is_serialized(tmp_path: Path):
     assert {"prompt_sha256", "requested_model", "requested_effort"} <= columns
 
 
+def test_legacy_operator_parent_migration_preserves_exact_receipt_foreign_keys(
+    tmp_path: Path,
+):
+    project, _worker = _project(tmp_path)
+    control = project / ".human-intervention"
+    control.mkdir(mode=0o700)
+    database = control / "events.sqlite3"
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute(
+            "CREATE TABLE round_operator_events ("
+            "seq INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "action TEXT NOT NULL CHECK(action IN ('abandoned_outcome_unknown')) ,"
+            "client_id TEXT NOT NULL REFERENCES round_intents(client_id),"
+            "target TEXT NOT NULL,thread_id TEXT NOT NULL,"
+            "prior_state TEXT NOT NULL CHECK(prior_state IN "
+            "('dispatching','started','delivery_unknown')) ,"
+            "reason TEXT NOT NULL,"
+            "acknowledged_paid_outcome_unknown INTEGER NOT NULL "
+            "CHECK(acknowledged_paid_outcome_unknown IN (0,1)),"
+            "created_ns INTEGER NOT NULL,UNIQUE(client_id,action))"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    store = HotJoinStore(project)
+    with store._connect() as db:
+        foreign_keys = {
+            (str(row["from"]), str(row["table"]), str(row["to"]))
+            for row in db.execute(
+                "PRAGMA foreign_key_list(round_coordination_operator_receipts)"
+            ).fetchall()
+        }
+        assert foreign_keys == {
+            ("client_id", "round_intents", "client_id"),
+            ("operator_event_seq", "round_operator_events", "seq"),
+        }
+        assert (
+            db.execute(
+                "PRAGMA foreign_key_check(round_coordination_operator_receipts)"
+            ).fetchall()
+            == []
+        )
+        assert (
+            db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='round_operator_events_before_prepared_cancel'"
+            ).fetchone()
+            is None
+        )
+
+    store.set_thread_id("max", "thread-migrated-operator")
+    intent = store.round_intent(
+        "max",
+        "thread-migrated-operator",
+        prompt_sha256="9" * 64,
+        requested_model="offline-model",
+        requested_effort="high",
+        coordination_slot_id="slot_migrated_operator",
+        coordination_generation=1,
+        coordination_lane="root",
+    )
+    store.cancel_prepared_round_intent(
+        target="max",
+        thread_id="thread-migrated-operator",
+        client_id=intent["client_id"],
+        reason="cancel after exact schema migration",
+    )
+    assert (
+        store.terminal_receipt_for_coordination_slot(
+            coordination_slot_id="slot_migrated_operator",
+            target="max",
+            coordination_generation=1,
+            coordination_lane="root",
+            prompt_sha256="9" * 64,
+            requested_model="offline-model",
+            requested_effort="high",
+            thread_id="thread-migrated-operator",
+        )["operator_action"]
+        == "cancelled_not_dispatched"
+    )
+
+
+def test_populated_legacy_operator_receipt_migration_preserves_exact_replay(
+    tmp_path: Path,
+):
+    project, _worker = _project(tmp_path)
+    control = project / ".human-intervention"
+    control.mkdir(mode=0o700)
+    database = control / "events.sqlite3"
+    reason = "owner accepted the exact legacy paid outcome risk"
+    receipt_fields = {
+        "coordination_slot_id": "slot_populated_operator_migration",
+        "client_id": "danus-round:populated-operator-migration",
+        "target": "max",
+        "coordination_generation": 3,
+        "coordination_lane": "critic",
+        "thread_id": "thread-populated-operator-migration",
+        "turn_id": "turn-populated-operator-migration",
+        "prompt_sha256": "1" * 64,
+        "requested_model": "offline-model",
+        "requested_effort": "high",
+        "operator_event_seq": 1,
+        "operator_action": "abandoned_outcome_unknown",
+        "prior_state": "started",
+        "acknowledged_paid_outcome_unknown": 1,
+        "reason_sha256": hashlib.sha256(reason.encode("utf-8")).hexdigest(),
+        "terminal_status": "owner_abandoned_outcome_unknown",
+        "coordination_outcome": "operator_abandoned_outcome_unknown",
+        "effective_adapter_rc": 126,
+        "disposition": "owner_abandoned_outcome_unknown",
+    }
+    _material, receipt_sha256 = HotJoinStore._coordination_operator_receipt_material(
+        receipt_fields
+    )
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.executescript(
+            "CREATE TABLE worker_threads (target TEXT PRIMARY KEY,"
+            "thread_id TEXT NOT NULL,updated_ns INTEGER NOT NULL);"
+            "CREATE TABLE round_intents (client_id TEXT PRIMARY KEY,"
+            "target TEXT NOT NULL,thread_id TEXT NOT NULL,prompt_sha256 TEXT NOT NULL,"
+            "requested_model TEXT NOT NULL,requested_effort TEXT NOT NULL,"
+            "coordination_slot_id TEXT,coordination_generation INTEGER,"
+            "coordination_lane TEXT,turn_id TEXT,state TEXT NOT NULL,"
+            "terminal_status TEXT,created_ns INTEGER NOT NULL,updated_ns INTEGER NOT NULL);"
+            "CREATE TABLE round_operator_events ("
+            "seq INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "action TEXT NOT NULL CHECK(action IN ('abandoned_outcome_unknown')) ,"
+            "client_id TEXT NOT NULL REFERENCES round_intents(client_id),"
+            "target TEXT NOT NULL,thread_id TEXT NOT NULL,"
+            "prior_state TEXT NOT NULL CHECK(prior_state IN "
+            "('dispatching','started','delivery_unknown')) ,reason TEXT NOT NULL,"
+            "acknowledged_paid_outcome_unknown INTEGER NOT NULL "
+            "CHECK(acknowledged_paid_outcome_unknown IN (0,1)),"
+            "created_ns INTEGER NOT NULL,UNIQUE(client_id,action));"
+            "CREATE TABLE round_coordination_operator_receipts ("
+            "receipt_sha256 TEXT PRIMARY KEY,coordination_slot_id TEXT NOT NULL UNIQUE,"
+            "client_id TEXT NOT NULL UNIQUE REFERENCES round_intents(client_id),"
+            "target TEXT NOT NULL,coordination_generation INTEGER NOT NULL,"
+            "coordination_lane TEXT NOT NULL,thread_id TEXT NOT NULL,turn_id TEXT,"
+            "prompt_sha256 TEXT NOT NULL,requested_model TEXT NOT NULL,"
+            "requested_effort TEXT NOT NULL,operator_event_seq INTEGER NOT NULL "
+            "UNIQUE REFERENCES round_operator_events(seq),operator_action TEXT NOT NULL,"
+            "prior_state TEXT NOT NULL,acknowledged_paid_outcome_unknown INTEGER NOT NULL,"
+            "reason_sha256 TEXT NOT NULL,terminal_status TEXT NOT NULL,"
+            "coordination_outcome TEXT NOT NULL,effective_adapter_rc INTEGER NOT NULL,"
+            "disposition TEXT NOT NULL,created_ns INTEGER NOT NULL);"
+        )
+        connection.execute(
+            "INSERT INTO worker_threads VALUES (?,?,?)",
+            ("max", receipt_fields["thread_id"], 1),
+        )
+        connection.execute(
+            "INSERT INTO round_intents VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                receipt_fields["client_id"],
+                "max",
+                receipt_fields["thread_id"],
+                receipt_fields["prompt_sha256"],
+                receipt_fields["requested_model"],
+                receipt_fields["requested_effort"],
+                receipt_fields["coordination_slot_id"],
+                receipt_fields["coordination_generation"],
+                receipt_fields["coordination_lane"],
+                receipt_fields["turn_id"],
+                "failed",
+                receipt_fields["terminal_status"],
+                1,
+                1,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO round_operator_events VALUES (?,?,?,?,?,?,?,?,?)",
+            (
+                1,
+                receipt_fields["operator_action"],
+                receipt_fields["client_id"],
+                "max",
+                receipt_fields["thread_id"],
+                receipt_fields["prior_state"],
+                reason,
+                1,
+                1,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO round_coordination_operator_receipts VALUES "
+            "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (receipt_sha256, *receipt_fields.values(), 1),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    lookup = {
+        "coordination_slot_id": receipt_fields["coordination_slot_id"],
+        "target": "max",
+        "coordination_generation": receipt_fields["coordination_generation"],
+        "coordination_lane": receipt_fields["coordination_lane"],
+        "prompt_sha256": receipt_fields["prompt_sha256"],
+        "requested_model": receipt_fields["requested_model"],
+        "requested_effort": receipt_fields["requested_effort"],
+        "thread_id": receipt_fields["thread_id"],
+    }
+    store = HotJoinStore(project)
+    receipt = store.terminal_receipt_for_coordination_slot(**lookup)
+    assert receipt is not None
+    assert receipt["receipt_sha256"] == receipt_sha256
+    assert receipt["operator_event_seq"] == 1
+    assert receipt["operator_action"] == "abandoned_outcome_unknown"
+    with store._connect() as db:
+        assert (
+            db.execute(
+                "PRAGMA foreign_key_check(round_coordination_operator_receipts)"
+            ).fetchall()
+            == []
+        )
+        assert (
+            db.execute("SELECT COUNT(*) FROM round_operator_events").fetchone()[0] == 1
+        )
+        assert (
+            db.execute(
+                "SELECT COUNT(*) FROM round_coordination_operator_receipts"
+            ).fetchone()[0]
+            == 1
+        )
+
+    replay = HotJoinStore(project).terminal_receipt_for_coordination_slot(**lookup)
+    assert replay == receipt
+
+
+def test_initialization_repairs_previously_published_broken_operator_receipt_fk(
+    tmp_path: Path,
+):
+    project, _worker = _project(tmp_path)
+    control = project / ".human-intervention"
+    control.mkdir(mode=0o700)
+    database = control / "events.sqlite3"
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute(
+            "CREATE TABLE round_coordination_operator_receipts ("
+            "receipt_sha256 TEXT PRIMARY KEY,coordination_slot_id TEXT NOT NULL UNIQUE,"
+            "client_id TEXT NOT NULL UNIQUE REFERENCES round_intents(client_id),"
+            "target TEXT NOT NULL,coordination_generation INTEGER NOT NULL,"
+            "coordination_lane TEXT NOT NULL,thread_id TEXT NOT NULL,turn_id TEXT,"
+            "prompt_sha256 TEXT NOT NULL,requested_model TEXT NOT NULL,"
+            "requested_effort TEXT NOT NULL,operator_event_seq INTEGER NOT NULL "
+            "UNIQUE REFERENCES round_operator_events_before_prepared_cancel(seq),"
+            "operator_action TEXT NOT NULL,prior_state TEXT NOT NULL,"
+            "acknowledged_paid_outcome_unknown INTEGER NOT NULL,"
+            "reason_sha256 TEXT NOT NULL,terminal_status TEXT NOT NULL,"
+            "coordination_outcome TEXT NOT NULL,effective_adapter_rc INTEGER NOT NULL,"
+            "disposition TEXT NOT NULL,created_ns INTEGER NOT NULL)"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    store = HotJoinStore(project)
+    with store._connect() as db:
+        assert {
+            (str(row["from"]), str(row["table"]), str(row["to"]))
+            for row in db.execute(
+                "PRAGMA foreign_key_list(round_coordination_operator_receipts)"
+            ).fetchall()
+        } == {
+            ("client_id", "round_intents", "client_id"),
+            ("operator_event_seq", "round_operator_events", "seq"),
+        }
+        assert (
+            db.execute(
+                "PRAGMA foreign_key_check(round_coordination_operator_receipts)"
+            ).fetchall()
+            == []
+        )
+        assert (
+            db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND "
+                "name='round_coordination_operator_receipts_before_fk_repair'"
+            ).fetchone()
+            is None
+        )
+
+
 def test_attempt_then_terminal_audits_are_append_only_and_finalize_atomically(
     tmp_path: Path,
 ):
@@ -385,6 +666,7 @@ def test_attempt_then_terminal_audits_are_append_only_and_finalize_atomically(
     )
     assert canonical["payload"] == final_payload
     assert store.get_round_intent(intent["client_id"])["state"] == "completed"
+    assert store.thread_id("max") == "thread-1"
     assert store.get(message["message_id"])["state"] == "turn_completed"
     assert [row["kind"] for row in store.round_audit_events(intent["client_id"])] == [
         "attempt",
@@ -402,6 +684,814 @@ def test_attempt_then_terminal_audits_are_append_only_and_finalize_atomically(
     )
     assert replay["payload"] == final_payload
     assert len(store.round_audit_events(intent["client_id"])) == 2
+
+
+def _coordination_terminal_payload(
+    *,
+    thread_id: str,
+    turn_id: str,
+    terminal_status: str = "completed",
+    requested_model: str = "offline-model",
+    requested_effort: str = "high",
+    effective_adapter_rc: int = 0,
+    disposition: str = "completed",
+) -> str:
+    return (
+        json.dumps(
+            {
+                "event": "turn_completed",
+                "terminal_observed": True,
+                "thread_id": thread_id,
+                "turn_id": turn_id,
+                "status": terminal_status,
+                "requested_model": requested_model,
+                "requested_effort": requested_effort,
+                "effective_adapter_rc": effective_adapter_rc,
+                "coordination_disposition": disposition,
+            },
+            sort_keys=True,
+        )
+        + "\n"
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "wrong_value"),
+    [
+        ("event", "turn_started"),
+        ("terminal_observed", False),
+        ("thread_id", "wrong-thread"),
+        ("turn_id", "wrong-turn"),
+        ("status", "interrupted"),
+        ("requested_model", "wrong-model"),
+        ("requested_effort", "low"),
+        ("effective_adapter_rc", 124),
+        ("coordination_disposition", "hard_timeout"),
+    ],
+)
+def test_coordination_terminal_header_mismatch_rolls_back_every_publish(
+    tmp_path: Path,
+    field: str,
+    wrong_value: object,
+):
+    project, _worker = _project(tmp_path)
+    store = HotJoinStore(project)
+    store.set_thread_id("max", "thread-header-fence")
+    intent = store.round_intent(
+        "max",
+        "thread-header-fence",
+        prompt_sha256="8" * 64,
+        requested_model="offline-model",
+        requested_effort="high",
+        coordination_slot_id="slot_header_fence",
+        coordination_generation=1,
+        coordination_lane="root",
+    )
+    store.record_round_intent(
+        intent["client_id"],
+        "started",
+        turn_id="turn-header-fence",
+        expected_states={"prepared"},
+    )
+    header = json.loads(
+        _coordination_terminal_payload(
+            thread_id="thread-header-fence",
+            turn_id="turn-header-fence",
+        )
+    )
+    header[field] = wrong_value
+    bad_payload = json.dumps(header, sort_keys=True) + "\n"
+
+    with pytest.raises(HotJoinError, match="audit binding conflicts"):
+        store.finalize_round(
+            intent["client_id"],
+            bad_payload,
+            thread_id="thread-header-fence",
+            turn_id="turn-header-fence",
+            terminal_status="completed",
+            effective_adapter_rc=0,
+            disposition="completed",
+        )
+
+    saved = store.get_round_intent(intent["client_id"])
+    assert saved["state"] == "started"
+    assert saved["turn_id"] == "turn-header-fence"
+    assert saved["terminal_status"] is None
+    assert store.thread_id("max") == "thread-header-fence"
+    assert store.round_audit_events(intent["client_id"]) == []
+    assert all(
+        event["action"] != "retired_coordination_terminal"
+        for event in store.thread_events("max")
+    )
+    with store._connect() as db:
+        assert (
+            db.execute("SELECT COUNT(*) FROM round_terminal_receipts").fetchone()[0]
+            == 0
+        )
+
+    good_payload = _coordination_terminal_payload(
+        thread_id="thread-header-fence",
+        turn_id="turn-header-fence",
+    )
+    store.finalize_round(
+        intent["client_id"],
+        good_payload,
+        thread_id="thread-header-fence",
+        turn_id="turn-header-fence",
+        terminal_status="completed",
+        effective_adapter_rc=0,
+        disposition="completed",
+    )
+    assert store.get_round_intent(intent["client_id"])["state"] == "completed"
+
+
+def test_coordination_terminal_receipt_is_atomic_and_exactly_bound(tmp_path: Path):
+    project, _worker = _project(tmp_path)
+    store = HotJoinStore(project)
+    store.set_thread_id("max", "thread-coordination")
+    intent = store.round_intent(
+        "max",
+        "thread-coordination",
+        prompt_sha256="a" * 64,
+        requested_model="offline-model",
+        requested_effort="high",
+        coordination_slot_id="slot_receipt",
+        coordination_generation=7,
+        coordination_lane="root",
+    )
+    store.record_round_intent(
+        intent["client_id"],
+        "started",
+        turn_id="turn-coordination",
+        expected_states={"prepared"},
+    )
+    payload = (
+        json.dumps(
+            {
+                "event": "turn_completed",
+                "terminal_observed": True,
+                "thread_id": "thread-coordination",
+                "turn_id": "turn-coordination",
+                "status": "completed",
+                "requested_model": "offline-model",
+                "requested_effort": "high",
+                "effective_adapter_rc": 0,
+                "coordination_disposition": "completed",
+            },
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    store.finalize_round(
+        intent["client_id"],
+        payload,
+        thread_id="thread-coordination",
+        turn_id="turn-coordination",
+        terminal_status="completed",
+        effective_adapter_rc=0,
+        disposition="completed",
+    )
+
+    expected = {
+        "coordination_slot_id": "slot_receipt",
+        "target": "max",
+        "coordination_generation": 7,
+        "coordination_lane": "root",
+        "prompt_sha256": "a" * 64,
+        "requested_model": "offline-model",
+        "requested_effort": "high",
+        "thread_id": None,
+    }
+    receipt = store.terminal_receipt_for_coordination_slot(**expected)
+    assert receipt is not None
+    assert receipt["effective_adapter_rc"] == 0
+    assert receipt["coordination_outcome"] == "terminal_rc_0"
+    assert receipt["audit_header"]["turn_id"] == "turn-coordination"
+    assert store.thread_id("max") is None
+    assert store.thread_events("max")[-1]["action"] == ("retired_coordination_terminal")
+
+    store.finalize_round(
+        intent["client_id"],
+        payload,
+        thread_id="thread-coordination",
+        turn_id="turn-coordination",
+        terminal_status="completed",
+        effective_adapter_rc=0,
+        disposition="completed",
+    )
+    assert store.terminal_receipt_for_coordination_slot(**expected) == receipt
+
+    for field, conflicting in (
+        ("coordination_generation", 8),
+        ("coordination_lane", "critic"),
+        ("prompt_sha256", "b" * 64),
+        ("requested_model", "other-model"),
+        ("requested_effort", "low"),
+        ("thread_id", "other-thread"),
+    ):
+        mutated = dict(expected)
+        mutated[field] = conflicting
+        with pytest.raises(HotJoinError):
+            store.terminal_receipt_for_coordination_slot(**mutated)
+
+    store.set_thread_id("max", "thread-next-generation")
+    next_intent = store.round_intent(
+        "max",
+        "thread-next-generation",
+        prompt_sha256="e" * 64,
+        requested_model="offline-model",
+        requested_effort="high",
+        coordination_slot_id="slot_next_generation",
+        coordination_generation=8,
+        coordination_lane="root",
+    )
+    assert next_intent["thread_id"] == "thread-next-generation"
+
+
+def _finalized_coordination_turn(
+    tmp_path: Path,
+) -> tuple[HotJoinStore, dict[str, Any], str, dict[str, Any]]:
+    project, _worker = _project(tmp_path)
+    store = HotJoinStore(project)
+    store.set_thread_id("max", "thread-protected-terminal")
+    intent = store.round_intent(
+        "max",
+        "thread-protected-terminal",
+        prompt_sha256="7" * 64,
+        requested_model="offline-model",
+        requested_effort="high",
+        coordination_slot_id="slot_protected_terminal",
+        coordination_generation=4,
+        coordination_lane="critic",
+    )
+    store.record_round_intent(
+        intent["client_id"],
+        "started",
+        turn_id="turn-protected-terminal",
+        expected_states={"prepared"},
+    )
+    payload = _coordination_terminal_payload(
+        thread_id="thread-protected-terminal",
+        turn_id="turn-protected-terminal",
+    )
+    store.finalize_round(
+        intent["client_id"],
+        payload,
+        thread_id="thread-protected-terminal",
+        turn_id="turn-protected-terminal",
+        terminal_status="completed",
+        effective_adapter_rc=0,
+        disposition="completed",
+    )
+    lookup = {
+        "coordination_slot_id": "slot_protected_terminal",
+        "target": "max",
+        "coordination_generation": 4,
+        "coordination_lane": "critic",
+        "prompt_sha256": "7" * 64,
+        "requested_model": "offline-model",
+        "requested_effort": "high",
+        "thread_id": None,
+    }
+    return store, intent, payload, lookup
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "receipt_sha",
+        "receipt_binding",
+        "final_audit_missing",
+        "final_audit_digest",
+        "final_audit_coherent_wrong_header",
+        "retirement_event_missing",
+        "retirement_event_binding",
+        "thread_mapping_reappeared",
+    ],
+)
+def test_coordination_terminal_receipt_tamper_matrix_fails_closed(
+    tmp_path: Path,
+    tamper: str,
+):
+    store, intent, _payload, lookup = _finalized_coordination_turn(tmp_path)
+    with store._connect() as db:
+        if tamper == "receipt_sha":
+            db.execute(
+                "UPDATE round_terminal_receipts SET receipt_sha256=?",
+                ("f" * 64,),
+            )
+        elif tamper == "receipt_binding":
+            db.execute("UPDATE round_terminal_receipts SET coordination_generation=5")
+        elif tamper == "final_audit_missing":
+            db.execute(
+                "DELETE FROM round_audit_events WHERE client_id=? AND kind='final'",
+                (intent["client_id"],),
+            )
+        elif tamper == "final_audit_digest":
+            db.execute(
+                "UPDATE round_audit_events SET payload_sha256=? "
+                "WHERE client_id=? AND kind='final'",
+                ("e" * 64, intent["client_id"]),
+            )
+        elif tamper == "final_audit_coherent_wrong_header":
+            audit = db.execute(
+                "SELECT * FROM round_audit_events WHERE client_id=? AND kind='final'",
+                (intent["client_id"],),
+            ).fetchone()
+            receipt = db.execute(
+                "SELECT * FROM round_terminal_receipts WHERE client_id=?",
+                (intent["client_id"],),
+            ).fetchone()
+            assert audit is not None and receipt is not None
+            header = json.loads(str(audit["payload"]).splitlines()[0])
+            header["requested_model"] = "coherently-forged-model"
+            forged_payload = json.dumps(header, sort_keys=True) + "\n"
+            forged_digest = hashlib.sha256(forged_payload.encode("utf-8")).hexdigest()
+            receipt_fields = dict(receipt)
+            receipt_fields["audit_payload_sha256"] = forged_digest
+            _material, forged_receipt_sha = store._terminal_receipt_material(
+                receipt_fields
+            )
+            db.execute(
+                "UPDATE round_audit_events SET payload=?,payload_sha256=? "
+                "WHERE client_id=? AND kind='final'",
+                (forged_payload, forged_digest, intent["client_id"]),
+            )
+            db.execute(
+                "UPDATE round_terminal_receipts "
+                "SET audit_payload_sha256=?,receipt_sha256=? WHERE client_id=?",
+                (forged_digest, forged_receipt_sha, intent["client_id"]),
+            )
+        elif tamper == "retirement_event_missing":
+            db.execute(
+                "DELETE FROM worker_thread_events "
+                "WHERE action='retired_coordination_terminal'"
+            )
+        elif tamper == "retirement_event_binding":
+            db.execute(
+                "UPDATE worker_thread_events SET detail='wrong-client' "
+                "WHERE action='retired_coordination_terminal'"
+            )
+        elif tamper == "thread_mapping_reappeared":
+            db.execute(
+                "INSERT INTO worker_threads(target,thread_id,updated_ns) "
+                "VALUES ('max','unexpected-thread',1)"
+            )
+        else:  # pragma: no cover - the parameter list is exhaustive
+            raise AssertionError(tamper)
+
+    with pytest.raises(HotJoinError):
+        store.terminal_receipt_for_coordination_slot(**lookup)
+
+
+def test_coordination_terminal_receipt_insert_fault_rolls_back_all_state(
+    tmp_path: Path,
+):
+    project, _worker = _project(tmp_path)
+    store = HotJoinStore(project)
+    store.set_thread_id("max", "thread-receipt-cut")
+    intent = store.round_intent(
+        "max",
+        "thread-receipt-cut",
+        prompt_sha256="6" * 64,
+        requested_model="offline-model",
+        requested_effort="high",
+        coordination_slot_id="slot_receipt_cut",
+        coordination_generation=1,
+        coordination_lane="root",
+    )
+    store.record_round_intent(
+        intent["client_id"],
+        "started",
+        turn_id="turn-receipt-cut",
+        expected_states={"prepared"},
+    )
+    payload = _coordination_terminal_payload(
+        thread_id="thread-receipt-cut",
+        turn_id="turn-receipt-cut",
+    )
+    with store._connect() as db:
+        db.execute(
+            "CREATE TRIGGER inject_terminal_receipt_cut "
+            "BEFORE INSERT ON round_terminal_receipts "
+            "BEGIN SELECT RAISE(ABORT,'injected receipt cut'); END"
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="injected receipt cut"):
+        store.finalize_round(
+            intent["client_id"],
+            payload,
+            thread_id="thread-receipt-cut",
+            turn_id="turn-receipt-cut",
+            terminal_status="completed",
+            effective_adapter_rc=0,
+            disposition="completed",
+        )
+
+    assert store.get_round_intent(intent["client_id"])["state"] == "started"
+    assert store.thread_id("max") == "thread-receipt-cut"
+    assert store.round_audit_events(intent["client_id"]) == []
+    assert all(
+        event["action"] != "retired_coordination_terminal"
+        for event in store.thread_events("max")
+    )
+    with store._connect() as db:
+        assert (
+            db.execute("SELECT COUNT(*) FROM round_terminal_receipts").fetchone()[0]
+            == 0
+        )
+        db.execute("DROP TRIGGER inject_terminal_receipt_cut")
+
+    store.finalize_round(
+        intent["client_id"],
+        payload,
+        thread_id="thread-receipt-cut",
+        turn_id="turn-receipt-cut",
+        terminal_status="completed",
+        effective_adapter_rc=0,
+        disposition="completed",
+    )
+    assert store.thread_id("max") is None
+
+
+def test_coordination_terminal_intent_without_receipt_fails_closed(tmp_path: Path):
+    project, _worker = _project(tmp_path)
+    store = HotJoinStore(project)
+    store.set_thread_id("max", "thread-coordination")
+    intent = store.round_intent(
+        "max",
+        "thread-coordination",
+        prompt_sha256="a" * 64,
+        requested_model="offline-model",
+        requested_effort="high",
+        coordination_slot_id="slot_missing_receipt",
+        coordination_generation=1,
+        coordination_lane="root",
+    )
+    with store._connect() as db:
+        db.execute(
+            "UPDATE round_intents SET state='completed',turn_id='turn-1',"
+            "terminal_status='completed' WHERE client_id=?",
+            (intent["client_id"],),
+        )
+        db.commit()
+
+    with pytest.raises(HotJoinError, match="missing its exact receipt"):
+        store.terminal_receipt_for_coordination_slot(
+            coordination_slot_id="slot_missing_receipt",
+            target="max",
+            coordination_generation=1,
+            coordination_lane="root",
+            prompt_sha256="a" * 64,
+            requested_model="offline-model",
+            requested_effort="high",
+            thread_id="thread-coordination",
+        )
+
+
+@pytest.mark.parametrize("terminal_state", ["completed", "failed"])
+def test_generic_terminal_transition_is_forbidden_for_coordination_only(
+    tmp_path: Path,
+    terminal_state: str,
+):
+    project, _worker = _project(tmp_path)
+    store = HotJoinStore(project)
+    coordination_intent = store.round_intent(
+        "max",
+        "thread-protected-generic-terminal",
+        prompt_sha256="5" * 64,
+        requested_model="offline-model",
+        requested_effort="high",
+        coordination_slot_id="slot_protected_generic_terminal",
+        coordination_generation=1,
+        coordination_lane="root",
+    )
+    with pytest.raises(HotJoinError, match="require an exact finalize or operator"):
+        store.record_round_intent(
+            coordination_intent["client_id"],
+            terminal_state,
+            expected_states={"prepared"},
+        )
+    assert store.get_round_intent(coordination_intent["client_id"])["state"] == (
+        "prepared"
+    )
+    with store._connect() as db:
+        assert [
+            event["state"]
+            for event in db.execute(
+                "SELECT state FROM round_events WHERE client_id=? ORDER BY seq",
+                (coordination_intent["client_id"],),
+            ).fetchall()
+        ] == ["prepared"]
+
+    legacy_intent = store.round_intent(
+        "legacy",
+        "thread-legacy-generic-terminal",
+        prompt_sha256="4" * 64,
+        requested_model="offline-model",
+        requested_effort="low",
+    )
+    saved_legacy = store.record_round_intent(
+        legacy_intent["client_id"],
+        terminal_state,
+        expected_states={"prepared"},
+    )
+    assert saved_legacy["state"] == terminal_state
+
+
+@pytest.mark.parametrize(
+    ("action", "expected_outcome", "expected_disposition"),
+    [
+        (
+            "cancelled_not_dispatched",
+            "operator_cancelled_not_dispatched",
+            "owner_cancelled_not_dispatched",
+        ),
+        (
+            "abandoned_outcome_unknown",
+            "operator_abandoned_outcome_unknown",
+            "owner_abandoned_outcome_unknown",
+        ),
+    ],
+)
+def test_coordination_operator_terminal_receipt_is_exact_and_content_free(
+    tmp_path: Path,
+    action: str,
+    expected_outcome: str,
+    expected_disposition: str,
+):
+    project, _worker = _project(tmp_path)
+    store = HotJoinStore(project)
+    store.set_thread_id("max", "thread-operator")
+    intent = store.round_intent(
+        "max",
+        "thread-operator",
+        prompt_sha256="c" * 64,
+        requested_model="offline-model",
+        requested_effort="high",
+        coordination_slot_id="slot_operator",
+        coordination_generation=3,
+        coordination_lane="critic",
+    )
+    if action == "cancelled_not_dispatched":
+        store.cancel_prepared_round_intent(
+            target="max",
+            thread_id="thread-operator",
+            client_id=intent["client_id"],
+            reason="owner cancelled before transport",
+        )
+    else:
+        store.record_round_intent(
+            intent["client_id"],
+            "started",
+            turn_id="turn-operator",
+            expected_states={"prepared"},
+        )
+        store.abandon_round_intent(
+            target="max",
+            thread_id="thread-operator",
+            client_id=intent["client_id"],
+            expected_state="started",
+            reason="owner accepts an unknown paid outcome",
+            acknowledge_paid_outcome_unknown=True,
+        )
+
+    expected = {
+        "coordination_slot_id": "slot_operator",
+        "target": "max",
+        "coordination_generation": 3,
+        "coordination_lane": "critic",
+        "prompt_sha256": "c" * 64,
+        "requested_model": "offline-model",
+        "requested_effort": "high",
+        "thread_id": "thread-operator",
+    }
+    receipt = store.terminal_receipt_for_coordination_slot(**expected)
+    assert receipt is not None
+    assert receipt["receipt_kind"] == "operator_terminal"
+    assert receipt["operator_action"] == action
+    assert receipt["coordination_outcome"] == expected_outcome
+    assert receipt["effective_adapter_rc"] == 126
+    assert receipt["disposition"] == expected_disposition
+    assert "reason" not in receipt
+    with pytest.raises(StaleClaim, match="cannot be reactivated"):
+        store.record_round_intent(
+            intent["client_id"],
+            "dispatching",
+            expected_states={"failed"},
+        )
+    with store._connect() as db:
+        stored = db.execute(
+            "SELECT * FROM round_coordination_operator_receipts"
+        ).fetchone()
+        assert stored is not None and "reason" not in stored.keys()
+
+    with store._connect() as db:
+        db.execute(
+            "UPDATE round_operator_events SET reason='tampered' WHERE client_id=?",
+            (intent["client_id"],),
+        )
+        db.commit()
+    with pytest.raises(HotJoinError, match="binding conflicts"):
+        store.terminal_receipt_for_coordination_slot(**expected)
+
+
+def test_concurrent_coordination_finalize_replays_one_exact_terminal_receipt(
+    tmp_path: Path,
+):
+    project, _worker = _project(tmp_path)
+    setup = HotJoinStore(project)
+    setup.set_thread_id("max", "thread-concurrent-finalize")
+    intent = setup.round_intent(
+        "max",
+        "thread-concurrent-finalize",
+        prompt_sha256="3" * 64,
+        requested_model="offline-model",
+        requested_effort="high",
+        coordination_slot_id="slot_concurrent_finalize",
+        coordination_generation=1,
+        coordination_lane="root",
+    )
+    setup.record_round_intent(
+        intent["client_id"],
+        "started",
+        turn_id="turn-concurrent-finalize",
+        expected_states={"prepared"},
+    )
+    payload = _coordination_terminal_payload(
+        thread_id="thread-concurrent-finalize",
+        turn_id="turn-concurrent-finalize",
+    )
+    barrier = threading.Barrier(2)
+    results: list[dict[str, Any]] = []
+    errors: list[BaseException] = []
+
+    def finalize() -> None:
+        try:
+            local = HotJoinStore(project)
+            barrier.wait()
+            results.append(
+                local.finalize_round(
+                    intent["client_id"],
+                    payload,
+                    thread_id="thread-concurrent-finalize",
+                    turn_id="turn-concurrent-finalize",
+                    terminal_status="completed",
+                    effective_adapter_rc=0,
+                    disposition="completed",
+                )
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=finalize) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+    assert not any(thread.is_alive() for thread in threads)
+    assert errors == []
+    assert len(results) == 2
+    assert {result["payload_sha256"] for result in results} == {
+        hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    }
+    assert setup.thread_id("max") is None
+    with setup._connect() as db:
+        assert (
+            db.execute(
+                "SELECT COUNT(*) FROM round_audit_events "
+                "WHERE client_id=? AND kind='final'",
+                (intent["client_id"],),
+            ).fetchone()[0]
+            == 1
+        )
+        assert (
+            db.execute(
+                "SELECT COUNT(*) FROM round_terminal_receipts WHERE client_id=?",
+                (intent["client_id"],),
+            ).fetchone()[0]
+            == 1
+        )
+        assert (
+            db.execute(
+                "SELECT COUNT(*) FROM worker_thread_events "
+                "WHERE action='retired_coordination_terminal'"
+            ).fetchone()[0]
+            == 1
+        )
+
+
+@pytest.mark.parametrize("operator_action", ["cancel", "abandon"])
+def test_concurrent_coordination_operator_terminal_is_exactly_one_cas(
+    tmp_path: Path,
+    operator_action: str,
+):
+    project, _worker = _project(tmp_path)
+    setup = HotJoinStore(project)
+    setup.set_thread_id("max", "thread-concurrent-operator")
+    intent = setup.round_intent(
+        "max",
+        "thread-concurrent-operator",
+        prompt_sha256="2" * 64,
+        requested_model="offline-model",
+        requested_effort="high",
+        coordination_slot_id="slot_concurrent_operator",
+        coordination_generation=1,
+        coordination_lane="critic",
+    )
+    if operator_action == "abandon":
+        setup.record_round_intent(
+            intent["client_id"],
+            "started",
+            turn_id="turn-concurrent-operator",
+            expected_states={"prepared"},
+        )
+    barrier = threading.Barrier(2)
+    results: list[dict[str, Any]] = []
+    errors: list[BaseException] = []
+
+    def terminalize() -> None:
+        try:
+            local = HotJoinStore(project)
+            barrier.wait()
+            if operator_action == "cancel":
+                result = local.cancel_prepared_round_intent(
+                    target="max",
+                    thread_id="thread-concurrent-operator",
+                    client_id=intent["client_id"],
+                    reason="one exact concurrent cancellation",
+                )
+            else:
+                result = local.abandon_round_intent(
+                    target="max",
+                    thread_id="thread-concurrent-operator",
+                    client_id=intent["client_id"],
+                    expected_state="started",
+                    reason="one exact concurrent abandonment",
+                    acknowledge_paid_outcome_unknown=True,
+                )
+            results.append(result)
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=terminalize) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+    assert not any(thread.is_alive() for thread in threads)
+    assert len(results) == 1
+    assert len(errors) == 1 and isinstance(errors[0], StaleClaim)
+    assert setup.thread_id("max") == "thread-concurrent-operator"
+    with setup._connect() as db:
+        assert (
+            db.execute(
+                "SELECT COUNT(*) FROM round_coordination_operator_receipts "
+                "WHERE client_id=?",
+                (intent["client_id"],),
+            ).fetchone()[0]
+            == 1
+        )
+        assert (
+            db.execute(
+                "SELECT COUNT(*) FROM round_operator_events WHERE client_id=?",
+                (intent["client_id"],),
+            ).fetchone()[0]
+            == 1
+        )
+        assert (
+            db.execute(
+                "SELECT COUNT(*) FROM round_events "
+                "WHERE client_id=? AND state='failed'",
+                (intent["client_id"],),
+            ).fetchone()[0]
+            == 1
+        )
+
+
+def test_legacy_operator_terminal_does_not_create_coordination_receipt(tmp_path: Path):
+    project, _worker = _project(tmp_path)
+    store = HotJoinStore(project)
+    intent = store.round_intent(
+        "max",
+        "thread-legacy",
+        prompt_sha256="d" * 64,
+        requested_model="offline-model",
+        requested_effort="low",
+    )
+    store.cancel_prepared_round_intent(
+        target="max",
+        thread_id="thread-legacy",
+        client_id=intent["client_id"],
+        reason="legacy cancellation",
+    )
+    with store._connect() as db:
+        assert (
+            db.execute(
+                "SELECT COUNT(*) FROM round_coordination_operator_receipts"
+            ).fetchone()[0]
+            == 0
+        )
 
 
 def test_prepared_round_failure_is_known_undispatched_not_delivery_unknown(
@@ -424,6 +1514,50 @@ def test_prepared_round_failure_is_known_undispatched_not_delivery_unknown(
     assert saved["state"] == "failed"
     assert saved["terminal_status"] == "not_dispatched"
     assert store.unfinished_round_intent("max") is None
+
+
+def test_coordination_prepared_attempt_stays_exactly_retryable_and_cancellable(
+    tmp_path: Path,
+):
+    project, _worker = _project(tmp_path)
+    store = HotJoinStore(project)
+    store.set_thread_id("max", "thread-prepared-coordination")
+    intent = store.round_intent(
+        "max",
+        "thread-prepared-coordination",
+        prompt_sha256="f" * 64,
+        requested_model="offline-model",
+        requested_effort="high",
+        coordination_slot_id="slot_prepared_retry",
+        coordination_generation=1,
+        coordination_lane="root",
+    )
+    store.record_round_attempt_audit(
+        intent["client_id"],
+        '{"event":"turn_completed","terminal_observed":false}\n',
+    )
+    saved = store.get_round_intent(intent["client_id"])
+    assert saved["state"] == "prepared" and saved["terminal_status"] is None
+    assert store.unfinished_round_intent("max")["client_id"] == intent["client_id"]
+
+    store.cancel_prepared_round_intent(
+        target="max",
+        thread_id="thread-prepared-coordination",
+        client_id=intent["client_id"],
+        reason="owner cancels exact unspent coordination turn",
+    )
+    receipt = store.terminal_receipt_for_coordination_slot(
+        coordination_slot_id="slot_prepared_retry",
+        target="max",
+        coordination_generation=1,
+        coordination_lane="root",
+        prompt_sha256="f" * 64,
+        requested_model="offline-model",
+        requested_effort="high",
+        thread_id="thread-prepared-coordination",
+    )
+    assert receipt is not None
+    assert receipt["operator_action"] == "cancelled_not_dispatched"
 
 
 def test_dangling_database_symlink_cannot_create_outside_target(tmp_path: Path):
@@ -562,16 +1696,14 @@ def test_crash_reconciliation_uses_thread_read_client_id(tmp_path: Path):
     client = _StubClient(
         read_payload={
             "thread": {
-                    "id": "thread-1",
-                    "turns": [
-                        {
-                            "id": "turn-1",
-                            "status": "inProgress",
-                            "items": [
-                                {"type": "userMessage", "clientId": client_id}
-                            ],
-                        }
-                    ]
+                "id": "thread-1",
+                "turns": [
+                    {
+                        "id": "turn-1",
+                        "status": "inProgress",
+                        "items": [{"type": "userMessage", "clientId": client_id}],
+                    }
+                ],
             }
         }
     )
@@ -608,17 +1740,13 @@ def test_ack_lost_message_reconciles_to_exact_completed_turn(tmp_path: Path):
                     {
                         "id": "turn-1",
                         "status": "completed",
-                        "items": [
-                            {"type": "userMessage", "clientId": client_id}
-                        ],
+                        "items": [{"type": "userMessage", "clientId": client_id}],
                     }
-                ]
+                ],
             }
         }
     )
-    HotJoinBroker(
-        store, client, target="max", thread_id="thread-1"
-    ).reconcile_routing()
+    HotJoinBroker(store, client, target="max", thread_id="thread-1").reconcile_routing()
     row = store.get(message["message_id"])
     assert row["state"] == "turn_completed"
     assert row["turn_id"] == "turn-1"
@@ -701,7 +1829,9 @@ def test_owner_reset_thread_is_cas_fenced_audited_and_blocks_unfinished_turn(
         "state": "cleared",
     }
     assert store.thread_id("max") is None
-    assert [(event["action"], event["thread_id"]) for event in store.thread_events("max")] == [
+    assert [
+        (event["action"], event["thread_id"]) for event in store.thread_events("max")
+    ] == [
         ("set", "thread-old"),
         ("cleared", "thread-old"),
     ]
@@ -819,9 +1949,11 @@ def _mailbox_snapshot(store: HotJoinStore, message_id: str) -> dict[str, Any]:
 def _round_ledger_snapshot(store: HotJoinStore, client_id: str) -> dict[str, Any]:
     with store._connect() as db:
         return {
-            "intent": dict(db.execute(
-                "SELECT * FROM round_intents WHERE client_id=?", (client_id,)
-            ).fetchone()),
+            "intent": dict(
+                db.execute(
+                    "SELECT * FROM round_intents WHERE client_id=?", (client_id,)
+                ).fetchone()
+            ),
             "round_events": [
                 dict(row)
                 for row in db.execute(
@@ -1003,7 +2135,10 @@ def test_cli_abandon_intent_requires_failstop_holds_lock_never_signals_then_rota
     cli.os.kill = lambda *args: signals.append(args)
     cli.os.killpg = lambda *args: signals.append(args)
     try:
-        with _agents_root(root), pytest.raises(SystemExit, match="worker is still live"):
+        with (
+            _agents_root(root),
+            pytest.raises(SystemExit, match="worker is still live"),
+        ):
             cli.do_abandon_intent(
                 "P/max",
                 thread_id="thread-ambiguous",
@@ -1021,7 +2156,10 @@ def test_cli_abandon_intent_requires_failstop_holds_lock_never_signals_then_rota
         lifecycle_lock = cli._open_worker_lock(cli.L.WorkerLayout(worker))
         cli.fcntl.flock(lifecycle_lock, cli.fcntl.LOCK_EX | cli.fcntl.LOCK_NB)
         try:
-            with _agents_root(root), pytest.raises(SystemExit, match="lifecycle lock is busy"):
+            with (
+                _agents_root(root),
+                pytest.raises(SystemExit, match="lifecycle lock is busy"),
+            ):
                 cli.do_abandon_intent(
                     "P/max",
                     thread_id="thread-ambiguous",
@@ -1068,11 +2206,13 @@ def test_cli_abandon_intent_requires_failstop_holds_lock_never_signals_then_rota
         ) = originals
 
     assert store.thread_id("max") is None
-    assert _mailbox_snapshot(store, message["message_id"])["messages"] == (
-        mailbox_before["messages"]
+    assert (
+        _mailbox_snapshot(store, message["message_id"])["messages"]
+        == (mailbox_before["messages"])
     )
-    assert _mailbox_snapshot(store, message["message_id"])["deliveries"] == (
-        mailbox_before["deliveries"]
+    assert (
+        _mailbox_snapshot(store, message["message_id"])["deliveries"]
+        == (mailbox_before["deliveries"])
     )
     assert signals == []
 
@@ -1120,7 +2260,10 @@ def test_cancel_prepared_intent_exact_cas_unblocks_drift_without_paid_dispatch(
     cli.os.kill = lambda *args: signals.append(args)
     cli.os.killpg = lambda *args: signals.append(args)
     try:
-        with _agents_root(root), pytest.raises(SystemExit, match="worker is still live"):
+        with (
+            _agents_root(root),
+            pytest.raises(SystemExit, match="worker is still live"),
+        ):
             cli.do_cancel_prepared_intent(
                 "P/max",
                 thread_id="thread-before-drift",
@@ -1162,9 +2305,7 @@ def test_cancel_prepared_intent_exact_cas_unblocks_drift_without_paid_dispatch(
         "failed",
     ]
     assert events["operator_events"][-1]["action"] == "cancelled_not_dispatched"
-    assert events["operator_events"][-1][
-        "acknowledged_paid_outcome_unknown"
-    ] == 0
+    assert events["operator_events"][-1]["acknowledged_paid_outcome_unknown"] == 0
     assert rotated["state"] == "rotated"
     mailbox_after = _mailbox_snapshot(store, message["message_id"])
     for key in ("messages", "deliveries"):
@@ -1187,9 +2328,7 @@ def test_cancel_prepared_intent_exact_cas_unblocks_drift_without_paid_dispatch(
 
 def _remove_mapping(action: str, target: str, expected_thread_id: str) -> dict:
     if action == "reset":
-        return cli.do_reset_thread(
-            target, expected_thread_id=expected_thread_id
-        )
+        return cli.do_reset_thread(target, expected_thread_id=expected_thread_id)
     return cli.do_rotate_thread(
         target, expected_thread_id=expected_thread_id, reason="terminal"
     )
@@ -1326,9 +2465,7 @@ def test_rotation_lock_fences_start_until_thread_cas_finishes(tmp_path: Path):
         with _agents_root(root):
             thread.start()
             entered.wait(timeout=2)
-            assert cli.do_start("P/max") == [
-                {"worker": "max", "result": "locked"}
-            ]
+            assert cli.do_start("P/max") == [{"worker": "max", "result": "locked"}]
             assert store.thread_id("max") == "thread-old"
             assert [event["action"] for event in store.thread_events("max")] == ["set"]
             assert store.list_messages(target="max") == messages_before
@@ -1409,9 +2546,7 @@ def test_reset_lock_fences_start_until_thread_cas_finishes(tmp_path: Path):
         with _agents_root(root):
             thread.start()
             entered.wait(timeout=2)
-            assert cli.do_start("P/max") == [
-                {"worker": "max", "result": "locked"}
-            ]
+            assert cli.do_start("P/max") == [{"worker": "max", "result": "locked"}]
             assert store.thread_id("max") == "thread-old"
             assert store.list_messages(target="max") == messages_before
             assert store.events(message["message_id"]) == deliveries_before
@@ -1548,7 +2683,10 @@ def test_live_pid_rotation_rejection_holds_lock_and_preserves_all_ledgers(
     cli.os.kill = lambda *args: signals.append(args)
     cli.os.killpg = lambda *args: signals.append(args)
     try:
-        with _agents_root(root), pytest.raises(SystemExit, match="worker is still live"):
+        with (
+            _agents_root(root),
+            pytest.raises(SystemExit, match="worker is still live"),
+        ):
             _remove_mapping(action, "P/max", "thread-live")
     finally:
         cli._pid_record_is_live, cli.os.kill, cli.os.killpg = originals
@@ -1584,8 +2722,9 @@ def test_reset_unfinished_intent_rejection_preserves_mailbox_and_never_signals(
     cli.os.kill = lambda *args: signals.append(args)
     cli.os.killpg = lambda *args: signals.append(args)
     try:
-        with _agents_root(root), pytest.raises(
-            SystemExit, match="unfinished paid-turn intent"
+        with (
+            _agents_root(root),
+            pytest.raises(SystemExit, match="unfinished paid-turn intent"),
         ):
             cli.do_reset_thread("P/max", expected_thread_id="thread-pending")
     finally:
@@ -1858,9 +2997,207 @@ def test_token_usage_projection_drops_secret_extras_and_rejects_bad_counts(
 
     malformed = json.loads(json.dumps(notification))
     malformed["params"]["tokenUsage"]["last"]["inputTokens"] = True
-    with pytest.raises(ProtocolError, match="non-negative integer"):
-        client._dispatch(malformed)
+    client._dispatch(malformed)
     assert client.token_usage("thread-1", "turn-1") == projected
+    assert "TOKEN_USAGE_SECRET_CANARY" not in json.dumps(client.notifications())
+    bandwidth = client.reasoning_bandwidth(
+        "thread-1",
+        "turn-1",
+        {"id": "turn-1", "status": "completed", "durationMs": 10, "items": []},
+    )
+    assert bandwidth["finality"] == "partial"
+    assert "token_usage_notification_unavailable" in bandwidth["finality_reasons"]
+    assert bandwidth["usage_growth_sample_count"] == 1
+
+
+def test_reasoning_bandwidth_tracks_content_free_unions_and_resume_triggers(
+    tmp_path: Path,
+):
+    client = AppServerClient([sys.executable], cwd=tmp_path)
+    client._dispatch(
+        {
+            "method": "turn/started",
+            "params": {
+                "threadId": "thread-1",
+                "turn": {"id": "turn-1", "status": "inProgress"},
+            },
+        }
+    )
+
+    def lifecycle(
+        *,
+        item: dict[str, object],
+        started: int,
+        completed: int,
+    ) -> None:
+        client._dispatch(
+            {
+                "method": "item/started",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "item": dict(item),
+                    "startedAtMs": started,
+                },
+            }
+        )
+        client._dispatch(
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "item": dict(item),
+                    "completedAtMs": completed,
+                },
+            }
+        )
+
+    lifecycle(
+        item={"id": "reason-1", "type": "reasoning", "text": "SECRET_REASONING"},
+        started=100,
+        completed=300,
+    )
+    lifecycle(
+        item={
+            "id": "memory-1",
+            "type": "mcpToolCall",
+            "server": "danus",
+            "tool": "gm_add",
+            "status": "completed",
+            "arguments": {"secret": "SECRET_ARGUMENT"},
+        },
+        started=250,
+        completed=350,
+    )
+    breakdown = {
+        "cachedInputTokens": 10,
+        "inputTokens": 20,
+        "outputTokens": 5,
+        "reasoningOutputTokens": 4,
+        "totalTokens": 25,
+    }
+    client._dispatch(
+        {
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "tokenUsage": {"last": breakdown, "total": breakdown},
+            },
+        }
+    )
+    lifecycle(
+        item={
+            "id": "wait-1",
+            "type": "collabAgentToolCall",
+            "tool": "wait",
+            "status": "completed",
+            "receiverThreadIds": [],
+        },
+        started=360,
+        completed=460,
+    )
+    terminal = {
+        "id": "turn-1",
+        "status": "completed",
+        "durationMs": 500,
+        "items": [
+            {
+                "id": "compact-1",
+                "type": "contextCompaction",
+                "status": "completed",
+                "raw": "SECRET_COMPACTION",
+            }
+        ],
+    }
+    client._dispatch(
+        {
+            "method": "turn/completed",
+            "params": {"threadId": "thread-1", "turn": terminal},
+        }
+    )
+    bandwidth = client.reasoning_bandwidth("thread-1", "turn-1", terminal)
+    assert bandwidth["reasoning_item_union_ms"] == 200
+    assert bandwidth["reasoning_item_wall_share"] == 0.4
+    assert bandwidth["memory_write_union_ms"] == 100
+    assert bandwidth["wait_union_ms"] == 100
+    assert bandwidth["tool_or_control_union_ms"] == 200
+    assert bandwidth["measured_item_union_ms"] == 350
+    assert bandwidth["operation_counts"]["memory_write"] == {"completed": 1}
+    assert bandwidth["operation_counts"]["collab_wait"] == {"completed": 1}
+    assert bandwidth["usage_growth_sample_counts_by_resume_trigger"] == {
+        "observed_after_memory_write": 1
+    }
+    assert bandwidth["observed_reasoning_output_share_of_output"] == 0.8
+    assert bandwidth["compaction_count"] == 1
+    assert bandwidth["finality"] == "partial"
+    assert "missing_item_completed_notification" in bandwidth["finality_reasons"]
+    serialized = json.dumps(bandwidth)
+    assert "SECRET_REASONING" not in serialized
+    assert "SECRET_ARGUMENT" not in serialized
+    assert "SECRET_COMPACTION" not in serialized
+
+
+def test_reasoning_bandwidth_tracking_is_hard_bounded(monkeypatch):
+    from danus import reasoning_telemetry as telemetry_module
+
+    monkeypatch.setattr(telemetry_module, "MAX_TRACKED_ITEMS_PER_TURN", 2)
+    telemetry = telemetry_module.TurnReasoningBandwidth()
+    for index in range(3):
+        item = {
+            "id": f"tool-{index}",
+            "type": "mcpToolCall",
+            "server": "danus",
+            "tool": "gm_search",
+            "status": "completed",
+        }
+        telemetry.observe_start(item, index * 10)
+        telemetry.observe_completion(item, index * 10 + 5, source="notification")
+
+    assert len(telemetry.starts) + len(telemetry.completed_ids) == 2
+    assert sum(len(items) for items in telemetry.intervals_by_category.values()) == 2
+    assert telemetry.pending_resume_categories == {"memory_search"}
+    summary = telemetry.summary(100)
+    assert summary["finality"] == "partial"
+    assert "item_tracking_limit_reached" in summary["finality_reasons"]
+    assert summary["lifecycle"]["tracking_limit_drop_count"] == 2
+
+
+def test_reasoning_bandwidth_classifies_exact_global_memory_lookup():
+    from danus.reasoning_telemetry import TurnReasoningBandwidth
+
+    telemetry = TurnReasoningBandwidth()
+    item = {
+        "id": "gm-get-1",
+        "type": "mcpToolCall",
+        "server": "danus",
+        "tool": "gm_get",
+        "status": "completed",
+    }
+    telemetry.observe_start(item, 10)
+    telemetry.observe_completion(item, 110, source="notification")
+
+    summary = telemetry.summary(200)
+    assert summary["memory_union_ms"] == 100
+    assert summary["retrieval_union_ms"] == 100
+    assert summary["operation_counts"]["memory_search"] == {"completed": 1}
+
+
+def test_first_zero_token_sample_is_not_reported_as_growth():
+    from danus.reasoning_telemetry import token_usage_cumulative_total_changed
+
+    zero = {
+        "cachedInputTokens": 0,
+        "inputTokens": 0,
+        "outputTokens": 0,
+        "reasoningOutputTokens": 0,
+        "totalTokens": 0,
+    }
+    assert not token_usage_cumulative_total_changed(
+        None,
+        {"last": dict(zero), "total": dict(zero)},
+    )
 
 
 def test_turn_notifications_and_direct_history_reject_unknown_status(
@@ -1915,10 +3252,6 @@ def test_turn_notifications_and_direct_history_reject_unknown_status(
             },
         ),
         (
-            "thread/tokenUsage/updated",
-            {"threadId": "x" * 513, "turnId": "turn-1", "tokenUsage": {}},
-        ),
-        (
             "item/completed",
             {
                 "threadId": "thread-1",
@@ -1942,6 +3275,244 @@ def test_notification_identities_are_nonempty_and_bounded(
     client = AppServerClient([sys.executable], cwd=tmp_path)
     with pytest.raises(ProtocolError, match="nonempty|string|hard limit|exact id"):
         client._dispatch({"method": method, "params": params})
+
+
+def test_app_server_turn_identity_tracking_is_globally_bounded_and_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(hotjoin_module, "MAX_TRACKED_TURN_IDENTITIES_PER_CLIENT", 2)
+    monkeypatch.setattr(hotjoin_module, "MAX_OBSERVED_CLIENT_IDS_PER_CLIENT", 2)
+    client = AppServerClient([sys.executable], cwd=tmp_path)
+    usage = {
+        "cachedInputTokens": 0,
+        "inputTokens": 2,
+        "outputTokens": 1,
+        "reasoningOutputTokens": 1,
+        "totalTokens": 3,
+    }
+
+    client._dispatch(
+        {
+            "method": "turn/started",
+            "params": {
+                "threadId": "thread-1",
+                "turn": {"id": "turn-1", "status": "inProgress"},
+            },
+        }
+    )
+    client._dispatch(
+        {
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "tokenUsage": {"last": usage, "total": usage},
+            },
+        }
+    )
+    client._dispatch(
+        {
+            "method": "model/rerouted",
+            "params": {
+                "fromModel": "model-a",
+                "reason": "highRiskCyberActivity",
+                "threadId": "thread-1",
+                "toModel": "model-b",
+                "turnId": "turn-1",
+            },
+        }
+    )
+    client._dispatch(
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turn": {"id": "turn-1", "status": "completed", "items": []},
+            },
+        }
+    )
+    client._dispatch(
+        {
+            "method": "turn/started",
+            "params": {
+                "threadId": "thread-2",
+                "turn": {"id": "turn-2", "status": "inProgress"},
+            },
+        }
+    )
+
+    for index in range(2):
+        client._dispatch(
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-2",
+                    "turnId": "turn-2",
+                    "item": {
+                        "id": f"user-item-{index}",
+                        "type": "userMessage",
+                        "clientId": f"owner-client-{index}",
+                    },
+                    "completedAtMs": index + 1,
+                },
+            }
+        )
+    with pytest.raises(ProtocolError, match="client-id tracking exceeds hard limit"):
+        client._dispatch(
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-2",
+                    "turnId": "turn-2",
+                    "item": {
+                        "id": "user-item-overflow",
+                        "type": "userMessage",
+                        "clientId": "owner-client-overflow",
+                    },
+                    "completedAtMs": 3,
+                },
+            }
+        )
+    with pytest.raises(
+        ProtocolError, match="turn identity tracking exceeds hard limit"
+    ):
+        client._dispatch(
+            {
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread-overflow",
+                    "turn": {
+                        "id": "turn-overflow",
+                        "status": "failed",
+                        "items": [],
+                    },
+                },
+            }
+        )
+
+    admitted = {("thread-1", "turn-1"), ("thread-2", "turn-2")}
+    assert client._tracked_turn_identities == admitted
+    assert set(client._terminal_turns) == {("thread-1", "turn-1")}
+    assert set(client._token_usage) == {("thread-1", "turn-1")}
+    assert set(client._model_reroutes) == {("thread-1", "turn-1")}
+    assert set(client._reasoning_bandwidth) == admitted
+    assert client._observed_client_ids == {"owner-client-0", "owner-client-1"}
+    assert client.active_turn("thread-2") == "turn-2"
+
+
+def test_conflicting_second_active_turn_never_retargets_broker(tmp_path: Path):
+    client = AppServerClient([sys.executable], cwd=tmp_path)
+    started = {
+        "method": "turn/started",
+        "params": {
+            "threadId": "thread-1",
+            "turn": {"id": "turn-authoritative", "status": "inProgress"},
+        },
+    }
+    client._dispatch(started)
+    client._dispatch(started)  # an exact duplicate is harmless
+
+    with pytest.raises(ProtocolError, match="another active turn"):
+        client._dispatch(
+            {
+                "method": "turn/started",
+                "params": {
+                    "threadId": "thread-1",
+                    "turn": {"id": "turn-conflicting", "status": "inProgress"},
+                },
+            }
+        )
+
+    assert client.active_turn("thread-1") == "turn-authoritative"
+    assert client._tracked_turn_identities == {("thread-1", "turn-authoritative")}
+    assert ("thread-1", "turn-conflicting") not in client._reasoning_bandwidth
+
+
+def test_terminal_turn_permanently_binds_thread_against_second_start(tmp_path: Path):
+    client = AppServerClient([sys.executable], cwd=tmp_path)
+    client._dispatch(
+        {
+            "method": "turn/started",
+            "params": {
+                "threadId": "thread-1",
+                "turn": {"id": "turn-authoritative", "status": "inProgress"},
+            },
+        }
+    )
+    terminal = {
+        "method": "turn/completed",
+        "params": {
+            "threadId": "thread-1",
+            "turn": {
+                "id": "turn-authoritative",
+                "status": "completed",
+                "items": [],
+            },
+        },
+    }
+    client._dispatch(terminal)
+    client._dispatch(terminal)  # exact same-identity terminal replay is harmless
+    assert client.active_turn("thread-1") is None
+
+    with pytest.raises(ProtocolError, match="bound to another turn identity"):
+        client._dispatch(
+            {
+                "method": "turn/started",
+                "params": {
+                    "threadId": "thread-1",
+                    "turn": {"id": "turn-conflicting", "status": "inProgress"},
+                },
+            }
+        )
+
+    assert client.active_turn("thread-1") is None
+    assert client._thread_turn_bindings == {"thread-1": "turn-authoritative"}
+    assert client._tracked_turn_identities == {("thread-1", "turn-authoritative")}
+    assert set(client._terminal_turns) == {("thread-1", "turn-authoritative")}
+    assert ("thread-1", "turn-conflicting") not in client._reasoning_bandwidth
+
+
+def test_terminal_turn_cannot_be_reactivated_by_started_replay_or_adoption(
+    tmp_path: Path,
+):
+    client = AppServerClient([sys.executable], cwd=tmp_path)
+    started = {
+        "method": "turn/started",
+        "params": {
+            "threadId": "thread-1",
+            "turn": {"id": "turn-authoritative", "status": "inProgress"},
+        },
+    }
+    client._dispatch(started)
+    client._dispatch(
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turn": {
+                    "id": "turn-authoritative",
+                    "status": "completed",
+                    "items": [],
+                },
+            },
+        }
+    )
+    assert client.active_turn("thread-1") is None
+
+    with pytest.raises(
+        ProtocolError, match="terminal turn identity cannot be reactivated"
+    ):
+        client._dispatch(started)
+    with pytest.raises(
+        ProtocolError, match="terminal turn identity cannot be reactivated"
+    ):
+        client.adopt_active_turn("thread-1", "turn-authoritative")
+
+    assert client.active_turn("thread-1") is None
+    assert client._thread_turn_bindings == {"thread-1": "turn-authoritative"}
+    assert client._tracked_turn_identities == {("thread-1", "turn-authoritative")}
+    assert set(client._terminal_turns) == {("thread-1", "turn-authoritative")}
 
 
 def test_reroute_and_runtime_display_metadata_is_redacted_before_bounding(
@@ -2085,9 +3656,12 @@ def test_thread_rotation_never_rebinds_old_delivery_provenance(tmp_path: Path):
     )
     store.set_thread_id("max", "thread-new")
 
-    assert store.claim(
-        target="max", owner="new", allow_queued=True, thread_id="thread-new"
-    ) is None
+    assert (
+        store.claim(
+            target="max", owner="new", allow_queued=True, thread_id="thread-new"
+        )
+        is None
+    )
     with pytest.raises(StaleClaim):
         store.record(
             message["message_id"],
@@ -2158,9 +3732,7 @@ def test_rpc_error_redaction_is_idempotent_and_delivery_ledger_never_stores_secr
             self.calls.append((method, params))
             raise RpcError(method, raw_error)
 
-    broker = HotJoinBroker(
-        store, SecretReject(), target="max", thread_id="thread-1"
-    )
+    broker = HotJoinBroker(store, SecretReject(), target="max", thread_id="thread-1")
     broker.start()
     try:
         _wait_state(store, message["message_id"], "queued")
@@ -2203,8 +3775,7 @@ def test_owner_recovery_reasons_are_redacted_before_any_sqlite_write(tmp_path: P
         thread_id="thread-prepared-secret",
         client_id=prepared["client_id"],
         reason=(
-            "Authorization: Bearer OWNER_BEARER_CANARY "
-            "OPENAI_API_KEY=OWNER_API_CANARY"
+            "Authorization: Bearer OWNER_BEARER_CANARY OPENAI_API_KEY=OWNER_API_CANARY"
         ),
     )
     store.rotate_thread_id(

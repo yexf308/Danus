@@ -15,7 +15,8 @@ as an interface **only** when the LLM can't do it reliably itself:
 2. **multi-file integrity** — cascade revoke (find descendants, move, log);
 3. **a load-bearing gate** — a fact may exist only if the verifier accepted it;
 4. **bounded, integrity-checked hydration** — large fact graphs need explicit-id
-   context with proof opt-in, completeness metadata, and stable digests.
+   context with proof opt-in, completeness metadata, and stable digests; a
+   designated critic likewise needs exact bounded global-memory hydration.
 
 Everything else is the agent writing/reading files per a format the **prompt**
 specifies; fact retrieval is the deliberate exception because uncontrolled reads
@@ -25,8 +26,8 @@ inflate context and bypass completeness checks.
 
 The interface surface is small on purpose. Writes that need a guaranteed
 envelope, deterministic hashing, BM25, or bounded fact hydration are wrapped.
-Local/global-memory reads stay direct; fact reads use `fact_search` and
-`fact_context`. At the extreme, a files-direct deployment wraps **nothing**: the agent
+Local/global-memory browsing can stay direct, but exact designated-entry review
+uses `gm_get`; fact reads use `fact_search` and `fact_context`. At the extreme, a files-direct deployment wraps **nothing**: the agent
 reads/searches/writes `{run_dir}/memory/<channel>.md` directly, and the only
 scripts are an arXiv-search API helper and a LaTeX compiler — neither a
 data-structure interface. A heavy design would sprawl into dozens of MCP tools
@@ -42,7 +43,9 @@ it reads/writes/greps:
 
 - **local memory** — append a rough note, read it back, grep it. It's private and
   rough; no schema to enforce.
-- **global memory — read** a `<kind>.jsonl` (it's readable), and grep it.
+- **global memory — browse** a `<kind>.jsonl` (it's readable), and grep it.
+  Designated critic review is the exception: use exact `gm_get`, not a BM25/grep
+  match.
 - **fact graph — local debugging** may still inspect readable markdown files;
   agent retrieval uses full-text `fact_search` with statement-only results, followed by explicit-id
   `fact_context` so proofs are hydrated only on request.
@@ -54,14 +57,14 @@ it reads/writes/greps:
 ## The interfaces we DO need
 
 Minimal set. Form = **MCP** — one stdio MCP server (`danus/gateway/`, a thin
-wrapper over `danus/core/`) exposing 6 data-structure tools **+
+wrapper over `danus/core/`) exposing 7 data-structure tools **+
 `search_arxiv_theorems`** (one external integration — Matlas arXiv theorem search,
 returning *verbatim* statements; `danus/integrations/matlas.py`, not a
 data-structure interface but the LLM still can't do it itself). codex
 consumes MCP natively; `DANUS_ROLE`
 selects the per-agent tool subset (worker:
-`gm_add`/`gm_search`/`fact_submit`/`fact_search`/`fact_context`/`search_arxiv_theorems`; main:
-`gm_add`/`gm_search`/`fact_search`/`fact_context`/`fact_revoke`/`search_arxiv_theorems`; verifier:
+`gm_add`/`gm_get`/`gm_search`/`fact_submit`/`fact_search`/`fact_context`/`search_arxiv_theorems`; main:
+`gm_add`/`gm_get`/`gm_search`/`fact_search`/`fact_context`/`fact_revoke`/`search_arxiv_theorems`; verifier:
 `search_arxiv_theorems` only — stateless, with required fact context supplied in
 the request).
 Install: `danus/gateway/INSTALL.md`.
@@ -156,6 +159,10 @@ Install: `danus/gateway/INSTALL.md`.
   finding with the schema enforced (valid `kind`, evidence required for
   verifiable kinds, correct envelope, optional `--glossary`). On the shared store
   we want the format guaranteed, so this is a real interface (not LLM-direct).
+- **`gm_get <entry_id>`** — exact hydration by canonical 16-lowercase-hex id.
+  Absent or duplicate ids fail and serialized output is capped at 16 KiB. A
+  designated critic uses this exact record before confirmation; BM25 cannot
+  substitute.
 - **`danus gm search <query> [--kinds ...]`** — BM25 over the shared findings.
   The shared store gets large (N workers); ranked recall is computation the LLM
   can't do by reading.
@@ -186,10 +193,11 @@ MCP tools (danus/gateway/server.py):
   fact_context  # explicit-id lazy statements/edges/proofs + completeness metadata and digest
   fact_revoke   # cascade revoke
   gm_add        # schema-enforced write of a finding (kind / evidence rule / optional glossary)
+  gm_get        # exact 16-hex global-memory entry, unique and bounded to 16 KiB
   gm_search     # BM25 over global memory
 ```
 
-Six data-structure tools (+ `search_arxiv_theorems`). Everything else — local
+Seven data-structure tools (+ `search_arxiv_theorems`). Everything else — local
 memory, novelty *judgment* — is the agent reading/writing files, guided by prose.
 The server is a thin wrapper: `fact_submit` = `FactGraph.undefined_symbols` + the
 verify call + a post-verification context recheck + `FactGraph.add`; `fact_search`

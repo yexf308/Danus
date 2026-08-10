@@ -343,10 +343,11 @@ def test_stale_expected_turn_and_late_old_terminal_do_not_cross_talk(make_client
     _start_turn(client)
 
     # The fake emits this old terminal after the new turn/started notification.
-    old = client.wait_for(
-        _turn_notification("turn/completed", "turn-old-0"), timeout=1
-    )
+    old = client.wait_for(_turn_notification("turn/completed", "turn-old-0"), timeout=1)
     assert old["params"]["turn"]["status"] == "completed"
+    assert client.active_turn(THREAD_ID) == TURN_ID
+    assert client._thread_turn_bindings == {THREAD_ID: TURN_ID}
+    assert client.terminal_turn(THREAD_ID, "turn-old-0") is not None
 
     with pytest.raises(RpcError, match="expected turn"):
         _steer(client, expected_turn_id="turn-stale-client")
@@ -355,12 +356,8 @@ def test_stale_expected_turn_and_late_old_terminal_do_not_cross_talk(make_client
     with pytest.raises(TimeoutError):
         client.wait_for(_turn_notification("turn/completed", TURN_ID), timeout=0.05)
 
-    client.rpc(
-        "turn/interrupt", {"threadId": THREAD_ID, "turnId": TURN_ID}, timeout=1
-    )
-    terminal = client.wait_for(
-        _turn_notification("turn/completed", TURN_ID), timeout=1
-    )
+    client.rpc("turn/interrupt", {"threadId": THREAD_ID, "turnId": TURN_ID}, timeout=1)
+    terminal = client.wait_for(_turn_notification("turn/completed", TURN_ID), timeout=1)
     assert terminal["params"]["turn"]["status"] == "interrupted"
 
     requests = _trace_messages(trace)
@@ -438,12 +435,8 @@ def test_large_stderr_is_drained_without_blocking_stdout_protocol(make_client):
     _start_thread(client)
     _start_turn(client)  # fake writes 256 KiB to stderr before this response
 
-    client.rpc(
-        "turn/interrupt", {"threadId": THREAD_ID, "turnId": TURN_ID}, timeout=1
-    )
-    terminal = client.wait_for(
-        _turn_notification("turn/completed", TURN_ID), timeout=1
-    )
+    client.rpc("turn/interrupt", {"threadId": THREAD_ID, "turnId": TURN_ID}, timeout=1)
+    terminal = client.wait_for(_turn_notification("turn/completed", TURN_ID), timeout=1)
     assert terminal["params"]["turn"]["status"] == "interrupted"
 
 
@@ -456,12 +449,13 @@ def test_timeout_sends_exactly_one_interrupt_and_reaches_terminal(make_client):
     with pytest.raises(TimeoutError):
         client.wait_for(_turn_notification("turn/completed", TURN_ID), timeout=0.05)
 
-    assert client.rpc(
-        "turn/interrupt", {"threadId": THREAD_ID, "turnId": TURN_ID}, timeout=1
-    ) == {}
-    terminal = client.wait_for(
-        _turn_notification("turn/completed", TURN_ID), timeout=1
+    assert (
+        client.rpc(
+            "turn/interrupt", {"threadId": THREAD_ID, "turnId": TURN_ID}, timeout=1
+        )
+        == {}
     )
+    terminal = client.wait_for(_turn_notification("turn/completed", TURN_ID), timeout=1)
     assert terminal["params"]["turn"]["status"] == "interrupted"
 
     requests = _trace_messages(trace)
@@ -499,9 +493,7 @@ def test_worker_round_auto_completes_with_mapping_and_sanitized_audit(
     from danus.execution import layout as worker_layout
     from danus.execution import loop as worker_loop
 
-    worker = worker_layout.WorkerLayout(
-        tmp_path / "project" / "workers" / "max"
-    )
+    worker = worker_layout.WorkerLayout(tmp_path / "project" / "workers" / "max")
     worker.dir.mkdir(parents=True)
     worker.task.write_text("offline assignment", encoding="utf-8")
     audit_path = worker.dir / "round-app-server.jsonl"
@@ -556,6 +548,16 @@ def test_worker_round_auto_completes_with_mapping_and_sanitized_audit(
 
     audit_text = audit_path.read_text(encoding="utf-8")
     audit = [json.loads(line) for line in audit_text.splitlines()]
+    reasoning_bandwidth = audit[0].pop("reasoning_bandwidth")
+    assert reasoning_bandwidth["schema"] == "danus_reasoning_bandwidth_v1"
+    assert reasoning_bandwidth["scope"] == "root_thread_only"
+    assert reasoning_bandwidth["finality"] == "partial"
+    assert reasoning_bandwidth["item_counts"] == {
+        "agentMessage": 1,
+        "userMessage": 1,
+    }
+    assert reasoning_bandwidth["usage_growth_sample_count"] == 1
+    assert reasoning_bandwidth["observed_reasoning_output_share_of_output"] == 0.4
     assert audit[0] == {
         "event": "turn_completed",
         "thread_id": THREAD_ID,
@@ -615,16 +617,18 @@ def test_worker_round_auto_completes_with_mapping_and_sanitized_audit(
     # The fake deliberately emitted a completed userMessage containing the
     # sentinel.  Only trusted agent/tool completions may reach the round audit.
     assert user_sentinel not in audit_text
-    assert "userMessage" not in audit_text
+    assert all(
+        row.get("item", {}).get("type") != "userMessage"
+        for row in audit
+        if isinstance(row, dict)
+    )
     assert "danus-round:" not in audit_text
     assert "STALE_OTHER_TURN_MUST_NOT_PERSIST" not in audit_text
 
     trace = _trace_messages(trace_path)
     turn_start = next(m for m in trace if m.get("method") == "turn/start")
     assert not any(m.get("method") == "thread/read" for m in trace)
-    assert turn_start["params"]["input"] == [
-        {"type": "text", "text": user_sentinel}
-    ]
+    assert turn_start["params"]["input"] == [{"type": "text", "text": user_sentinel}]
     assert not any(m.get("method") == "turn/steer" for m in trace)
     assert not any(m.get("method") == "turn/interrupt" for m in trace)
     thread_start = next(m for m in trace if m.get("method") == "thread/start")
@@ -658,9 +662,7 @@ def _configured_worker_fake_scenario(
     from danus.execution import layout as worker_layout
     from danus.execution import loop as worker_loop
 
-    worker = worker_layout.WorkerLayout(
-        tmp_path / "project" / "workers" / "max"
-    )
+    worker = worker_layout.WorkerLayout(tmp_path / "project" / "workers" / "max")
     worker.dir.mkdir(parents=True)
     worker.task.write_text("offline assignment", encoding="utf-8")
     if stored_thread:
@@ -686,6 +688,7 @@ def _configured_worker_fake_scenario(
         "app_server_argv",
         lambda *_a: [sys.executable, str(FAKE), "--scenario", scenario],
     )
+
     def run() -> int:
         return worker_loop.run_round_app_server(
             worker,
@@ -706,12 +709,227 @@ def _run_worker_fake_scenario(
     stored_thread: bool = False,
 ) -> tuple[Any, Any, Path, Path, int]:
     """Run one production adapter round against a named offline fake."""
-    worker_loop, worker, audit_path, trace_path, run = (
-        _configured_worker_fake_scenario(
-            tmp_path, monkeypatch, scenario, stored_thread=stored_thread
-        )
+    worker_loop, worker, audit_path, trace_path, run = _configured_worker_fake_scenario(
+        tmp_path, monkeypatch, scenario, stored_thread=stored_thread
     )
     return worker_loop, worker, audit_path, trace_path, run()
+
+
+def test_identity_flood_fails_stop_reaps_and_never_redispatches_paid_turn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A second provider turn identity cannot survive as a paid retry.
+
+    ``stale-turn`` emits the current ``turn/started`` and then an unrelated old
+    terminal before acknowledging ``turn/start``. Reducing the production cap
+    to one makes that second identity a deterministic protocol-failure cut.
+    """
+
+    monkeypatch.setattr(hotjoin_module, "MAX_TRACKED_TURN_IDENTITIES_PER_CLIENT", 1)
+    worker_loop, worker, _audit_path, trace_path, run = (
+        _configured_worker_fake_scenario(
+            tmp_path,
+            monkeypatch,
+            "stale-turn",
+            hard_timeout=2,
+        )
+    )
+
+    assert run() == worker_loop.APP_SERVER_PROTOCOL_FAILURE_RC
+    first_trace = _trace_messages(trace_path)
+    assert sum(row.get("method") == "turn/start" for row in first_trace) == 1
+    first_pid = next(row["pid"] for row in first_trace if row.get("_fake") == "started")
+    _wait_until(lambda: not _pid_running(first_pid))
+    pending = HotJoinStore(worker.project_dir).unfinished_round_intent(worker.name)
+    assert pending is not None and pending["state"] == "delivery_unknown"
+    assert worker_loop._Child.proc is None
+
+    # Restarting may inspect the durable intent and thread history, but an
+    # acknowledgement-loss boundary can never authorize a second paid request.
+    assert run() == worker_loop.APP_SERVER_PROTOCOL_FAILURE_RC
+    final_trace = _trace_messages(trace_path)
+    assert sum(row.get("method") == "turn/start" for row in final_trace) == 1
+    started_pids = [row["pid"] for row in final_trace if row.get("_fake") == "started"]
+    assert len(started_pids) == 2
+    _wait_until(lambda: all(not _pid_running(pid) for pid in started_pids))
+    replayed = HotJoinStore(worker.project_dir).unfinished_round_intent(worker.name)
+    assert replayed is not None
+    assert replayed["client_id"] == pending["client_id"]
+    assert replayed["state"] == "delivery_unknown"
+    assert worker_loop._Child.proc is None
+
+
+@pytest.mark.parametrize(
+    "replayed_turn_id",
+    [TURN_ID, "turn-conflicting-after-terminal"],
+)
+def test_terminal_then_second_start_reader_race_never_retargets_broker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replayed_turn_id: str,
+):
+    """A terminal thread binding cannot be recycled under a live broker.
+
+    The offline provider supplies the authoritative paid turn.  Its real
+    terminal notification is followed, in the production reader, by a second
+    provider ``turn/started`` for the same thread.  The broker is released in
+    that exact window: it may queue the message after activity is cleared, but
+    must never steer the conflicting identity.
+    """
+
+    worker_loop, worker, _audit_path, trace_path, run = (
+        _configured_worker_fake_scenario(
+            tmp_path,
+            monkeypatch,
+            "notification-before-response",
+            hard_timeout=10,
+        )
+    )
+    store = HotJoinStore(worker.project_dir)
+    clients: list[AppServerClient] = []
+    broker_release = threading.Event()
+    broker_decision_done = threading.Event()
+    conflict_seen = threading.Event()
+
+    def capture_client(*args: Any, **kwargs: Any) -> AppServerClient:
+        client = AppServerClient(*args, **kwargs)
+        clients.append(client)
+        return client
+
+    original_route_loop = worker_loop.HotJoinBroker._route_loop
+
+    def gated_route_loop(broker: Any) -> None:
+        if not broker_release.wait(5):
+            raise TimeoutError("test broker release was not observed")
+        original_route_loop(broker)
+
+    original_wait_turn = AppServerClient.wait_turn
+
+    def hold_adapter_at_terminal(
+        client: AppServerClient,
+        thread_id: str,
+        turn_id: str,
+        timeout: float,
+    ) -> dict[str, Any]:
+        terminal = original_wait_turn(client, thread_id, turn_id, timeout)
+        if thread_id == THREAD_ID and turn_id == TURN_ID:
+            if not broker_decision_done.wait(5):
+                raise TimeoutError("test broker decision was not observed")
+        return terminal
+
+    original_dispatch = AppServerClient._dispatch
+    injected = False
+
+    def terminal_then_conflicting_start(
+        client: AppServerClient, message: dict[str, Any]
+    ) -> None:
+        nonlocal injected
+        params = message.get("params")
+        turn = params.get("turn") if isinstance(params, dict) else None
+        if (
+            not injected
+            and message.get("method") == "turn/completed"
+            and isinstance(params, dict)
+            and params.get("threadId") == THREAD_ID
+            and isinstance(turn, dict)
+            and turn.get("id") == TURN_ID
+        ):
+            injected = True
+            original_dispatch(client, message)
+            conflict: BaseException | None = None
+            try:
+                original_dispatch(
+                    client,
+                    {
+                        "method": "turn/started",
+                        "params": {
+                            "threadId": THREAD_ID,
+                            "turn": {
+                                "id": replayed_turn_id,
+                                "status": "inProgress",
+                            },
+                        },
+                    },
+                )
+            except BaseException as exc:
+                conflict = exc
+            finally:
+                conflict_seen.set()
+                broker_release.set()
+                if not broker_decision_done.wait(5):
+                    raise TimeoutError("test broker decision was not observed")
+            if conflict is not None:
+                raise conflict
+            return
+        original_dispatch(client, message)
+
+    monkeypatch.setattr(worker_loop, "AppServerClient", capture_client)
+    monkeypatch.setattr(worker_loop.HotJoinBroker, "_route_loop", gated_route_loop)
+    monkeypatch.setattr(AppServerClient, "wait_turn", hold_adapter_at_terminal)
+    monkeypatch.setattr(AppServerClient, "_dispatch", terminal_then_conflicting_start)
+
+    def round_is_brokered() -> bool:
+        if not worker.status.exists():
+            return False
+        try:
+            status = json.loads(worker.status.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        return status.get("active_turn_id") == TURN_ID
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(run)
+        try:
+            _wait_until(lambda: len(clients) == 1)
+            _wait_until(round_is_brokered)
+            queued = store.enqueue(
+                target=worker.name,
+                body="must never follow a recycled provider turn",
+            )
+            try:
+                clients[0].rpc(
+                    "turn/interrupt",
+                    {"threadId": THREAD_ID, "turnId": TURN_ID},
+                    timeout=2,
+                )
+            except AppServerClosed:
+                pass
+            assert conflict_seen.wait(3)
+
+            # Fixed code has no active turn and queues without an RPC.  The
+            # vulnerable implementation exposes the conflicting identity and
+            # therefore emits a traceable turn/steer before it can queue.
+            _wait_until(
+                lambda: store.get(queued["message_id"])["state"] == "queued"
+                or any(
+                    row.get("method") == "turn/steer"
+                    for row in _trace_messages(trace_path)
+                )
+            )
+            broker_decision_done.set()
+            rc = future.result(timeout=10)
+        finally:
+            broker_release.set()
+            broker_decision_done.set()
+
+    assert rc == worker_loop.APP_SERVER_MODEL_REROUTED_RC
+    assert clients[0].active_turn(THREAD_ID) is None
+    assert clients[0]._thread_turn_bindings == {THREAD_ID: TURN_ID}
+    if replayed_turn_id != TURN_ID:
+        assert (THREAD_ID, replayed_turn_id) not in (
+            clients[0]._tracked_turn_identities
+        )
+    row = store.get(queued["message_id"])
+    assert row["state"] == "queued"
+    if replayed_turn_id != TURN_ID:
+        assert row["turn_id"] != replayed_turn_id
+    trace = _trace_messages(trace_path)
+    assert sum(item.get("method") == "turn/start" for item in trace) == 1
+    assert sum(item.get("method") == "turn/steer" for item in trace) == 0
+    pid = next(item["pid"] for item in trace if item.get("_fake") == "started")
+    _wait_until(lambda: not _pid_running(pid))
+    assert worker_loop._Child.proc is None
 
 
 def test_worker_host_loss_before_paid_dispatch_sends_no_turn_start(
@@ -753,13 +971,11 @@ def test_worker_host_loss_before_paid_dispatch_sends_no_turn_start(
 def test_worker_host_loss_after_turn_start_application_is_delivery_unknown_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    worker_loop, worker, audit_path, trace_path, run = (
-        _configured_worker_fake_scenario(
-            tmp_path,
-            monkeypatch,
-            "host-loss-after-turn-start-applied",
-            hard_timeout=20,
-        )
+    worker_loop, worker, audit_path, trace_path, run = _configured_worker_fake_scenario(
+        tmp_path,
+        monkeypatch,
+        "host-loss-after-turn-start-applied",
+        hard_timeout=20,
     )
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
         future = pool.submit(run)
@@ -803,10 +1019,8 @@ def test_worker_host_loss_after_turn_start_application_is_delivery_unknown_once(
 def test_active_worker_detects_host_only_sigkill_and_sweeps_stubborn_group(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    worker_loop, worker, audit_path, trace_path, run = (
-        _configured_worker_fake_scenario(
-            tmp_path, monkeypatch, "cleanup-ignore-sigterm", hard_timeout=60
-        )
+    worker_loop, worker, audit_path, trace_path, run = _configured_worker_fake_scenario(
+        tmp_path, monkeypatch, "cleanup-ignore-sigterm", hard_timeout=60
     )
     store = HotJoinStore(worker.project_dir)
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
@@ -817,28 +1031,26 @@ def test_active_worker_detects_host_only_sigkill_and_sweeps_stubborn_group(
                 for row in _trace_messages(trace_path)
             )
             and (
-                (intent := store.unfinished_round_intent(worker.name))
-                is not None
+                (intent := store.unfinished_round_intent(worker.name)) is not None
                 and intent["state"] == "started"
             ),
             timeout=5,
         )
         trace = _trace_messages(trace_path)
-        actual_pid = next(
-            row["pid"] for row in trace if row.get("_fake") == "started"
-        )
+        actual_pid = next(row["pid"] for row in trace if row.get("_fake") == "started")
         grandchild = next(
-            row["pid"]
-            for row in trace
-            if row.get("_fake") == "stubborn_grandchild"
+            row["pid"] for row in trace if row.get("_fake") == "stubborn_grandchild"
         )
         host = worker_loop._Child.proc
         assert host is not None
-        assert next(
-            row["pgid"]
-            for row in trace
-            if row.get("_fake") == "stubborn_grandchild"
-        ) == host.pid
+        assert (
+            next(
+                row["pgid"]
+                for row in trace
+                if row.get("_fake") == "stubborn_grandchild"
+            )
+            == host.pid
+        )
         started = time.monotonic()
         os.kill(host.pid, signal.SIGKILL)
         with pytest.raises(HotJoinError, match="cleanup is still in progress"):
@@ -854,12 +1066,23 @@ def test_active_worker_detects_host_only_sigkill_and_sweeps_stubborn_group(
     assert intent["turn_id"] == TURN_ID
     status = json.loads(worker.status.read_text(encoding="utf-8"))
     assert status["attempt_failure_code"] == "app_server_host_lost"
-    audit = store.latest_round_audit_event(
-        intent["client_id"], kind="attempt"
-    )
+    audit = store.latest_round_audit_event(intent["client_id"], kind="attempt")
     assert audit is not None
-    assert "owned-child host exited unexpectedly" in audit["payload"]
+    # A host-only SIGKILL races the direct waitpid observation against the
+    # independent pid/start-time liveness authenticator.  Both messages are the
+    # same fail-closed ``app_server_host_lost`` classification; the invariants
+    # below, rather than scheduler order, are the contract.
+    assert any(
+        detail in audit["payload"]
+        for detail in (
+            "owned-child host exited unexpectedly",
+            "owned-child host liveness could not be authenticated",
+        )
+    )
     assert audit_path.exists()
+    assert (
+        sum(row.get("_fake") == "started" for row in _trace_messages(trace_path)) == 1
+    )
     _wait_until(
         lambda: not _pid_running(actual_pid) and not _pid_running(grandchild),
         timeout=8,
@@ -879,10 +1102,8 @@ def test_active_worker_detects_host_only_sigkill_and_sweeps_stubborn_group(
 def test_terminal_cached_then_host_lost_during_settle_uses_cached_audit_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    worker_loop, worker, audit_path, trace_path, run = (
-        _configured_worker_fake_scenario(
-            tmp_path, monkeypatch, "auto-complete", hard_timeout=20
-        )
+    worker_loop, worker, audit_path, trace_path, run = _configured_worker_fake_scenario(
+        tmp_path, monkeypatch, "auto-complete", hard_timeout=20
     )
     original_settle = AppServerClient.settle_after_terminal
     killed = False
@@ -899,9 +1120,7 @@ def test_terminal_cached_then_host_lost_during_settle_uses_cached_audit_once(
             _wait_until(lambda: hotjoin_module.owned_child_exited_no_reap(host))
         original_settle(client, thread_id, turn_id, timeout)
 
-    monkeypatch.setattr(
-        AppServerClient, "settle_after_terminal", kill_during_settle
-    )
+    monkeypatch.setattr(AppServerClient, "settle_after_terminal", kill_during_settle)
     assert run() == worker_loop.APP_SERVER_MODEL_REROUTED_RC
     assert killed is True
     status = json.loads(worker.status.read_text(encoding="utf-8"))
@@ -931,13 +1150,9 @@ def test_terminal_then_malformed_stream_is_fail_stop_and_not_false_attested(
     assert final is not None
     header = json.loads(final["payload"].splitlines()[0])
     assert header["status"] == "completed"
-    assert header["token_usage_finality"] == (
-        "not_attested_after_adapter_interruption"
-    )
+    assert header["token_usage_finality"] == ("not_attested_after_adapter_interruption")
     assert header["model_rerouted"] is None
-    assert header["model_reroute_observation"] == (
-        "unknown_after_adapter_interruption"
-    )
+    assert header["model_reroute_observation"] == ("unknown_after_adapter_interruption")
     assert audit_path.read_text(encoding="utf-8") == final["payload"]
     trace = _trace_messages(trace_path)
     assert sum(row.get("method") == "turn/start" for row in trace) == 1
@@ -1000,9 +1215,7 @@ def test_surrogate_runtime_response_fails_closed_and_reaps_adapter(
     assert status["attempt_dispatch_state"] == "none"
     trace = _trace_messages(trace_path)
     assert sum(row.get("method") == "turn/start" for row in trace) == 0
-    actual_pid = next(
-        row["pid"] for row in trace if row.get("_fake") == "started"
-    )
+    actual_pid = next(row["pid"] for row in trace if row.get("_fake") == "started")
     _wait_until(lambda: not _pid_running(actual_pid))
     assert worker_loop._Child.proc is None
 
@@ -1163,9 +1376,7 @@ def test_outer_loop_never_automatically_retries_fail_stop_app_server_round(
     monkeypatch.setattr(worker_loop.signal, "signal", lambda *_a: None)
     monkeypatch.setattr(worker_loop, "_cleanup_pid", lambda *_a: None)
     monkeypatch.setattr(worker_loop, "_prior_round_sequence", lambda *_a: 0)
-    monkeypatch.setattr(
-        worker_loop, "_canonical_app_server_fact_id", lambda *_a: None
-    )
+    monkeypatch.setattr(worker_loop, "_canonical_app_server_fact_id", lambda *_a: None)
     monkeypatch.setattr(
         worker_loop,
         "write_status",
@@ -1206,9 +1417,7 @@ def test_outer_status_attributes_recovered_paid_turn_and_tokens(
     monkeypatch.setattr(worker_loop.signal, "signal", lambda *_a: None)
     monkeypatch.setattr(worker_loop, "_cleanup_pid", lambda *_a: None)
     monkeypatch.setattr(worker_loop, "_prior_round_sequence", lambda *_a: 0)
-    monkeypatch.setattr(
-        worker_loop, "_canonical_app_server_fact_id", lambda *_a: None
-    )
+    monkeypatch.setattr(worker_loop, "_canonical_app_server_fact_id", lambda *_a: None)
     monkeypatch.setattr(
         worker_loop,
         "_read_status_snapshot",
@@ -1235,10 +1444,7 @@ def test_outer_status_attributes_recovered_paid_turn_and_tokens(
         lambda *_a, **_k: worker_loop.APP_SERVER_MODEL_REROUTED_RC,
     )
 
-    assert (
-        worker_loop.main(str(worker_dir))
-        == worker_loop.APP_SERVER_MODEL_REROUTED_RC
-    )
+    assert worker_loop.main(str(worker_dir)) == worker_loop.APP_SERVER_MODEL_REROUTED_RC
     status = json.loads((worker_dir / ".status.json").read_text(encoding="utf-8"))
     assert status["last_attempt"]["dispatch_state"] == "recovered"
     assert status["last_paid_turn"]["dispatch_state"] == "recovered"
@@ -1261,9 +1467,7 @@ def test_four_hour_timeout_then_oversize_resume_preserves_paid_outcome_and_sends
     from danus.execution import layout as worker_layout
     from danus.execution import loop as worker_loop
 
-    worker = worker_layout.WorkerLayout(
-        tmp_path / "project" / "workers" / "max"
-    )
+    worker = worker_layout.WorkerLayout(tmp_path / "project" / "workers" / "max")
     worker.dir.mkdir(parents=True)
     worker.task.write_text("offline assignment", encoding="utf-8")
     # Match the production incident's round numbers without creating any prior
@@ -1311,7 +1515,9 @@ def test_four_hour_timeout_then_oversize_resume_preserves_paid_outcome_and_sends
 
     monkeypatch.setattr(worker_loop, "run_round_app_server", fast_hard_timeout)
 
-    assert worker_loop.main(str(worker.dir)) == worker_loop.APP_SERVER_PROTOCOL_FAILURE_RC
+    assert (
+        worker_loop.main(str(worker.dir)) == worker_loop.APP_SERVER_PROTOCOL_FAILURE_RC
+    )
     trace = _trace_messages(trace_path)
     assert sum(row.get("method") == "turn/start" for row in trace) == 1
     assert sum(row.get("method") == "turn/interrupt" for row in trace) == 1
@@ -1330,9 +1536,9 @@ def test_four_hour_timeout_then_oversize_resume_preserves_paid_outcome_and_sends
     paid_header = json.loads(str(paid_audit["payload"]).splitlines()[0])
     assert paid_header["status"] == "interrupted"
     assert paid_header["failure"] == "round hard-timeout after 0.02s"
-    assert "JSONL line exceeds hard limit" in (
-        worker.logs / "round_3.log"
-    ).read_text(encoding="utf-8")
+    assert "JSONL line exceeds hard limit" in (worker.logs / "round_3.log").read_text(
+        encoding="utf-8"
+    )
 
     status = json.loads(worker.status.read_text(encoding="utf-8"))
     assert status["state"] == "error"
@@ -1430,7 +1636,9 @@ def test_oversize_resume_with_ambiguous_paid_intent_never_offers_rotation(
         ],
     )
 
-    assert worker_loop.main(str(worker.dir)) == worker_loop.APP_SERVER_PROTOCOL_FAILURE_RC
+    assert (
+        worker_loop.main(str(worker.dir)) == worker_loop.APP_SERVER_PROTOCOL_FAILURE_RC
+    )
     trace = _trace_messages(trace_path)
     assert sum(row.get("method") == "thread/read" for row in trace) == 0
     assert sum(row.get("method") == "thread/resume" for row in trace) == 1
@@ -1477,9 +1685,7 @@ def test_oversize_recovery_intent_query_failure_is_fail_closed(
     monkeypatch.setattr(worker_loop.signal, "signal", lambda *_a: None)
     monkeypatch.setattr(worker_loop, "_cleanup_pid", lambda *_a: None)
     monkeypatch.setattr(worker_loop, "_prior_round_sequence", lambda *_a: 0)
-    monkeypatch.setattr(
-        worker_loop, "_canonical_app_server_fact_id", lambda *_a: None
-    )
+    monkeypatch.setattr(worker_loop, "_canonical_app_server_fact_id", lambda *_a: None)
     monkeypatch.setattr(
         worker_loop,
         "write_status",
@@ -1506,7 +1712,9 @@ def test_oversize_recovery_intent_query_failure_is_fail_closed(
     monkeypatch.setattr(worker_loop, "run_round_app_server", failed_round)
     monkeypatch.setattr(HotJoinStore, "unfinished_round_intent", fail_query)
 
-    assert worker_loop.main(str(worker_dir)) == worker_loop.APP_SERVER_PROTOCOL_FAILURE_RC
+    assert (
+        worker_loop.main(str(worker_dir)) == worker_loop.APP_SERVER_PROTOCOL_FAILURE_RC
+    )
     assert calls == ["adapter-attempt"]
     assert statuses[-1]["state"] == "error"
     assert statuses[-1]["recovery_required"] is None
@@ -1617,9 +1825,7 @@ def test_paid_turn_start_ack_loss_is_recovered_once_then_provenance_quarantined(
     from danus.execution import layout as worker_layout
     from danus.execution import loop as worker_loop
 
-    worker = worker_layout.WorkerLayout(
-        tmp_path / "project" / "workers" / "max"
-    )
+    worker = worker_layout.WorkerLayout(tmp_path / "project" / "workers" / "max")
     worker.dir.mkdir(parents=True)
     worker.task.write_text("offline assignment", encoding="utf-8")
     audit_path = worker.dir / "round-recovered.jsonl"
@@ -1651,24 +1857,33 @@ def test_paid_turn_start_ack_loss_is_recovered_once_then_provenance_quarantined(
     )
     role = {"MODEL": "offline-model", "REASONING_EFFORT": "low"}
 
-    assert worker_loop.run_round_app_server(
-        worker, role, prompt, audit_path, hard_timeout=2
-    ) == worker_loop.APP_SERVER_PROTOCOL_FAILURE_RC
+    assert (
+        worker_loop.run_round_app_server(
+            worker, role, prompt, audit_path, hard_timeout=2
+        )
+        == worker_loop.APP_SERVER_PROTOCOL_FAILURE_RC
+    )
     store = HotJoinStore(worker.project_dir)
     pending = store.unfinished_round_intent(worker.name)
     assert pending is not None
     assert pending["state"] == "delivery_unknown"
     assert pending["turn_id"] is None
 
-    assert worker_loop.run_round_app_server(
-        worker, role, prompt, audit_path, hard_timeout=2
-    ) == worker_loop.APP_SERVER_MODEL_REROUTED_RC
+    assert (
+        worker_loop.run_round_app_server(
+            worker, role, prompt, audit_path, hard_timeout=2
+        )
+        == worker_loop.APP_SERVER_MODEL_REROUTED_RC
+    )
     trace = _trace_messages(trace_path)
     assert sum(row.get("method") == "turn/start" for row in trace) == 1
     assert sum(row.get("method") == "thread/start" for row in trace) == 1
     assert sum(row.get("method") == "thread/resume" for row in trace) == 1
     assert sum(row.get("_fake") == "round_turn_applied" for row in trace) == 1
-    assert sum(row.get("method") == "turn/interrupt" for row in trace) == expected_interrupts
+    assert (
+        sum(row.get("method") == "turn/interrupt" for row in trace)
+        == expected_interrupts
+    )
 
     assert store.unfinished_round_intent(worker.name) is None
     intent = store.get_round_intent(str(pending["client_id"]))
@@ -1685,10 +1900,7 @@ def test_paid_turn_start_ack_loss_is_recovered_once_then_provenance_quarantined(
         == "not_observed_after_bounded_post_terminal_settle"
     )
     assert audit[0]["model_rerouted"] is None
-    assert (
-        audit[0]["model_reroute_observation"]
-        == "unknown_after_adapter_interruption"
-    )
+    assert audit[0]["model_reroute_observation"] == "unknown_after_adapter_interruption"
     assert audit[0]["model_reroutes"]["observed"] is None
     expected_recovery_failure = (
         "recovered after prior adapter interruption"
@@ -1748,20 +1960,25 @@ def test_dispatching_paid_intent_without_history_is_quarantined_not_resent(
         lambda *_a: [sys.executable, str(FAKE), "--scenario", "auto-complete"],
     )
 
-    assert worker_loop.run_round_app_server(
-        worker,
-        {"MODEL": "offline-model", "REASONING_EFFORT": "low"},
-        prompt,
-        audit_path,
-        hard_timeout=2,
-    ) == worker_loop.APP_SERVER_PROTOCOL_FAILURE_RC
+    assert (
+        worker_loop.run_round_app_server(
+            worker,
+            {"MODEL": "offline-model", "REASONING_EFFORT": "low"},
+            prompt,
+            audit_path,
+            hard_timeout=2,
+        )
+        == worker_loop.APP_SERVER_PROTOCOL_FAILURE_RC
+    )
     assert store.get_round_intent(intent["client_id"])["state"] == "delivery_unknown"
     assert not any(
         row.get("method") == "turn/start" for row in _trace_messages(trace_path)
     )
     attempts = store.round_audit_events(intent["client_id"])
     assert [row["kind"] for row in attempts] == ["attempt"]
-    assert json.loads(attempts[0]["payload"].splitlines()[0])["terminal_observed"] is False
+    assert (
+        json.loads(attempts[0]["payload"].splitlines()[0])["terminal_observed"] is False
+    )
 
 
 def test_owner_abandoned_paid_intent_restart_never_dispatches_duplicate(
@@ -1824,9 +2041,12 @@ def test_owner_abandoned_paid_intent_restart_never_dispatches_duplicate(
         lambda *_a: [sys.executable, str(FAKE), "--scenario", "auto-complete"],
     )
 
-    assert worker_loop.run_round_app_server(
-        worker, role, prompt, audit_path, hard_timeout=2
-    ) == worker_loop.APP_SERVER_PROTOCOL_FAILURE_RC
+    assert (
+        worker_loop.run_round_app_server(
+            worker, role, prompt, audit_path, hard_timeout=2
+        )
+        == worker_loop.APP_SERVER_PROTOCOL_FAILURE_RC
+    )
     trace = _trace_messages(trace_path)
     assert sum(row.get("method") == "turn/start" for row in trace) == 0
     assert store.get_round_intent(intent["client_id"]) == intent_before

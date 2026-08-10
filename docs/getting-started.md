@@ -56,15 +56,17 @@ Then pick your **codex backend** (workers + verifier):
 - **ChatGPT subscription:** in `config/danus.env` set `CODEX_BACKEND=chatgpt`, then
   `bash scripts/setup-codex.sh login` and follow the device-auth flow.
 
-And your **strategy consult transport** in `config/danus.env`
-(`DANUS_CONSULT_TRANSPORT`): `gpt_pro` (paid OpenAI-compatible, the default — fill
+And your optional **strategy consult transport** in `config/danus.env`
+(`DANUS_CONSULT_TRANSPORT`): `off` (the default; the main agent reasons from the
+durable synthesis), `gpt_pro` (paid OpenAI-compatible, explicit opt-in — fill
 `DANUS_CONSULT_API_KEY` / `_BASE_URL` / `_MODEL`), `claude_api` (the Anthropic API
 via the native SDK — per-token billing to your `DANUS_CONSULT_CLAUDE_API_KEY`,
 cost metered from real usage), `claude_code` (your Claude
 subscription via the Claude Code CLI — no separate API key: each consult is metered
-into the spend ledger at the `DANUS_CONSULT_CLAUDE_CODE_PRICE_*` estimate rates), or
-`off` (the main agent reasons on its own). See `configuration.md` for the full
-variable list.
+into the spend ledger at the `DANUS_CONSULT_CLAUDE_CODE_PRICE_*` estimate rates).
+See `configuration.md` for the full variable list. ChatGPT Pro in Chrome is not
+an environment transport; it is available later only after an exact current
+coordinator recommendation plus per-question owner authorization.
 
 ## 3. Confirm the codex backend is reachable
 
@@ -116,12 +118,12 @@ DANUS_ROOT=/home/you/Danus
   ok   python dep: openai (gpt_pro consult)
   ok   python dep: anthropic (claude_api consult)
   ok   node: .../runtime/node22/bin/node
-  ok   codex: codex-cli 0.142.5
+  ok   codex: codex-cli 0.147
   ok   codex login ok (/home/you/codex-home)
   ok   verify service up :8091 (ours)
   warn no pdflatex on PATH (write-paper PDF render needs it; set TEX_ENGINE or install TeX)
   ok   chrome: /usr/bin/chromium-browser (human-summary PDF)
-consult transport: gpt_pro
+consult transport: off
 done.
 ```
 
@@ -137,6 +139,10 @@ spend ceiling, consult transport, codex backend), provisions `OPERATOR.md` +
 `config/danus.env`, brings up verify, and writes `runtime/.danus-initialized`.
 
 After initialize, continue with `operating-guide.md` to create and run a project.
+`danus new <project>` defaults to reasoning-first coordination and roster
+`max:2,high:5`: the two `max` workers become the only paid root/critic lanes and
+the five `high` workers remain dormant observers. Pass `--roles` for an explicit
+override. `--coordination legacy` without `--roles` retains `high:3,xhigh:4`.
 
 ## Troubleshooting
 

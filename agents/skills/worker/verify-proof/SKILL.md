@@ -66,10 +66,15 @@ Concretely, before you submit:
   `fact_context` for explicit relevant ids; search global memory with `gm_search`.
   If a verified fact already has the needed statement, cite its `fact_id` instead
   of re-proving it.
+- **Bind the candidate checkpoint.** In `reasoning_first_v1`, first publish the
+  phase's one consolidated `proof_attempt` and retain its returned global-memory
+  `id`. Pass that exact id as `source_id`; do not create a second proof copy merely for
+  submission.
 
 ## Submit and repair
 
-Call `fact_submit(statement, proof, predecessors=[...], glossary_introduces={...})`.
+Call `fact_submit(statement, proof, predecessors=[...],
+glossary_introduces={...}, source_id="<consolidated_entry_id>")`.
 Read the result:
 
 - `promoted: true, submission_status: "promoted", fact_id` — the fact is
@@ -80,7 +85,13 @@ Read the result:
   critical errors first, then all remaining gaps; do not assume the fix is local —
   change strategy or backtrack if needed; then resubmit. Treat any `wrong` verdict,
   any critical error, or any gap as failure.
-- `verdict: "error"` — the verify service was unavailable; retry.
+- `verdict: "error"` — the verify service was unavailable. Do not spin; retain
+  the exact candidate/source identity and retry only after the bounded scheduler
+  or a later admitted phase, and only when no live candidate overlay exists.
+- `candidate_outcome: "outcome_unknown"` — stop. Preserve the exact receipt and
+  source slot, do not retry or resubmit this candidate, and surface the
+  owner-only `resolve-candidate` recovery. There is no TTL or time-based inference;
+  the live slot remains frozen until exact owner resolution.
 - `accepted: true, verification_verdict: "correct", promoted: false,
   submission_status: "verified_not_promoted", fact_id: null, write_error` — the
   mathematics passed but the fact was not written. Refresh/re-prove around stale
@@ -90,6 +101,13 @@ Read the result:
 - `accepted: true, promoted: null, submission_status: "promotion_unknown"` — an
   fsync failure made commit versus rollback crash recovery ambiguous. Do not cite
   or count the response; refresh graph truth before proceeding.
+- `verification_reuse: "active_exact_fact", verification_calls: 0` — the full
+  candidate identity was already active and integrity-valid. No verifier was
+  spent and no graph file was rewritten; cite the returned existing `fact_id`.
+
+Queued, coalesced, and cache-hit scheduler fields are performance telemetry, not
+correctness verdicts. Preserve them for diagnosis, but obey only the verifier
+verdict, `promoted`, and current graph truth.
 
 Every outcome is auto-logged to global memory (kind `verification`), so the
 feedback is shared — `gm_search` it to learn from others' rejections.

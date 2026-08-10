@@ -20,9 +20,14 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from .config import (
-    load_claude_api_config, load_claude_code_config, load_config, resolve_transport,
+    CONSULT_TRANSPORTS,
+    load_claude_api_config,
+    load_claude_code_config,
+    load_config,
+    resolve_transport,
 )
-from .ledger import log_spend
+from .ledger import log_spend_summary
+from .browser_advisor import BrowserAdvisorBroker, BrowserAdvisorError
 from .transport import (
     ClaudeApiTransport, ClaudeCodeTransport, GptProTransport, OffTransport,
 )
@@ -43,7 +48,8 @@ def _write_out(path: str, res: Dict[str, Any]) -> None:
         f"transport={res.get('transport')}, {res.get('status')})\n\n"
         f"- time: {res.get('seconds')}s · tools: {res.get('tool_calls') or 'none'}\n"
         f"- tokens: in {usage.get('input')} / out {usage.get('output')} "
-        f"(reasoning {usage.get('reasoning')}) · **cost ${res.get('cost_usd')}**\n\n"
+        f"(reasoning {usage.get('reasoning')}) · cost "
+        f"{('$' + str(res.get('cost_usd'))) if res.get('cost_usd') is not None else 'unpriced'}\n\n"
         f"## reasoning summary\n\n{res.get('reasoning_summary') or '_(none)_'}\n\n"
         f"## reply (record this as master_guidance)\n\n{res.get('reply', '')}\n"
     )
@@ -53,8 +59,8 @@ def _write_out(path: str, res: Dict[str, Any]) -> None:
 def _build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="consult",
-        description="Consult a strong model (default gpt-5.5-pro) via an "
-        "OpenAI-compatible Responses API; emit reply+cost as one JSON line.",
+        description="Optionally consult a configured strong model (default "
+        "transport: off); emit reply+cost as one JSON line.",
     )
     src = ap.add_mutually_exclusive_group(required=True)
     src.add_argument("--file", help="read the elaboration / prompt from this file")
@@ -70,11 +76,47 @@ def _build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--model", default=None,
                     help="override the consult model (api: any OpenAI-compatible id; "
                     "claude_api/claude_code: any Claude model, e.g. claude-fable-5 / claude-opus-4-8)")
-    ap.add_argument("--transport", choices=["gpt_pro", "claude_api", "claude_code", "off"], default=None,
-                    help="gpt_pro (the default, paid OpenAI-compatible), claude_api "
+    ap.add_argument("--transport", choices=CONSULT_TRANSPORTS, default=None,
+                    help="off (the default), gpt_pro (paid OpenAI-compatible), claude_api "
                     "(paid Anthropic API, BYO key), claude_code (your Claude "
-                    "subscription via the Claude Code CLI), or off (no-op short-circuit); "
-                    "falls back to $DANUS_CONSULT_TRANSPORT then gpt_pro")
+                    "subscription via the Claude Code CLI), chatgpt_pro_browser "
+                    "(owner-mediated durable UI handoff; this process never opens "
+                    "a browser); "
+                    "falls back to $DANUS_CONSULT_TRANSPORT then off")
+    ap.add_argument("--elaboration-id", help="provenance id for browser-advisor prepare")
+    ap.add_argument("--browser-client-id", help="idempotency key for browser prepare")
+    ap.add_argument(
+        "--browser-context-id",
+        help="stable conversation-lineage binding for explicit browser prepare",
+    )
+    ap.add_argument(
+        "--browser-recommendation-id",
+        help=(
+            "exact current coordinator recommendation; required for a "
+            "reasoning-first browser prepare"
+        ),
+    )
+    ap.add_argument(
+        "--browser-checkpoint-id",
+        help="exact immutable advisor_checkpoint global-memory id",
+    )
+    ap.add_argument(
+        "--browser-checkpoint-sha256",
+        help="SHA-256 of the strict canonical immutable checkpoint record",
+    )
+    ap.add_argument(
+        "--browser-checkpoint-bytes",
+        type=int,
+        help="exact byte length of the strict canonical checkpoint record",
+    )
+    ap.add_argument(
+        "--owner-browser-prepare",
+        action="store_true",
+        help=(
+            "explicit owner-only permission to create a durable browser request; "
+            "the env transport alone never creates one"
+        ),
+    )
     ap.add_argument("--quiet", action="store_true", help="suppress the stderr heartbeat")
     return ap
 
@@ -87,7 +129,73 @@ def main(argv: Optional[list] = None) -> int:
         print("refusing to consult on an empty prompt", file=sys.stderr, flush=True)
         return 2
 
-    transport_name = resolve_transport(args.transport)
+    try:
+        transport_name = resolve_transport(args.transport)
+    except ValueError as exc:
+        print(f"consult: {exc}", file=sys.stderr, flush=True)
+        return 2
+
+    if transport_name == "chatgpt_pro_browser":
+        if args.transport != "chatgpt_pro_browser" or not args.owner_browser_prepare:
+            print(
+                "chatgpt_pro_browser never prepares from environment/unattended "
+                "selection; invoke it explicitly with --transport "
+                "chatgpt_pro_browser --owner-browser-prepare, or use "
+                "consult-browser prepare",
+                file=sys.stderr,
+                flush=True,
+            )
+            return 2
+        if not args.project:
+            print(
+                "chatgpt_pro_browser requires --project for its durable owner receipt",
+                file=sys.stderr,
+                flush=True,
+            )
+            return 2
+        if not args.browser_context_id:
+            print(
+                "chatgpt_pro_browser requires --browser-context-id to bind this "
+                "exact strategic cycle",
+                file=sys.stderr,
+                flush=True,
+            )
+            return 2
+        if args.out:
+            print(
+                "chatgpt_pro_browser has no reply yet; --out is valid only after "
+                "`consult-browser import`",
+                file=sys.stderr,
+                flush=True,
+            )
+            return 2
+        try:
+            prepared = BrowserAdvisorBroker(args.project).prepare(
+                prompt,
+                elaboration_id=args.elaboration_id,
+                client_id=args.browser_client_id,
+                context_id=args.browser_context_id,
+                recommendation_id=args.browser_recommendation_id,
+                checkpoint_id=args.browser_checkpoint_id,
+                checkpoint_sha256=args.browser_checkpoint_sha256,
+                checkpoint_bytes=args.browser_checkpoint_bytes,
+            )
+        except (BrowserAdvisorError, OSError, ValueError) as exc:
+            print(f"consult: browser-advisor prepare failed: {exc}", file=sys.stderr)
+            return 2
+        prepared["status"] = "interactive_action_required"
+        prepared["next_command"] = (
+            "consult-browser authorize --project <project> --request-id "
+            f"{prepared['request_id']} --prompt-sha256 {prepared['prompt_sha256']} "
+            "--scope <exact-authorized-scope> --acknowledge-external-transmission"
+        )
+        print(json.dumps(prepared, ensure_ascii=False, allow_nan=False))
+        print(
+            "[consult] owner browser action required; no browser/model was started",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 4
 
     if transport_name == "off":
         res = OffTransport().consult(
@@ -95,7 +203,7 @@ def main(argv: Optional[list] = None) -> int:
             max_output_tokens=args.max_output_tokens,
         )
         if args.project:
-            res["project_total_usd"] = log_spend(args.project, res)  # records the $0 event
+            res.update(log_spend_summary(args.project, res))  # records the $0 event
         if args.out:
             _write_out(args.out, res)
         print(json.dumps(res, ensure_ascii=False))
@@ -120,7 +228,7 @@ def main(argv: Optional[list] = None) -> int:
             print(f"[consult] WARNING status={res.get('status')} (claude_code transport did not "
                   "complete; main agent should reason on its own)", file=sys.stderr, flush=True)
         if args.project:
-            res["project_total_usd"] = log_spend(args.project, res)  # records the consult event with its metered cost_usd
+            res.update(log_spend_summary(args.project, res))
         if args.out:
             _write_out(args.out, res)
         print(json.dumps(res, ensure_ascii=False))
@@ -152,7 +260,7 @@ def main(argv: Optional[list] = None) -> int:
                   "did not complete; main agent should reason on its own)",
                   file=sys.stderr, flush=True)
         if args.project:
-            res["project_total_usd"] = log_spend(args.project, res)  # real usage × per-1M rate
+            res.update(log_spend_summary(args.project, res))
         if args.out:
             _write_out(args.out, res)
         print(json.dumps(res, ensure_ascii=False))
@@ -177,8 +285,8 @@ def main(argv: Optional[list] = None) -> int:
     if res.get("status") and res["status"] != "completed":
         print(f"[consult] WARNING status={res['status']} (not completed)", file=sys.stderr, flush=True)
     if args.project:
-        res["project_total_usd"] = log_spend(args.project, res)
+        res.update(log_spend_summary(args.project, res))
     if args.out:
         _write_out(args.out, res)
     print(json.dumps(res, ensure_ascii=False))
-    return 0
+    return 0 if res.get("status") == "completed" and bool(res.get("reply")) else 1

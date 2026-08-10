@@ -23,12 +23,18 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from danus import codex
+from danus.coordination import (
+    CoordinationStore,
+    coordination_config,
+    coordination_payload,
+)
 
 from . import layout as L
 
 # --------------------------------------------------------------------------- #
 # atomic file helpers                                                         #
 # --------------------------------------------------------------------------- #
+
 
 def atomic_write(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -37,9 +43,7 @@ def atomic_write(path: Path, text: str) -> None:
         raise OSError(f"refusing unsafe write parent: {path.parent}")
     if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
         raise OSError("host lacks no-follow file operations")
-    parent_fd = os.open(
-        str(path.parent), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-    )
+    parent_fd = os.open(str(path.parent), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     temp_name = f".{path.name}.danus-{os.getpid()}-{os.urandom(12).hex()}"
     temp_fd: Optional[int] = None
     try:
@@ -89,11 +93,7 @@ def open_append_log(path: Path):
     ensure_real_dir(path.parent)
     fd = os.open(
         str(path),
-        os.O_WRONLY
-        | os.O_CREAT
-        | os.O_APPEND
-        | os.O_NOFOLLOW
-        | os.O_NONBLOCK,
+        os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK,
         0o600,
     )
     info = os.fstat(fd)
@@ -155,6 +155,9 @@ _TASK_PLACEHOLDER = (
     "`danus assign`; you read this file at the start of every round)\n"
 )
 
+DEFAULT_REASONING_FIRST_ROLES = "max:2,high:5"
+DEFAULT_LEGACY_ROLES = "high:3,xhigh:4"
+
 
 def _verify_url() -> str:
     # each fact_submit POSTs here; the verify service spawns a fresh codex to
@@ -173,20 +176,28 @@ def write_codex_config(wl: "L.WorkerLayout") -> None:
     the same Python as danus — never a bare ``python3`` that PATH could resolve to
     a different install (which would silently point the worker at another codebase
     / an incompatible ``mcp``)."""
-    atomic_write(wl.codex_config, _CODEX_CONFIG.format(
-        python=_toml_str(sys.executable),
-        project_dir=_toml_str(str(wl.project_dir)),
-        author=_toml_str(wl.name),
-        verify_url=_toml_str(_verify_url()),
-    ))
+    atomic_write(
+        wl.codex_config,
+        _CODEX_CONFIG.format(
+            python=_toml_str(sys.executable),
+            project_dir=_toml_str(str(wl.project_dir)),
+            author=_toml_str(wl.name),
+            verify_url=_toml_str(_verify_url()),
+        ),
+    )
 
 
 # --------------------------------------------------------------------------- #
 # do_new — scaffold a project                                                 #
 # --------------------------------------------------------------------------- #
 
-def do_new(project: str, roles: str = "high:3,xhigh:4",
-           model: Optional[str] = None) -> Dict:
+
+def do_new(
+    project: str,
+    roles: Optional[str] = None,
+    model: Optional[str] = None,
+    coordination: str | None = None,
+) -> Dict:
     """Scaffold a project dir + one worker home per role. Refuses to clobber an
     existing project dir (no silent overwrite of a live fact graph). Returns
     ``{"project_dir", "workers"}``."""
@@ -196,7 +207,16 @@ def do_new(project: str, roles: str = "high:3,xhigh:4",
         raise SystemExit(f"invalid project name: {exc}") from exc
     pdir = L.project_dir(project)
     if pdir.exists():
-        raise SystemExit(f"project already exists: {pdir} (pick another name or remove it)")
+        raise SystemExit(
+            f"project already exists: {pdir} (pick another name or remove it)"
+        )
+    coordination_data = coordination_payload(coordination)
+    if roles is None:
+        roles = (
+            DEFAULT_LEGACY_ROLES
+            if coordination_data["mode"] == "legacy"
+            else DEFAULT_REASONING_FIRST_ROLES
+        )
     role_pairs = L.parse_roles(roles)
     model = model or _default_model()
 
@@ -218,20 +238,38 @@ def do_new(project: str, roles: str = "high:3,xhigh:4",
         # codex MCP wiring (role=worker)
         write_codex_config(wl)
         atomic_write(wl.task, _TASK_PLACEHOLDER)
-        atomic_write(wl.role,
-                     f"MODEL={model}\nREASONING_EFFORT={base}\nROLE={base}\nDANUS_AUTHOR={worker}\n")
-        atomic_write(wl.status,
-                     json.dumps({"worker": worker, "state": "created", "round": 0}, indent=2))
+        atomic_write(
+            wl.role,
+            f"MODEL={model}\nREASONING_EFFORT={base}\nROLE={base}\nDANUS_AUTHOR={worker}\n",
+        )
+        atomic_write(
+            wl.status,
+            json.dumps({"worker": worker, "state": "created", "round": 0}, indent=2),
+        )
         created.append(worker)
 
-    meta = {"name": project, "model": model, "roles": roles, "workers": created}
+    meta = {
+        "name": project,
+        "model": model,
+        "roles": roles,
+        "workers": created,
+        "coordination": coordination_data,
+    }
     atomic_write(pdir / "project.json", json.dumps(meta, ensure_ascii=False, indent=2))
-    return {"project_dir": str(pdir), "workers": created}
+    config = coordination_config(meta)
+    if config.reasoning_first:
+        CoordinationStore(pdir, meta)
+    return {
+        "project_dir": str(pdir),
+        "workers": created,
+        "coordination": meta["coordination"],
+    }
 
 
 # --------------------------------------------------------------------------- #
 # spawn_loop — detached launch of one worker's outer loop                     #
 # --------------------------------------------------------------------------- #
+
 
 def spawn_loop(wdir: Path) -> subprocess.Popen:
     """Launch ``python -m danus.execution <wdir>`` detached in its own process
@@ -245,7 +283,9 @@ def spawn_loop(wdir: Path) -> subprocess.Popen:
     try:
         proc = subprocess.Popen(
             [sys.executable, "-m", "danus.execution", str(wdir)],
-            stdout=logf, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+            stdout=logf,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
             start_new_session=True,
         )
     finally:
