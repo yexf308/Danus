@@ -282,8 +282,20 @@ Every command prints one JSON receipt. Keep its `recommendation_id`,
    `master_guidance` do not themselves release the coordinator's
    `owner_action_required` state.
 
-7. Resolve the exact recommendation with an explicit paid-resume
-   acknowledgement. To adopt reviewed guidance:
+7. Stage the next generation's exact task for every paid lane before resuming.
+   While `owner_action_required` is open, each paid-lane `danus assign` targets
+   generation `N+1` and writes the durable coordinator first; the host
+   `TASK.md` is only its projection. Check the complete digest-only coverage:
+
+   ```bash
+   bin/danus assign <project>/<root-worker> --file <root-task.md>
+   bin/danus assign <project>/<critic-worker> --file <critic-task.md>
+   bin/danus status <project> --json  # task_staging.ready must be true
+   ```
+
+8. Resolve the exact recommendation with an explicit paid-resume
+   acknowledgement. The same transaction freezes the complete next-generation
+   task set. To adopt reviewed guidance:
 
    ```bash
    bin/danus resolve-recommendation <project> \
@@ -299,7 +311,9 @@ Every command prints one JSON receipt. Keep its `recommendation_id`,
    `--master-guidance-entry-id`. The command is an exact, replay-safe owner CAS:
    the acknowledgement must repeat the recommendation id, the recommendation
    must still be current, and all recommendation-generation paid slots must be
-   terminal. Adopted guidance must link that exact recommendation; browser-backed
+   terminal. Every next-generation paid lane must be staged; a missing lane
+   fails closed without advancing the generation. Adopted guidance must link
+   that exact recommendation; browser-backed
    guidance must also match its same-project adopted receipt. Continuing without
    advisor guidance additionally refuses any browser request still in `prepared`,
    `authorized`, `dispatching`, `submitted`, `completed`, or `delivery_unknown`.

@@ -4,6 +4,7 @@
     danus new    <project> [--roles ROLE_SPEC] [--model M]
     danus assign <project>/<worker> (--task "…" | --file P | --stdin)
     danus say    <project>/<worker> (--text "…" | --file P | --stdin)
+    danus encourage <project>/<worker> [--text "…" | --file P | --stdin]
     danus messages <project>[/<worker>] [--json]
     danus interrupt-turn <project>/<worker>
     danus abandon-intent <project>/<worker> --thread-id ID --client-id ID
@@ -64,7 +65,13 @@ from danus.core import FactGraph, GlobalMemory
 from danus.core.schema import clean_consult_provenance
 from danus.execution import layout as L
 from danus.execution.scaffold import atomic_write, do_new, ensure_real_dir, spawn_loop
-from danus.hotjoin import HotJoinError, HotJoinStore, IdempotencyConflict, StaleClaim
+from danus.hotjoin import (
+    DEFAULT_ENCOURAGEMENT,
+    HotJoinError,
+    HotJoinStore,
+    IdempotencyConflict,
+    StaleClaim,
+)
 from danus.strategy.browser_advisor import BrowserAdvisorError
 
 __all__ = [
@@ -77,6 +84,7 @@ __all__ = [
     "do_stop",
     "do_finalize",
     "do_say",
+    "do_encourage",
     "do_messages",
     "do_interrupt_turn",
     "do_abandon_intent",
@@ -468,23 +476,55 @@ def do_assign(target: str, task: str) -> Dict:
     wl = L.WorkerLayout(dirs[0])
     if not task.strip():
         raise SystemExit("refusing to assign an empty task")
+    normalized_task = task if task.endswith("\n") else task + "\n"
+    generation_assignment = None
+    reasoning_first = False
     try:
         metadata = load_project_metadata(wl.project_dir)
         config = coordination_config(metadata)
         if config.reasoning_first:
+            reasoning_first = True
             store = CoordinationStore.open_existing(wl.project_dir, metadata)
             if store is None:
                 raise CoordinationError(
                     "reasoning-first coordination database is missing"
                 )
-            if store.project_status()["candidate"] is not None:
+            coordination_status = store.project_status()
+            if coordination_status["candidate"] is not None:
                 raise SystemExit(
                     "active candidate freezes retask until its paid outcome is known"
                 )
+            paid_workers = {
+                coordination_status.get("root_worker"),
+                coordination_status.get("critic_worker"),
+            }
+            if worker in paid_workers:
+                # The database is authoritative for paid work.  Stage it first;
+                # TASK.md below is only an operator-facing projection and may
+                # be recreated from the exact slot snapshot at launch.
+                generation_assignment = store.stage_task_assignment(
+                    worker,
+                    normalized_task,
+                )
     except (CoordinationError, OSError, sqlite3.Error, ValueError) as exc:
         raise SystemExit(f"coordination state unavailable: {exc}") from exc
-    atomic_write(wl.task, task if task.endswith("\n") else task + "\n")
-    return {"worker": f"{project}/{worker}", "task_file": str(wl.task)}
+    atomic_write(wl.task, normalized_task)
+    result = {
+        "worker": f"{project}/{worker}",
+        "task_file": str(wl.task),
+        "generation_staged": generation_assignment is not None,
+    }
+    if generation_assignment is not None:
+        result.update(
+            {
+                "task_generation": generation_assignment.get("generation"),
+                "task_sha256": generation_assignment.get("task_sha256"),
+                "task_bytes": generation_assignment.get("task_bytes"),
+            }
+        )
+    elif reasoning_first:
+        result["assignment_scope"] = "dormant_observer_projection"
+    return result
 
 
 def do_resolve_candidate(
@@ -588,10 +628,11 @@ def do_resolve_recommendation(
     }:
         raise SystemExit("unsupported recommendation owner resolution")
     if resolution == "adopted-master-guidance" and master_guidance_entry_id is None:
-        raise SystemExit(
-            "adopted-master-guidance requires --master-guidance-entry-id"
-        )
-    if resolution == "continue-without-advisor" and master_guidance_entry_id is not None:
+        raise SystemExit("adopted-master-guidance requires --master-guidance-entry-id")
+    if (
+        resolution == "continue-without-advisor"
+        and master_guidance_entry_id is not None
+    ):
         raise SystemExit(
             "continue-without-advisor cannot include --master-guidance-entry-id"
         )
@@ -599,7 +640,9 @@ def do_resolve_recommendation(
     try:
         metadata = load_project_metadata(project_dir)
         if not coordination_config(metadata).reasoning_first:
-            raise CoordinationError("legacy project has no advisor recommendation state")
+            raise CoordinationError(
+                "legacy project has no advisor recommendation state"
+            )
         store = CoordinationStore.open_existing(project_dir, metadata)
         if store is None:
             raise CoordinationError("reasoning-first coordination database is missing")
@@ -671,9 +714,8 @@ def do_resolve_recommendation(
                         )
                         browser_request_id = provenance.get("request_id")
                         browser_receipt_sha256 = provenance.get("receipt_sha256")
-                        if (
-                            not isinstance(browser_request_id, str)
-                            or not isinstance(browser_receipt_sha256, str)
+                        if not isinstance(browser_request_id, str) or not isinstance(
+                            browser_receipt_sha256, str
                         ):
                             raise CoordinationError(
                                 "browser master guidance has incomplete adopted receipt"
@@ -737,6 +779,58 @@ def do_say(
         )
     except (ValueError, IdempotencyConflict) as exc:
         raise SystemExit(f"cannot enqueue human message: {exc}") from exc
+
+
+def do_encourage(
+    target: str,
+    text: str = DEFAULT_ENCOURAGEMENT,
+    *,
+    client_id: Optional[str] = None,
+) -> Dict:
+    """Send non-authoritative morale support to this exact live paid turn.
+
+    The authenticated worker birth record is checked under its lifecycle lock.
+    The message store then atomically snapshots the canonical started intent's
+    thread and turn IDs. Delivery is fail-only and the broker refuses any later
+    turn, so this command can neither queue future guidance nor retarget a race.
+    """
+    lock = None
+    locked = False
+    try:
+        project, worker, store = _hotjoin_target(target)
+        worker_dir = L.existing_worker_dir(project, worker)
+        assert worker_dir is not None
+        wl = L.WorkerLayout(worker_dir)
+        lock = _open_worker_lock(wl)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            locked = True
+        except BlockingIOError as exc:
+            raise HotJoinError(
+                "worker lifecycle lock is busy; retry after its current "
+                "start, stop, or owner action"
+            ) from exc
+        pid_record = _load_pid_record(wl)
+        if pid_record is None or not _pid_record_is_live(pid_record):
+            raise HotJoinError("worker is not authoritatively live")
+        return store.enqueue_encouragement(
+            target=worker,
+            note=text,
+            client_id=client_id,
+        )
+    except (
+        OSError,
+        sqlite3.Error,
+        ValueError,
+        HotJoinError,
+        ProcessIdentityError,
+    ) as exc:
+        raise SystemExit(f"cannot encourage worker: {exc}") from exc
+    finally:
+        if lock is not None:
+            if locked:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+            lock.close()
 
 
 def do_interrupt_turn(target: str, *, client_id: Optional[str] = None) -> Dict:
@@ -1296,6 +1390,7 @@ def worker_status(wl: L.WorkerLayout) -> Dict:
         "recommendation": None,
         "resolution": None,
         "candidate": None,
+        "task_staging": None,
     }
     try:
         metadata = load_project_metadata(wl.project_dir)
@@ -1372,7 +1467,24 @@ def worker_status(wl: L.WorkerLayout) -> Dict:
             else "dead"
         )
     recovery_required = st.get("recovery_required")
-    if unfinished_paid_intent is not None:
+    paid_intent_status = None
+    if unfinished_paid_intent is not None and alive:
+        # A live worker owns this intent and may be inside the normal
+        # dispatch/start/streaming gap.  Publishing an owner recovery action
+        # here is actively unsafe: abandon-intent is intentionally restricted
+        # to a fail-stopped worker, and the CLI must not make ordinary paid work
+        # look like an outcome-unknown incident while it is still running.
+        recovery_required = None
+        paid_intent_status = (
+            "outcome_unknown_while_worker_live"
+            if unfinished_paid_intent["state"] == "delivery_unknown"
+            else "in_progress"
+        )
+    elif unfinished_paid_intent is not None:
+        # PID-unsafe is deliberately handled like the existing fail-stopped
+        # projection: the recovery command itself re-authenticates lifecycle
+        # state under the worker lock and refuses an unsafe process identity.
+        paid_intent_status = "recovery_required"
         if unfinished_paid_intent["state"] == "prepared":
             recovery_required = {
                 "action": "resume_or_cancel_prepared_intent",
@@ -1454,6 +1566,7 @@ def worker_status(wl: L.WorkerLayout) -> Dict:
             st.get("last_turn_model_rerouted")
         ),
         "recovery_required": recovery_required,
+        "paid_intent_status": paid_intent_status,
         "unfinished_paid_intent": unfinished_paid_intent,
         "intent_ledger_error": intent_ledger_error,
         "pid_record_error": identity_error,
@@ -1479,6 +1592,7 @@ def worker_status(wl: L.WorkerLayout) -> Dict:
         "recommendation": coordination_view.get("recommendation"),
         "resolution": coordination_view.get("resolution"),
         "candidate": coordination_view.get("candidate"),
+        "task_staging": coordination_view.get("task_staging"),
         "coordination_mode": coordination_view.get("mode"),
         "coordination_error": coordination_error,
     }
@@ -1538,6 +1652,7 @@ def do_list() -> List[Dict]:
             "recommendation": None,
             "resolution": None,
             "candidate": None,
+            "task_staging": None,
         }
         try:
             if coordination_error is None:
@@ -1571,9 +1686,7 @@ def do_list() -> List[Dict]:
                 "phase_deadline_exceeded": coordination_view.get(
                     "phase_deadline_exceeded", False
                 ),
-                "advisor_reachable": coordination_view.get(
-                    "advisor_reachable", False
-                ),
+                "advisor_reachable": coordination_view.get("advisor_reachable", False),
                 "advisor_recommendation_present": coordination_view.get(
                     "advisor_recommendation_present", False
                 ),
@@ -1585,6 +1698,7 @@ def do_list() -> List[Dict]:
                 "recommendation": coordination_view.get("recommendation"),
                 "resolution": coordination_view.get("resolution"),
                 "candidate": coordination_view.get("candidate"),
+                "task_staging": coordination_view.get("task_staging"),
                 "coordination_mode": coordination_view.get("mode"),
                 "coordination_error": coordination_error,
                 "model": meta.get("model", "—"),
@@ -1707,6 +1821,18 @@ def _message_from_args(args) -> str:
     raise SystemExit("say needs one of --text, --file, or --stdin")
 
 
+def _encouragement_from_args(args) -> str:
+    import sys
+
+    if args.text is not None:
+        return args.text
+    if args.file:
+        return Path(args.file).read_text(encoding="utf-8")
+    if args.stdin:
+        return sys.stdin.read()
+    return DEFAULT_ENCOURAGEMENT
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="danus", description="Control codex workers.")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -1749,6 +1875,17 @@ def build_parser() -> argparse.ArgumentParser:
         default="queue",
         help="when the worker has no active turn (default: queue)",
     )
+
+    encourage = sub.add_parser(
+        "encourage",
+        help="send non-authoritative morale support to this exact live turn",
+    )
+    encourage.add_argument("target", help="<project>/<worker>")
+    encouragement_source = encourage.add_mutually_exclusive_group()
+    encouragement_source.add_argument("--text", default=None)
+    encouragement_source.add_argument("--file", default=None)
+    encouragement_source.add_argument("--stdin", action="store_true")
+    encourage.add_argument("--client-id", default=None, help="stable idempotency key")
 
     msgs = sub.add_parser("messages", help="show human-message delivery receipts")
     msgs.add_argument("target", help="<project> or <project>/<worker>")
@@ -1913,7 +2050,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
     elif args.cmd == "assign":
         r = do_assign(args.target, _task_from_args(args))
-        print(f"assigned {r['worker']} -> {r['task_file']}")
+        detail = (
+            f"; staged generation {r['task_generation']} task_sha256={r['task_sha256']}"
+            if r.get("generation_staged")
+            else (
+                "; dormant observer projection only"
+                if r.get("assignment_scope") == "dormant_observer_projection"
+                else ""
+            )
+        )
+        print(f"assigned {r['worker']} -> {r['task_file']}{detail}")
     elif args.cmd == "say":
         r = do_say(
             args.target,
@@ -1922,6 +2068,16 @@ def main(argv: Optional[List[str]] = None) -> int:
             fallback=args.fallback,
         )
         print(f"{r['message_id']}: {r['state']} -> {r['target']}")
+    elif args.cmd == "encourage":
+        r = do_encourage(
+            args.target,
+            _encouragement_from_args(args),
+            client_id=args.client_id,
+        )
+        print(
+            f"{r['message_id']}: {r['state']} -> {r['target']} "
+            f"(non-authoritative encouragement for {r['expected_turn_id']})"
+        )
     elif args.cmd == "messages":
         rows = do_messages(args.target, limit=args.limit)
         print(
@@ -1963,9 +2119,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             args.recommendation_id,
             resolution=args.resolution,
             acknowledge_recommendation_id=args.acknowledge_recommendation_id,
-            acknowledge_resume_paid_reasoning=(
-                args.acknowledge_resume_paid_reasoning
-            ),
+            acknowledge_resume_paid_reasoning=(args.acknowledge_resume_paid_reasoning),
             master_guidance_entry_id=args.master_guidance_entry_id,
         )
         print(

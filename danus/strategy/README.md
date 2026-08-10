@@ -92,11 +92,13 @@ digest/size and attestations; `import` requires the owner to resupply the exact
 response via file/stdin and never persists it. Only the reviewed synthesis passed
 to `adopt` becomes project plaintext. Neither adoption nor published guidance
 releases `owner_action_required`. Publish adopted guidance with
-`links.recommendation_id` and then run the exact owner-only
-`danus resolve-recommendation` transition, explicitly acknowledging both the
-recommendation id and the restart of paid reasoning. Continuing without advisor
-guidance is rejected while its browser request remains active, completed but
-unimported, or delivery-ambiguous.
+`links.recommendation_id`, use `danus assign` to stage exact next-generation
+tasks for both the root and critic (`status --json` must report
+`task_staging.ready=true`), and then run the exact owner-only
+`danus resolve-recommendation` transition. Resolution freezes that complete task
+set while explicitly acknowledging both the recommendation id and the restart
+of paid reasoning. Continuing without advisor guidance is rejected while its
+browser request remains active, completed but unimported, or delivery-ambiguous.
 
 ## Tests
 

@@ -127,7 +127,15 @@ health gate, and exits nonzero if any step failed. Idempotent.
 > from persisted memory).
 
 Worker intent repair is deliberately separate from service recovery. If a
-prepared app-server intent is authoritatively known to be unspent, use
+worker is authoritatively live, `status --json` treats canonical `prepared`,
+`dispatching`, and `started` intents as `paid_intent_status: "in_progress"` and
+does not publish a `recovery_required` action. A live `delivery_unknown` intent
+is labeled `outcome_unknown_while_worker_live`, again without an abandon argv;
+let the worker reconcile or fail-stop first. Recovery commands appear only for
+a fail-stopped/PID-unsafe worker and still recheck lifecycle state under the
+worker lock.
+
+If a prepared app-server intent is authoritatively known to be unspent, use
 `danus cancel-prepared-intent <project>/<worker> --thread-id ID --client-id ID
 --reason TEXT`; it performs an exact CAS under the worker lifecycle lock and
 appends a cancellation receipt. Reset or rotate the thread only as a separate

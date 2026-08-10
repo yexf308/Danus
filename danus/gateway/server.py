@@ -919,9 +919,10 @@ def _reasoning_sensitive_memory_replay(
                 or entry_links.get("coordination") != expected_provenance
             ):
                 continue
-            if publication["lane"] == "critic" and entry_links.get(
-                "confirms_entry_id"
-            ) is None:
+            if (
+                publication["lane"] == "critic"
+                and entry_links.get("confirms_entry_id") is None
+            ):
                 continue
             matches.append(entry)
             if len(matches) > 1:
@@ -1039,9 +1040,7 @@ def _advisor_checkpoint_replay(
         "claim": claim,
         "evidence": evidence,
         "verifiable": (
-            GLOBAL_KINDS["advisor_checkpoint"]
-            if verifiable is None
-            else verifiable
+            GLOBAL_KINDS["advisor_checkpoint"] if verifiable is None else verifiable
         ),
         "links": links,
         "glossary": glossary or {},
@@ -1555,6 +1554,54 @@ def fact_submit(
         statement=statement,
         proof=proof,
     )
+
+    # Reject a glossary redefinition while the attempt is still entirely
+    # read-only.  This also re-attests glossary integrity before an active exact
+    # fact can be reused.  The shared snapshot is only an optimization, not an
+    # authorization: a definition can still race in after this check, so
+    # add_if_context_unchanged retains the independent conflict check under its
+    # exclusive promotion/CAS lock.
+    try:
+        glossary_conflicts = fg.glossary_conflicts(glossary_introduces)
+    except Exception as exc:
+        return {
+            "accepted": False,
+            "promoted": False,
+            "submission_status": "error",
+            "verification_verdict": None,
+            "verdict": "error",
+            "error": "glossary preflight error: " + _bounded_exception_detail(exc),
+            "undefined_symbols": undefined,
+            "adaptive_rounds": 0,
+            "verification_calls": 0,
+            "expanded_proof_ids": [],
+            "verification_metrics": [],
+            "verification_scheduler": [],
+        }
+    if glossary_conflicts:
+        terms = ", ".join(glossary_conflicts)
+        return {
+            "accepted": False,
+            "promoted": False,
+            "submission_status": "error",
+            "verification_verdict": None,
+            "verdict": "error",
+            "error": (
+                "glossary_conflict: refusing to redefine project terms: " + terms
+            ),
+            "repair_hints": (
+                "Reuse the established definition exactly, remove the conflicting "
+                f"entry, or introduce a new symbol for: {terms}. Then resubmit "
+                "for a fresh verification."
+            ),
+            "undefined_symbols": undefined,
+            "adaptive_rounds": 0,
+            "verification_calls": 0,
+            "expanded_proof_ids": [],
+            "verification_metrics": [],
+            "verification_scheduler": [],
+        }
+
     try:
         reused_identity = fg.lookup_active_exact_identity(
             problem_id=problem_id,

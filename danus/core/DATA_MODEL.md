@@ -194,6 +194,25 @@ recovery of that same pinned slot resumes its exact thread. The 2700-second cap
 bounds each paid turn, not completion of the whole root/critic phase. Legacy
 `exec` and explicitly legacy app-server continuation remain separate semantics.
 
+For a paid reasoning-first lane, `danus assign` first stores one bounded exact
+task in the protected coordination database. The host `TASK.md` is only an
+operator-facing projection. Admission copies the task bytes, byte count, and
+SHA-256 into the immutable round slot; the pinned kickoff names the exact slot,
+generation, and task digest, and the model-workspace `TASK.md` is rebuilt from
+that slot snapshot rather than from a mutable host file. Before resolving
+`owner_action_required`, the owner must stage tasks for every paid lane in
+generation `N+1` (`task_staging.ready=true`); the resolution transaction freezes
+that complete set. A generation that advances without an owner gate carries its
+previous frozen task set forward exactly. Missing or conflicting bindings fail
+closed instead of silently reusing a stale assignment.
+
+Human morale support is a separate, optional surface. `danus encourage` binds a
+non-authoritative note to the exact currently started thread/turn and uses
+fail-only delivery: it neither queues for a later turn nor starts paid work. The
+note is not a task update, coordination directive, mathematical claim, proof,
+verification result, or scope permission. Danus never sends encouragement
+automatically and makes no claim that it causally improves reasoning.
+
 On an event with genuinely new shared state, the main agent writes an
 `elaboration`. Strategy consult defaults to `off`, in which case it assigns the
 fixed root/critic from that synthesis without fabricating `master_guidance`.
@@ -483,11 +502,16 @@ external_refs=[]) -> fact_id`, `get_raw(fact_id)`, `list()`, `search(query, limi
    stable references, cascade revocation.
 
 **Promotion.** A worker submits the finding only through the gateway's
-`fact_submit`, which builds and validates lazy predecessor context, calls the
-verifier, atomically rechecks the context, and then invokes `FactGraph.add` only
-for a valid `correct` verdict. The resulting fact id may back-link the global
-finding. There is deliberately no second `promote()` path that could bypass the
-gate.
+`fact_submit`. Before candidate admission or verifier spend, the gateway takes a
+read-only glossary snapshot and rejects any already-known project/global symbol
+conflict (including malformed glossary state). This preflight is a cost guard,
+not correctness authority: after verification, the existing exclusive
+context/glossary CAS independently rechecks the write. The gateway builds and
+validates lazy predecessor context, calls the verifier only after that preflight,
+and invokes `FactGraph.add_if_context_unchanged` only for a valid `correct`
+verdict whose locked context still matches. The resulting fact id may back-link
+the global finding.
+There is deliberately no second `promote()` path that could bypass the gate.
 
 ### Code vs prose (the boundary)
 
@@ -505,9 +529,10 @@ is prose.
 
 ## 5. Usage logic (typical reasoning-first generation)
 
-1. **Coordinator:** pin one root and one independent critic; leave observers
-   dormant without paid turns. A new terminal coordination slot gets a fresh
-   app-server thread, and only same-slot crash recovery resumes.
+1. **Coordinator:** stage and freeze generation-bound tasks, pin one root and one
+   independent critic, and leave observers dormant without paid turns. A new
+   terminal coordination slot gets a fresh app-server thread, and only same-slot
+   crash recovery resumes its exact task/thread binding.
 2. **Main agent, on material new state:** append an `elaboration`; dispatch the
    fixed lanes directly by default (`off`) or explicitly opt into an API/CLI
    consult and record only its actual reviewed reply as `master_guidance`.

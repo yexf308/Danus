@@ -82,6 +82,31 @@ class _StubClient:
         return self.terminals.get((thread_id, turn_id))
 
 
+def _started_intent(
+    store: HotJoinStore,
+    *,
+    thread_id: str = "thread-1",
+    turn_id: str = "turn-1",
+) -> dict[str, Any]:
+    store.set_thread_id("max", thread_id)
+    intent = store.round_intent(
+        "max",
+        thread_id,
+        prompt_sha256=hashlib.sha256(turn_id.encode()).hexdigest(),
+        requested_model="offline-model",
+        requested_effort="high",
+    )
+    store.record_round_intent(
+        intent["client_id"], "dispatching", expected_states={"prepared"}
+    )
+    return store.record_round_intent(
+        intent["client_id"],
+        "started",
+        turn_id=turn_id,
+        expected_states={"dispatching"},
+    )
+
+
 def test_store_is_idempotent_append_only_and_rejects_content_conflict(tmp_path: Path):
     project, _worker = _project(tmp_path)
     store = HotJoinStore(project)
@@ -328,6 +353,63 @@ def test_concurrent_legacy_round_intent_migration_is_serialized(tmp_path: Path):
     with sqlite3.connect(database) as db:
         columns = {row[1] for row in db.execute("PRAGMA table_info(round_intents)")}
     assert {"prompt_sha256", "requested_model", "requested_effort"} <= columns
+
+
+def test_legacy_messages_gain_nullable_exact_binding_without_identity_drift(
+    tmp_path: Path,
+):
+    project, _worker = _project(tmp_path)
+    control = project / ".human-intervention"
+    control.mkdir(mode=0o700)
+    database = control / "events.sqlite3"
+    body = "legacy queued guidance"
+    digest = hashlib.sha256(
+        json.dumps(
+            ["max", "message", body, "queue"],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    with sqlite3.connect(database) as db:
+        db.execute(
+            "CREATE TABLE messages ("
+            "message_id TEXT PRIMARY KEY,client_id TEXT NOT NULL UNIQUE,"
+            "target TEXT NOT NULL,kind TEXT NOT NULL,body TEXT NOT NULL,"
+            "fallback TEXT NOT NULL,content_sha256 TEXT NOT NULL,"
+            "created_ns INTEGER NOT NULL)"
+        )
+        db.execute(
+            "CREATE TABLE deliveries ("
+            "message_id TEXT PRIMARY KEY REFERENCES messages(message_id),"
+            "state TEXT NOT NULL,claim_owner TEXT,lease_until_ns INTEGER,"
+            "attempts INTEGER NOT NULL DEFAULT 0,thread_id TEXT,turn_id TEXT,"
+            "detail TEXT,updated_ns INTEGER NOT NULL)"
+        )
+        db.execute(
+            "INSERT INTO messages VALUES (?,?,?,?,?,?,?,?)",
+            (
+                "legacy-message",
+                "legacy-client",
+                "max",
+                "message",
+                body,
+                "queue",
+                digest,
+                1,
+            ),
+        )
+        db.execute(
+            "INSERT INTO deliveries(message_id,state,updated_ns) VALUES (?,?,?)",
+            ("legacy-message", "persisted", 1),
+        )
+
+    store = HotJoinStore(project)
+    row = store.get("legacy-message")
+    assert row["expected_thread_id"] is None
+    assert row["expected_turn_id"] is None
+    replay = store.enqueue(target="max", body=body, client_id="legacy-client")
+    assert replay["message_id"] == "legacy-message"
+    assert replay["content_sha256"] == digest
 
 
 def test_legacy_operator_parent_migration_preserves_exact_receipt_foreign_keys(
@@ -1605,6 +1687,139 @@ def test_broker_steers_exact_active_turn_with_stable_client_id(tmp_path: Path):
     assert params["input"] == [{"type": "text", "text": "Switch to Sigma-Delta."}]
 
 
+def test_encouragement_requires_started_intent_and_creates_no_rejected_row(
+    tmp_path: Path,
+):
+    project, _worker = _project(tmp_path)
+    store = HotJoinStore(project)
+    store.set_thread_id("max", "thread-prepared")
+    store.round_intent(
+        "max",
+        "thread-prepared",
+        prompt_sha256="a" * 64,
+        requested_model="offline-model",
+        requested_effort="high",
+    )
+
+    with pytest.raises(HotJoinError, match="canonical started"):
+        store.enqueue_encouragement(
+            target="max", note="Keep going", client_id="encourage-prepared"
+        )
+
+    assert store.list_messages(target="max") == []
+
+
+def test_exact_active_encouragement_is_marked_fail_only_and_delivered(
+    tmp_path: Path,
+):
+    project, _worker = _project(tmp_path)
+    store = HotJoinStore(project)
+    _started_intent(store)
+    message = store.enqueue_encouragement(
+        target="max", note="Believe in yourself and keep going.", client_id="morale-1"
+    )
+    client = _StubClient(active_turn="turn-1")
+    broker = HotJoinBroker(store, client, target="max", thread_id="thread-1")
+    broker.start()
+    try:
+        delivered = _wait_state(store, message["message_id"], "steer_accepted")
+    finally:
+        broker.stop()
+
+    assert delivered["expected_thread_id"] == "thread-1"
+    assert delivered["expected_turn_id"] == "turn-1"
+    assert delivered["fallback"] == "fail"
+    assert "NON-AUTHORITATIVE" in delivered["body"]
+    assert "not a task instruction" in delivered["body"]
+    assert "mathematical evidence" in delivered["body"]
+    assert client.calls == [
+        (
+            "turn/steer",
+            {
+                "threadId": "thread-1",
+                "expectedTurnId": "turn-1",
+                "input": [{"type": "text", "text": delivered["body"]}],
+                "clientUserMessageId": (f"danus-human:{message['message_id']}"),
+            },
+        )
+    ]
+
+
+def test_encouragement_terminal_to_next_turn_race_fails_without_steer(
+    tmp_path: Path,
+):
+    project, _worker = _project(tmp_path)
+    store = HotJoinStore(project)
+    first_intent = _started_intent(store)
+    message = store.enqueue_encouragement(
+        target="max", note="Keep going", client_id="morale-race"
+    )
+    store.record_round_intent(
+        first_intent["client_id"],
+        "completed",
+        terminal_status="completed",
+        expected_states={"started"},
+    )
+    _started_intent(store, turn_id="turn-2")
+
+    client = _StubClient(active_turn="turn-2")
+    broker = HotJoinBroker(store, client, target="max", thread_id="thread-1")
+    broker.start()
+    try:
+        failed = _wait_state(store, message["message_id"], "failed")
+    finally:
+        broker.stop()
+
+    assert failed["expected_turn_id"] == "turn-1"
+    assert failed["turn_id"] == "turn-2"
+    assert "no longer active" in failed["detail"]
+    assert client.calls == []
+    assert [event["state"] for event in store.events(message["message_id"])] == [
+        "persisted",
+        "routing",
+        "failed",
+    ]
+
+
+def test_encouragement_idempotency_replays_exact_binding_and_conflicts(
+    tmp_path: Path,
+):
+    project, _worker = _project(tmp_path)
+    store = HotJoinStore(project)
+    intent = _started_intent(store)
+    first = store.enqueue_encouragement(
+        target="max", note="Keep going", client_id="morale-idempotent"
+    )
+    replay = store.enqueue_encouragement(
+        target="max", note="Keep going", client_id="morale-idempotent"
+    )
+    assert replay["message_id"] == first["message_id"]
+    assert replay["expected_thread_id"] == "thread-1"
+    assert replay["expected_turn_id"] == "turn-1"
+    assert [event["state"] for event in store.events(first["message_id"])] == [
+        "persisted"
+    ]
+
+    with pytest.raises(IdempotencyConflict):
+        store.enqueue_encouragement(
+            target="max", note="A different note", client_id="morale-idempotent"
+        )
+    with pytest.raises(IdempotencyConflict):
+        store.enqueue(target="max", body="Keep going", client_id="morale-idempotent")
+
+    store.record_round_intent(
+        intent["client_id"],
+        "completed",
+        terminal_status="completed",
+        expected_states={"started"},
+    )
+    _started_intent(store, turn_id="turn-2")
+    with pytest.raises(IdempotencyConflict, match="thread, or turn"):
+        store.enqueue_encouragement(
+            target="max", note="Keep going", client_id="morale-idempotent"
+        )
+
+
 def test_no_active_turn_queues_by_default_and_fail_is_explicit(tmp_path: Path):
     project, _worker = _project(tmp_path)
     store = HotJoinStore(project)
@@ -1792,6 +2007,62 @@ def test_cli_say_messages_and_interrupt_are_durable(tmp_path: Path):
         interrupted["message_id"],
     }
     assert {row["kind"] for row in rows} == {"message", "interrupt"}
+
+
+def test_cli_encourage_requires_authenticated_live_worker_without_writing_row(
+    tmp_path: Path,
+):
+    root = tmp_path / "agents"
+    project = root / "P"
+    worker = project / "workers" / "max"
+    worker.mkdir(parents=True)
+    with (
+        _agents_root(root),
+        pytest.raises(SystemExit, match="not authoritatively live"),
+    ):
+        cli.do_encourage("P/max", "Keep going", client_id="no-live")
+    assert HotJoinStore(project).list_messages(target="max") == []
+
+
+def test_cli_encourage_rejects_not_started_then_binds_live_started_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    root = tmp_path / "agents"
+    project = root / "P"
+    worker = project / "workers" / "max"
+    worker.mkdir(parents=True)
+    store = HotJoinStore(project)
+    store.set_thread_id("max", "thread-cli")
+    intent = store.round_intent(
+        "max",
+        "thread-cli",
+        prompt_sha256="c" * 64,
+        requested_model="offline-model",
+        requested_effort="high",
+    )
+    monkeypatch.setattr(cli, "_load_pid_record", lambda _wl: {"pid": 4242})
+    monkeypatch.setattr(cli, "_pid_record_is_live", lambda _record: True)
+
+    with _agents_root(root):
+        with pytest.raises(SystemExit, match="canonical started"):
+            cli.do_encourage("P/max", "Keep going", client_id="live-but-prepared")
+        assert store.list_messages(target="max") == []
+        store.record_round_intent(
+            intent["client_id"], "dispatching", expected_states={"prepared"}
+        )
+        store.record_round_intent(
+            intent["client_id"],
+            "started",
+            turn_id="turn-cli",
+            expected_states={"dispatching"},
+        )
+        result = cli.do_encourage(
+            "P/max", "Believe in yourself", client_id="live-started"
+        )
+
+    assert result["expected_thread_id"] == "thread-cli"
+    assert result["expected_turn_id"] == "turn-cli"
+    assert result["fallback"] == "fail"
 
 
 def test_owner_reset_thread_is_cas_fenced_audited_and_blocks_unfinished_turn(

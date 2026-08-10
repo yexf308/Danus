@@ -48,7 +48,8 @@ projects use `app-server` and legacy projects use `exec`; an explicit
 `DANUS_WORKER_TRANSPORT=exec` remains the compatibility opt-out.
 `DANUS_WORKER_TRANSPORT=app-server` uses Codex app-server over local stdio,
 persists each worker's Codex thread id, and enables owner hot-join via
-`danus say`. It is a thin transport change: Codex still owns the thread/turn and
+`danus say` plus exact-turn morale support via `danus encourage`. It is a thin
+transport change: Codex still owns the thread/turn and
 the existing contract, skills, MCP gateway, FactGraph, and adaptive verifier are
 unchanged. Before any paid turn it generates the installed binary's protocol
 schema and fail-closes unless exact `turn/start`, `turn/steer`, idempotency, token
@@ -56,9 +57,13 @@ usage, and terminal-event contracts are present.
 
 The model runs in `<worker>/model_workspace`; host-owned PID, role, status,
 logs, and the hot-join database remain in the parent worker/project control
-directories and are not app-server writable roots. `TASK.md` is projected into
-that workspace for each turn, while the protected `project.json` fixes the paid
-model, effort, and author. Canonical lifecycle/model/token audit events live in
+directories and are not app-server writable roots. For reasoning-first work,
+`TASK.md` is projected only from the immutable task bytes copied into the exact
+generation/slot; later edits to the host projection cannot drift either
+app-server or explicit-`exec` paid work. The pinned kickoff also names the exact
+slot, generation, and task digest. Legacy execution retains its mutable host
+`TASK.md` behavior. The protected `project.json` fixes the paid model, effort,
+and author. Canonical lifecycle/model/token audit events live in
 the protected SQLite ledger; the worker round log is only a bounded projection.
 Token totals are labelled observation-only, not schema-attested final. Exact-turn
 `model/rerouted` notifications cause a fail-stop; after an adapter interruption,
@@ -92,8 +97,11 @@ thread from another paid dispatch until a separate `reset-thread` or
 same state, with no new paid turn or automatic retry.
 The owner obtains the exact CAS inputs from `status --json`'s canonical
 `unfinished_paid_intent`; a failed read is surfaced separately as
-`intent_ledger_error`. Status emits an `abandon_intent` command skeleton only
-for ambiguous states. A `prepared` intent is proven pre-dispatch and instead
+`intent_ledger_error`. While the authenticated worker PID is alive, status
+reports `paid_intent_status=in_progress` (or
+`outcome_unknown_while_worker_live`) and suppresses every owner recovery argv.
+Only after fail-stop does it emit recovery. A `prepared` intent is proven
+pre-dispatch and then
 offers `resume_prepared_intent`/`start` with the same prompt hash, model, and
 effort. If that immutable configuration has drifted, status also supplies
 `cancel-prepared-intent` with exact thread/client ids and an owner reason. This
@@ -118,6 +126,13 @@ Bounded `fact_submit` tool projections carry `promoted`, `submission_status`,
 valid fact id as publication. For an older gateway response without `promoted`,
 the projection derives success from the valid fact id, never from legacy
 `accepted` alone.
+`encourage` is deliberately narrower than `say`: it requires an authenticated
+live worker and a canonical `started` paid intent, snapshots that intent's exact
+thread/turn IDs in the message identity, and always uses fail-only delivery.
+The broker checks the snapshot immediately before `turn/steer`; a terminal-to-
+next-turn race records `failed` with zero steer and never queues the note. Its
+payload labels the human text non-authoritative and explicitly excludes it from
+mathematical evidence, proof, verification, task scope, and permissions.
 The ledger/transcript has no direct verifier channel. If a worker explicitly
 uses human-supplied mathematics in a submitted candidate, that statement/proof
 still goes through the ordinary verifier like every other candidate.

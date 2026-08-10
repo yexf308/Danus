@@ -6,7 +6,7 @@ and calls into it. Run via `bin/danus`.
 
 ```
 danus/orchestration/
-  cli.py        lifecycle verbs plus say / messages / interrupt-turn
+  cli.py        lifecycle verbs plus say / encourage / messages / interrupt-turn
   __main__.py   `python -m danus.orchestration` (what bin/danus execs)
   tests/{test_cli_verbs.py, test_orchestration.py}
 ```
@@ -17,8 +17,9 @@ danus/orchestration/
 |---|---|
 | `list [--json]` | projects + live worker counts + model |
 | `new <p> [--roles ROLE:N,...] [--model M] [--coordination reasoning-first\|legacy]` | → `execution.scaffold.do_new`; reasoning-first defaults to `max:2,high:5`, legacy to `high:3,xhigh:4` |
-| `assign <p>/<w> (--task/--file/--stdin)` | overwrite that worker's `TASK.md` |
+| `assign <p>/<w> (--task/--file/--stdin)` | legacy: overwrite `TASK.md`; reasoning-first paid lane: durably stage the exact generation task, then refresh the non-authoritative host projection |
 | `say <p>/<w> (--text/--file/--stdin)` | durable owner message; same-turn steer when app-server transport is active |
+| `encourage <p>/<w> [--text/--file/--stdin] [--client-id ID]` | non-authoritative morale note bound to the exact canonical live paid turn; fail-only, never queued |
 | `messages <p>[/<w>] [--json]` | immutable message and per-delivery receipt view |
 | `interrupt-turn <p>/<w>` | explicit owner request to interrupt the current model turn |
 | `resolve-recommendation <p> ...` | exact owner resolution of the current reviewed recommendation; requires repeated-id and paid-resume acknowledgements |
@@ -35,10 +36,20 @@ danus/orchestration/
 
 - Liveness is **zombie-aware** (`os.kill(pid,0)` + a `/proc/<pid>/stat` Z-state
   check), so `status`/`list` don't lie and `start` can restart a crashed worker.
+- At a reasoning-first owner recommendation gate, assign both the root and
+  critic before `resolve-recommendation`. Status JSON exposes digest-only
+  `task_staging.ready` / `missing_workers`; resolution atomically freezes the
+  complete next-generation set and refuses an incomplete set. Dormant observer
+  assignment remains a host-only projection and never creates a paid slot.
 - No implicit intervention policy: only the owner decides when to send guidance
   or interrupt. `say --fallback queue` never stops a worker; `--fallback fail`
   reports lack of an active turn. Plain-text commands are never interpreted as
   process control.
+- `encourage` is current-turn-only. It authenticates the live worker under the
+  lifecycle lock, requires a canonical `started` intent with exact thread/turn
+  IDs, and commits those IDs into the idempotency identity. Its payload is
+  explicitly morale support, not task authority or mathematical evidence. Any
+  no-active/next-turn race fails without steering or queueing.
 - A too-large terminal `thread/resume` never triggers a replacement paid turn.
   `status --json` preserves the prior paid outcome and reports an argv for the
   separate CAS-fenced `rotate-thread` action; only the owner may execute it and

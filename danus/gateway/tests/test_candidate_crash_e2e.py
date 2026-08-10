@@ -146,9 +146,19 @@ def _new_active_project(
     project = Path(created["project_dir"])
     store = CoordinationStore.open_existing(project)
     assert store is not None
+    store.stage_task_assignment(
+        "high",
+        "# Candidate crash test task\n\nExact generation 1 assignment for high.\n",
+    )
     admission = store.admit("high")
     assert admission is not None
-    store.pin_prompt(admission.slot_id, admission.directive)
+    bound_prompt = (
+        f"{admission.directive}\n\n"
+        f"coordination_slot_id={admission.slot_id}\n"
+        f"generation={admission.generation}\n"
+        f"task_sha256={admission.task_sha256}\n"
+    )
+    store.pin_prompt(admission.slot_id, bound_prompt)
     active = store.activate(admission.slot_id)
 
     monkeypatch.setenv("DANUS_PROJECT_DIR", str(project))

@@ -114,7 +114,8 @@ for.
   exact problem and confirm whether the human wants a roster override.
   Reasoning-first defaults to `max:2,high:5`; explicit legacy defaults to
   `high:3,xhigh:4`. Run `danus new <project>` and pass `--roles ...` only for an
-  explicit override, then assign the root/critic task and start. A configured
+  explicit override, then assign every protected paid lane (normally root and
+  critic), confirm `task_staging.ready=true`, and start. A configured
   API/CLI consult is optional; browser Pro is not a project-start prerequisite
   and still requires its later evidence checkpoint plus exact owner authorization.
 - **Cadence after that.** Run each project's elaborate → optional consult → assign beat
@@ -180,12 +181,21 @@ for.
   also requires the bound browser request to be absent or explicitly release-safe.
 - **Dispatch through two channels.** When an actual consult occurred,
   `master_guidance` is the **shared**
-  direction every worker reads each round; a worker's **`TASK.md`** is its
-  **per-worker** assignment (which branch/subgoal is *yours*), written with
-  `danus assign <project>/<worker> --task "…"`. So: record pro's reply as
-  `master_guidance` (global), then `danus assign` the admitted root/critic their
-  directions. When consult is `off`, assign from the current elaboration without
-  fabricating a `master_guidance` record.
+  direction every worker reads each round; a worker's durable generation task is
+  its **per-worker** assignment (which branch/subgoal is *yours*), written with
+  `danus assign <project>/<worker> --task "…"`. For a reasoning-first paid
+  lane, `assign` first stages the exact bytes in the protected coordinator and
+  only then refreshes the host `TASK.md`. The admitted slot copies and hashes
+  that snapshot; the model-workspace `TASK.md` is a bound projection, not a
+  second source of authority. So: record pro's reply as `master_guidance`
+  (global), then `danus assign` every protected paid-lane direction. When
+  consult is `off`, assign from the current elaboration without fabricating a
+  `master_guidance` record.
+  During `owner_action_required`, paid-lane assignments target the next
+  generation. Stage **all** paid lanes and verify `task_staging.ready=true`
+  before `resolve-recommendation`; the owner-resolution transaction freezes the
+  complete set. A normal generation advance with no owner gate carries the
+  preceding frozen task bytes forward exactly.
   If a consult names distinct branches, record them as future assignments, but
   do not defeat reasoning-first admission by expecting all roster workers to run
   paid turns simultaneously. The current root owns the highest-leverage branch;
@@ -193,6 +203,15 @@ for.
   fail over to dormant observers. The worker loop is autonomous between safe
   boundaries; you only
   `assign` / `start` / `status` / `stop` it.
+
+- **Morale support is a distinct, optional human channel.** If the operator asks
+  to send a “keep going”/“believe in yourself” style note to an already running
+  paid turn, use `danus encourage <project>/<worker> [--text ...]`. Do not send
+  encouragement automatically, schedule it from elapsed time, or claim it
+  causes better reasoning. It requires the authoritatively live canonical
+  `started` intent, binds that exact thread/turn, fails instead of queueing, and
+  starts no paid turn. Its content is non-authoritative morale only—never a task,
+  coordination directive, mathematical evidence, fact, or verification.
 
 ## Consult transport (optional strategy amplifier)
 
@@ -311,8 +330,10 @@ State only what you have **verified**. This is a hard rule, not a tone preferenc
     — scaffold project + worker dirs. Reasoning-first defaults to
     `max:2,high:5`; explicit legacy defaults to `high:3,xhigh:4`; explicit roles
     override either.
-  - `danus assign <project>/<worker> --task "…"` — write that worker's per-round
-    `TASK.md` (its assignment; replaces, doesn't append).
+  - `danus assign <project>/<worker> --task "…"` — replace an assignment. For a
+    reasoning-first paid lane this stages the protected current/next-generation
+    snapshot before refreshing the non-authoritative host `TASK.md` projection;
+    the returned generation and digest are the paid binding.
   - `danus finalize <project> [--paper <paper_id>] <fact_id> [<fact_id> ...]` —
     record the approved target theorem(s) in a paper's `TARGET.md`
     (fact-graph-validated); this is what `write-paper` reads. The default paper
@@ -321,16 +342,24 @@ State only what you have **verified**. This is a hard rule, not a tone preferenc
     no id: prints candidate terminal facts as suggestions (writes nothing).
   - `danus start <project>[/<worker>]` — launch the autonomous worker loop(s).
   - `danus status <project>[/<worker>] [--json]` — liveness, fixed
-    lane/generation, paid-active versus waiting admission, candidate state, and
-    honest reasoning telemetry (`unavailable`/`partial` are not zero or proof
-    state).
+    lane/generation, paid-active versus waiting admission, `task_staging`,
+    candidate/paid-intent state, and honest reasoning telemetry
+    (`unavailable`/`partial` are not zero or proof state). For a live worker,
+    `prepared`/`dispatching`/`started` means `paid_intent_status=in_progress`
+    with no recovery action; live `delivery_unknown` likewise has no abandon
+    argv. Recovery is only actionable after fail-stop/PID-unsafe state.
   - `danus resolve-recommendation <project> ...` — owner-only exact resolution
     of one current reviewed recommendation. Repeat the id with
     `--acknowledge-recommendation-id`, acknowledge paid resume, and either name
-    exact linked adopted guidance or explicitly continue without it.
+    exact linked adopted guidance or explicitly continue without it. Before the
+    call, stage every next-generation paid lane until `task_staging.ready=true`;
+    resolution freezes that set.
   - `danus say <project>/<worker> (--text "…" | --file P | --stdin)
     [--client-id ID] [--fallback queue|fail]` — durable owner hot-join to the
     exact active app-server turn.
+  - `danus encourage <project>/<worker> [--text "…" | --file P | --stdin]
+    [--client-id ID]` — optional current-turn-only, fail-only,
+    non-authoritative morale support; omitted content uses the built-in note.
   - `danus messages <project>[/<worker>] [--limit N] [--json]` — inspect hot-join
     delivery receipts.
   - `danus interrupt-turn <project>/<worker> [--client-id ID]` — explicit

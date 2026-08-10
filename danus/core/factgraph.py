@@ -1652,11 +1652,13 @@ class FactGraph:
             }
         return dict(loaded)
 
-    def _prepare_glossary_merge(self, new: Dict[str, str]) -> Dict[str, str]:
-        """Validate a stable project glossary and reject semantic redefinition."""
-        current = self._read_project_glossary(strict=True)
+    @staticmethod
+    def _glossary_conflicts_against(
+        current: Dict[str, str], new: Dict[str, str]
+    ) -> List[str]:
+        """Return terms whose proposed definitions change established semantics."""
         global_definitions = _glossary.global_glossary()
-        conflicts = sorted(
+        return sorted(
             term
             for term, definition in new.items()
             if (
@@ -1667,6 +1669,32 @@ class FactGraph:
                 )
             )
         )
+
+    def glossary_conflicts(
+        self, glossary_introduces: Optional[Dict[str, str]] = None
+    ) -> List[str]:
+        """Read known glossary conflicts from one linearizable graph snapshot.
+
+        This is a read-only preflight for callers that would otherwise pay for
+        work before :meth:`add_if_context_unchanged`.  It is deliberately not a
+        write authorization: a concurrent definition may appear after this
+        shared snapshot, so promotion must still repeat the check under the
+        exclusive mutation lock.
+        """
+        proposed = {} if glossary_introduces is None else glossary_introduces
+        if not isinstance(proposed, dict) or any(
+            not isinstance(term, str) or not isinstance(definition, str)
+            for term, definition in proposed.items()
+        ):
+            raise ValueError("glossary_introduces must map strings to strings")
+        with self._snapshot_lock():
+            current = self._read_project_glossary(strict=True)
+            return self._glossary_conflicts_against(current, proposed)
+
+    def _prepare_glossary_merge(self, new: Dict[str, str]) -> Dict[str, str]:
+        """Validate a stable project glossary and reject semantic redefinition."""
+        current = self._read_project_glossary(strict=True)
+        conflicts = self._glossary_conflicts_against(current, new)
         if conflicts:
             raise ValueError(
                 "glossary_conflict: refusing to redefine project terms: "

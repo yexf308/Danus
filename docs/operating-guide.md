@@ -64,7 +64,9 @@ new state:
    `claude_code` are explicit opt-ins. *(the `consult` skill)*
 3. **Assign** — record an actual reviewed consult reply as `master_guidance`, or
    dispatch directly from the elaboration when consult is off. Assign the fixed
-   root/critic lanes (`danus assign`); dormant observers remain unpaid.
+   root/critic lanes (`danus assign`); for paid lanes this first stages the exact
+   generation task in the coordinator, then refreshes the host `TASK.md`
+   projection. Dormant observers remain unpaid.
 4. **Monitor** — watch `danus status` / the dashboard; repeat when there is new
    state.
 
@@ -89,7 +91,13 @@ records `adopt`. Adoption or `master_guidance` does not release
 `owner_action_required`: audited owner-only resolution of the exact recommendation
 is required before that generation can resume. The owner runs
 `danus resolve-recommendation` with exact-id and paid-resume acknowledgements;
-adopted guidance must link the same recommendation. Later interventions in the
+adopted guidance must link the same recommendation. Before resolving, run
+`danus assign` for **every** paid lane: while this gate is open those assignments
+target the next generation. Confirm `task_staging.ready=true` in
+`danus status <project> --json`; the resolution then freezes that complete task
+set atomically. A normal generation advance with no owner decision instead
+carries the preceding frozen assignments forward byte-for-byte. Later
+interventions in the
 same Danus conversation retain a stable context but use a new recommendation,
 prompt/request, and verified local terminal predecessor, with the exact URL
 supplied by file/stdin at prepare and dispatch. Preparation still stops for a
@@ -118,9 +126,30 @@ never call the verifier or infer success from elapsed time.
 
 `danus start <p>` launches the autonomous worker loops. Each worker reads its
 `TASK.md` + `master_guidance`, picks proving skills, works, and submits results via
-`fact_submit` — which the **verifier** gates. A submission becomes a **fact** only
-after a `correct` verdict *and* successful graph promotion (`promoted: true` with
-a non-null `fact_id`); every verdict is traced to global memory either way.
+`fact_submit` — which the **verifier** gates. For reasoning-first paid work, the
+coordinator's generation/slot task snapshot is authoritative; the
+model-workspace `TASK.md` is materialized from those hash-attested bytes, not
+from a later host edit. A submission with a glossary definition already known to
+conflict is rejected by a read-only preflight before candidate admission or paid
+verification. The gateway still repeats the glossary and context checks under
+the promotion lock because a definition can race after preflight. A submission
+becomes a **fact** only after a `correct` verdict *and* successful graph promotion
+(`promoted: true` with a non-null `fact_id`); every verifier verdict is traced to
+global memory either way.
+
+If the operator wants to send morale support such as “keep going” or “believe in
+yourself” to a turn that is already running, use the separate current-turn-only
+channel:
+
+```bash
+danus encourage <project>/<worker> --text 'Keep going; trust your careful reasoning.'
+```
+
+This is an optional human input, not an automatic cadence or a claimed causal
+intervention. It requires an authoritatively live worker and the canonical
+`started` paid intent, binds the exact thread and turn, and fails instead of
+queueing if that turn changes. It opens no paid turn and carries no task,
+coordination, mathematical evidence, fact, or verification authority.
 
 Monitor with:
 

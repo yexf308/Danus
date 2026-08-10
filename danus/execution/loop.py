@@ -91,6 +91,7 @@ APP_SERVER_MODEL_REROUTED_RC = 125
 WORKER_STOP_REQUESTED_RC = 130
 THREAD_HISTORY_OVERSIZE_CODE = "thread_history_exceeds_transport_limit"
 MAX_EXEC_LOG_EVENT_BYTES = 8 * 1024 * 1024
+MAX_GENERATION_TASK_BYTES = 131_072
 _COORDINATION_TERMINAL_DISPOSITIONS = {
     0: "completed",
     APP_SERVER_PROTOCOL_FAILURE_RC: "protocol_failure",
@@ -114,7 +115,15 @@ def _bounded_protocol_identity(value: str, label: str) -> str:
 # --- the per-round prompt (continuation semantics; see worker.md) ----------- #
 
 
-def kickoff(project: str, worker: str, directive: str | None = None) -> str:
+def kickoff(
+    project: str,
+    worker: str,
+    directive: str | None = None,
+    *,
+    coordination_slot_id: str | None = None,
+    generation: int | None = None,
+    task_sha256: str | None = None,
+) -> str:
     prompt = (
         f"You are worker '{worker}' on project '{project}'. Continue solving the "
         f"problem (this is a continuation round, not a fresh start).\n"
@@ -132,7 +141,53 @@ def kickoff(project: str, worker: str, directive: str | None = None) -> str:
     )
     if directive is not None:
         prompt += f"\n\nReasoning-first coordination directive:\n{directive}"
+    binding = (coordination_slot_id, generation, task_sha256)
+    if any(value is not None for value in binding):
+        if (
+            directive is None
+            or not isinstance(coordination_slot_id, str)
+            or not coordination_slot_id
+            or isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or generation < 1
+            or not isinstance(task_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", task_sha256) is None
+        ):
+            raise CoordinationError(
+                "reasoning-first kickoff requires an exact slot/generation/task binding"
+            )
+        prompt += (
+            "\n\nImmutable generation task binding:\n"
+            f"coordination_slot_id={coordination_slot_id}\n"
+            f"generation={generation}\n"
+            f"task_sha256={task_sha256}"
+        )
     return prompt
+
+
+def _validated_coordination_task(
+    task: object,
+    task_sha256: object,
+    task_bytes: object,
+) -> str:
+    """Return one slot-pinned TASK snapshot only after exact byte attestation."""
+
+    if not isinstance(task, str) or not task:
+        raise CoordinationError("admitted generation task is empty or malformed")
+    try:
+        encoded = task.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise CoordinationError("admitted generation task is not valid UTF-8") from exc
+    if (
+        isinstance(task_bytes, bool)
+        or not isinstance(task_bytes, int)
+        or task_bytes > MAX_GENERATION_TASK_BYTES
+        or task_bytes != len(encoded)
+        or not isinstance(task_sha256, str)
+        or hashlib.sha256(encoded).hexdigest() != task_sha256
+    ):
+        raise CoordinationError("admitted generation task failed its durable pin")
+    return task
 
 
 def _terminal_coordination_memory_entries(
@@ -366,14 +421,25 @@ def _refresh_workspace_symlink(link: Path, target: Path) -> None:
     os.symlink(str(target), str(link), target_is_directory=target.is_dir())
 
 
-def _prepare_model_workspace(wl: L.WorkerLayout) -> Path:
-    """Refresh the model-only cwd while keeping host controls in its parent."""
+def _prepare_model_workspace(
+    wl: L.WorkerLayout, *, task_snapshot: str | None = None
+) -> Path:
+    """Refresh the model-only cwd while keeping host controls in its parent.
+
+    A reasoning-first caller supplies the exact task bytes copied into its paid
+    coordination slot.  Only legacy execution may fall back to the mutable host
+    ``TASK.md`` projection.
+    """
     workspace = wl.dir / "model_workspace"
     _ensure_real_dir(workspace)
     _ensure_real_dir(wl.local_memory)
     _atomic_write_real_parent(
         workspace / L.TASK_FILE,
-        _read_regular_text(wl.task, max_bytes=1_000_000),
+        (
+            _read_regular_text(wl.task, max_bytes=1_000_000)
+            if task_snapshot is None
+            else task_snapshot
+        ),
     )
     _refresh_workspace_symlink(workspace / "AGENTS.md", L.worker_md())
     agents = workspace / ".agents"
@@ -735,12 +801,18 @@ def _owned_child_exited_no_reap(proc: subprocess.Popen) -> bool:
 
 
 def run_round(
-    wl: L.WorkerLayout, role: dict, prompt: str, log_path: Path, hard_timeout: int
+    wl: L.WorkerLayout,
+    role: dict,
+    prompt: str,
+    log_path: Path,
+    hard_timeout: int,
+    *,
+    model_workspace: Path | None = None,
 ) -> int:
     """Exec one ``codex exec`` continuation session. Returns codex's rc, 124 on
     hard-timeout (terminate → wait 10s → kill), or 127 if the codex binary is
     missing."""
-    wdir = wl.dir
+    wdir = wl.dir if model_workspace is None else model_workspace
     try:
         require_gateway_runtime()
     except GatewayRuntimeUnavailable as exc:
@@ -1272,6 +1344,9 @@ def run_round_app_server(
     hard_timeout: int,
     *,
     coordination_provenance: Optional[dict[str, object]] = None,
+    task_snapshot: str | None = None,
+    task_sha256: str | None = None,
+    task_bytes: int | None = None,
 ) -> int:
     """Run one worker turn through app-server with durable human hot-join.
 
@@ -1311,6 +1386,12 @@ def run_round_app_server(
     prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
     if coordination_provenance is None:
         coordination_binding: dict[str, object] = {}
+        if any(value is not None for value in (task_snapshot, task_sha256, task_bytes)):
+            _best_effort_worker_projection(
+                log_path,
+                "[worker_loop] coordination task has no slot provenance\n",
+            )
+            return 126
     elif set(coordination_provenance) != {"slot_id", "generation", "lane"}:
         _best_effort_worker_projection(
             log_path,
@@ -1319,6 +1400,18 @@ def run_round_app_server(
         return 126
     else:
         coordination_binding = dict(coordination_provenance)
+        try:
+            task_snapshot = _validated_coordination_task(
+                task_snapshot,
+                task_sha256,
+                task_bytes,
+            )
+        except CoordinationError as exc:
+            _best_effort_worker_projection(
+                log_path,
+                f"[worker_loop] {redact_external_error(exc)}\n",
+            )
+            return 126
     pending_intent = store.unfinished_round_intent(wl.name)
     stored_thread = store.thread_id(wl.name)
     if pending_intent is not None:
@@ -1341,7 +1434,10 @@ def run_round_app_server(
             )
             return 126
     try:
-        model_workspace = _prepare_model_workspace(wl)
+        model_workspace = _prepare_model_workspace(
+            wl,
+            task_snapshot=task_snapshot,
+        )
     except (HotJoinError, OSError, UnicodeDecodeError) as exc:
         _best_effort_worker_projection(
             log_path,
@@ -2236,9 +2332,7 @@ def main(worker_dir: str) -> int:
             "advisor_recommendation_present": snapshot[
                 "advisor_recommendation_present"
             ],
-            "advisor_recommendation_ready": snapshot[
-                "advisor_recommendation_ready"
-            ],
+            "advisor_recommendation_ready": snapshot["advisor_recommendation_ready"],
             "fail_stop_reason": snapshot["fail_stop_reason"],
             "review": snapshot["review"],
             "recommendation": snapshot["recommendation"],
@@ -2288,6 +2382,7 @@ def main(worker_dir: str) -> int:
             admission = None
             prompt = legacy_prompt
             round_hard_timeout = legacy_hard_timeout
+            coordination_task_snapshot: str | None = None
             coordination_snapshot = None
             coordination_receipt: Optional[dict[str, object]] = None
             hotjoin_store: Optional[HotJoinStore] = None
@@ -2324,10 +2419,22 @@ def main(worker_dir: str) -> int:
                             **coordination_fields(coordination_snapshot),
                         )
                         return 126
+                    coordination_task_snapshot = _validated_coordination_task(
+                        admission.task,
+                        admission.task_sha256,
+                        admission.task_bytes,
+                    )
                     if admission.prompt is None:
                         admission = coordination_store.pin_prompt(
                             admission.slot_id,
-                            kickoff(project, worker, admission.directive),
+                            kickoff(
+                                project,
+                                worker,
+                                admission.directive,
+                                coordination_slot_id=admission.slot_id,
+                                generation=admission.generation,
+                                task_sha256=admission.task_sha256,
+                            ),
                         )
                     if (
                         admission.prompt is None
@@ -2337,6 +2444,17 @@ def main(worker_dir: str) -> int:
                     ):
                         raise CoordinationError(
                             "admitted prompt failed its durable pin"
+                        )
+                    expected_prompt_bindings = {
+                        f"coordination_slot_id={admission.slot_id}",
+                        f"generation={admission.generation}",
+                        f"task_sha256={admission.task_sha256}",
+                    }
+                    if not expected_prompt_bindings.issubset(
+                        set(admission.prompt.splitlines())
+                    ):
+                        raise CoordinationError(
+                            "admitted prompt omits its exact generation task binding"
                         )
                     prompt = admission.prompt
                     round_hard_timeout = admission.hard_timeout_seconds
@@ -2416,9 +2534,41 @@ def main(worker_dir: str) -> int:
                                 "generation": admission.generation,
                                 "lane": admission.lane,
                             },
+                            task_snapshot=coordination_task_snapshot,
+                            task_sha256=admission.task_sha256,
+                            task_bytes=admission.task_bytes,
                         )
                 elif transport == "exec":
-                    rc = run_round(wl, role, prompt, log_path, round_hard_timeout)
+                    if admission is None:
+                        rc = run_round(
+                            wl,
+                            role,
+                            prompt,
+                            log_path,
+                            round_hard_timeout,
+                        )
+                    else:
+                        try:
+                            model_workspace = _prepare_model_workspace(
+                                wl,
+                                task_snapshot=coordination_task_snapshot,
+                            )
+                        except (HotJoinError, OSError, UnicodeDecodeError) as exc:
+                            _best_effort_worker_projection(
+                                log_path,
+                                "[worker_loop] unsafe slot-bound model workspace: "
+                                f"{redact_external_error(exc)}\n",
+                            )
+                            rc = 126
+                        else:
+                            rc = run_round(
+                                wl,
+                                role,
+                                prompt,
+                                log_path,
+                                round_hard_timeout,
+                                model_workspace=model_workspace,
+                            )
                 else:
                     _best_effort_worker_projection(
                         log_path,

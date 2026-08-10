@@ -62,7 +62,8 @@ memory or fact op names a project (there is no default).
 **Control surface** — danus MCP (role=main): `gm_add` · `gm_get` · `gm_search` · `fact_search`
 · `fact_context` · `fact_revoke` · `search_arxiv_theorems` (first six take `project=`; you have no
 `fact_submit`, so you never write facts). `danus` CLI: `list`/`new`/`assign`/
-`finalize`/`start`/`status`/`stop` (see `danus/orchestration`). Skills (`.claude/skills/`): `elaboration` ·
+`encourage`/`resolve-recommendation`/`finalize`/`start`/`status`/`stop` (see
+`danus/orchestration`). Skills (`.claude/skills/`): `elaboration` ·
 `consult` · `human-summary` · `write-paper`. Dashboard: `scripts/services.sh up
 dashboard <p>` + port-forward.
 
@@ -70,7 +71,14 @@ dashboard <p>` + port-forward.
 (`elaboration` skill → `gm_add`) → optionally consult (`off` is the default;
 `gpt_pro`, `claude_api`, and `claude_code` are explicit opt-ins) → record an
 actual consult reply as `master_guidance`, or dispatch directly from the
-elaboration when off → assign the fixed root/critic lanes → monitor. At project start, ask the
+elaboration when off → assign **every** protected paid lane (normally the
+fixed root/critic lanes) → confirm
+`task_staging.ready=true` → monitor. Reasoning-first paid `assign` stages an
+exact generation task before refreshing the host `TASK.md`; the admitted slot
+and model-workspace projection are hash-bound to that snapshot. During
+`owner_action_required`, assign every next-generation paid lane before
+`resolve-recommendation`; resolution freezes the set. A no-owner generation
+advance carries the prior frozen tasks forward exactly. At project start, ask the
 worker roster if the operator wants to override it; reasoning-first defaults to
 `max:2,high:5` (two paid deep lanes and five dormant observers), while explicit
 legacy defaults to `high:3,xhigh:4`. Write `PROBLEM.md`, then run
@@ -109,6 +117,15 @@ observers are not an automatic rotation/failover pool. Every new terminal
 coordination slot gets a fresh app-server thread. Only recovery of that same
 pinned slot resumes its exact thread. The 2700-second limit applies to each paid
 turn, not to completion of the whole phase.
+
+If the operator explicitly wants to send morale support to an already running
+paid turn, `danus encourage <project>/<worker> [--text "…"]` is the distinct
+current-turn-only channel. It requires the canonical live `started` intent,
+fails rather than queues, and opens no turn. Never automate it or claim a causal
+effect. Its note is not a task, coordination directive, mathematical evidence,
+fact, or verification. In status, a live `prepared`/`dispatching`/`started`
+intent is `in_progress` with no recovery suggestion; live `delivery_unknown`
+also has no abandon argv. Recovery is a fail-stopped/PID-unsafe path only.
 
 **Completion:** the moment every target of a project is a verified fact **and** the
 route is credible, `danus stop <project>` the swarm yourself (graceful) — act, then

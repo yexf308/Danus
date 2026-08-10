@@ -53,6 +53,15 @@ that same pinned slot resumes its exact thread. Legacy `exec` rounds remain
 fresh processes; explicit legacy app-server projects retain their separately
 documented continuation semantics.
 
+Paid work is also bound to an exact generation task. `danus assign` stages each
+reasoning-first paid lane in the protected coordinator before updating the host
+`TASK.md` projection; admission snapshots those bytes into the slot and binds
+their SHA-256 into the kickoff prompt. The `TASK.md` inside the model workspace
+is materialized from that slot, so a later host edit cannot retarget the paid
+turn. An owner recommendation cannot be resolved until every next-generation
+paid lane is staged; resolution freezes the set atomically. Advances that need
+no owner decision carry the preceding frozen tasks forward exactly.
+
 When the root records an exact `obstacle` or `dead_end`, the generation enters
 `critic_obstacle_review`. Normal root/critic admission stops; the same fixed
 critic receives one fresh review-phase thread and independently confirms or
@@ -63,8 +72,12 @@ terminal review advances to a fresh reasoning generation without Pro advice.
 The single verifier remains the mathematical authority, but it is no longer a
 reject-on-busy bottleneck. Distinct submissions wait in a bounded FIFO queue,
 exact in-flight duplicates coalesce, and validated successful replies use a
-nonce-bound bounded cache. An exact already-active fact is reused before any
-verifier call. App-server turns also publish content-free, root-thread-only
+nonce-bound bounded cache. Before candidate admission, exact-fact reuse, or any
+paid verifier call, a read-only linearizable glossary preflight rejects a known
+definition conflict. The authoritative promotion path repeats this check under
+the graph lock to close concurrent-definition races. After a clean preflight, an
+exact already-active fact is reused before any verifier call. App-server turns
+also publish content-free, root-thread-only
 diagnostics for reasoning, tool/control, waiting, memory, retrieval, compaction,
 and token usage. Missing telemetry is reported as unavailable/partial, never as
 zero and never as proof state.
@@ -122,7 +135,7 @@ danus/                 the engine (installable Python package)
   gateway/             role-gated MCP server — the only door to the truth stores
   verify/              cold-start mathematical authority behind the write-gate
   execution/           worker swarm: the autonomous per-worker round loop + scaffolding
-  orchestration/       lifecycle plus durable human hot-join (`say`/`messages`)
+  orchestration/       lifecycle plus durable human hot-join (`say`/`encourage`/`messages`)
   strategy/            consult gateway + owner-only durable browser-advisor handoff
   integrations/        arXiv theorem search
   observability/       read-only dashboard
@@ -192,6 +205,8 @@ worker with the app-server transport and use the durable mailbox:
 export DANUS_WORKER_TRANSPORT=app-server
 bin/danus start my-project/max
 bin/danus say my-project/max --text 'Try the one-sided Sigma-Delta route next.'
+# Morale-only, bound to the currently started paid turn; never queued:
+bin/danus encourage my-project/max --text 'Keep going; trust your careful reasoning.'
 bin/danus messages my-project/max
 # Only this typed command interrupts; message text never does:
 bin/danus interrupt-turn my-project/max
@@ -205,6 +220,14 @@ is no direct transcript/ledger channel into verification, and ledger bytes are
 not included in proof-context digests. If a worker deliberately incorporates
 human-supplied mathematics into a candidate statement or proof, that candidate
 text is of course sent through the normal production verifier.
+
+`encourage` is deliberately narrower than `say`: it requires an
+authoritatively live worker and its one canonical `started` intent, binds the
+exact thread and turn, and fails if that turn changes. It cannot start a paid
+turn or queue for the next one. The envelope marks the note as non-authoritative
+morale support—not a task, coordination directive, mathematical evidence, fact,
+or verification. Danus does not send these notes automatically and does not
+claim a causal effect on reasoning quality.
 
 If Codex reports that a persisted thread was deleted or is no longer
 resumable, Danus fails closed instead of silently starting a second paid
@@ -264,10 +287,15 @@ new paid turns until the owner separately runs `reset-thread` or
 `rotate-thread`. A live worker, busy lifecycle lock, wrong target/thread/client/
 state, missing acknowledgement, or unreadable ledger fails closed unchanged.
 `status --json` exposes the canonical ledger row as
-`unfinished_paid_intent` and a matching `recovery_required.argv`; a separate
-`intent_ledger_error` is reported instead of guessing if that read fails. A
-`prepared` intent is authoritatively not dispatched and therefore recommends
-resuming the same immutable intent with `start`, never unknown-outcome abandon.
+`unfinished_paid_intent`; a separate `intent_ledger_error` is reported instead
+of guessing if that read fails. While the worker is authoritatively live,
+`prepared`, `dispatching`, and `started` report
+`paid_intent_status="in_progress"` and no recovery argv. Live
+`delivery_unknown` reports `outcome_unknown_while_worker_live`, also without an
+abandon suggestion. Only after fail-stop/PID-unsafe state does status expose the
+matching owner recovery. For a fail-stopped worker, a `prepared` intent is
+authoritatively not dispatched and therefore recommends resuming the same
+immutable intent with `start`, never unknown-outcome abandon.
 If the immutable prompt/model/effort has drifted, or the owner deliberately
 wants to discard that unspent preparation, status also supplies an exact safe
 cancel command:

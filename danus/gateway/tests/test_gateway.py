@@ -36,6 +36,7 @@ from danus.core import (
     canonical_global_memory_record,
     compute_fact_id,
 )
+from danus.core import glossary as _glossary
 from danus.gateway import build_app, tools_for
 from danus.gateway import server
 from danus.hotjoin import HotJoinStore
@@ -96,13 +97,46 @@ def _active_reasoning_store(
     }
     (project / "project.json").write_text(json.dumps(metadata), encoding="utf-8")
     store = CoordinationStore(project, metadata)
+    for worker in names:
+        store.stage_task_assignment(
+            worker,
+            f"# Gateway test task\n\nExact generation 1 assignment for {worker}.\n",
+        )
     admissions = []
     for worker in names:
-        admission = store.admit(worker)
-        assert admission is not None
-        store.pin_prompt(admission.slot_id, admission.directive)
-        admissions.append(store.activate(admission.slot_id))
+        admissions.append(_admit_and_activate(store, worker))
     return store, admissions
+
+
+def _bound_coordination_prompt(admission) -> str:
+    return (
+        f"{admission.directive}\n\n"
+        f"coordination_slot_id={admission.slot_id}\n"
+        f"generation={admission.generation}\n"
+        f"task_sha256={admission.task_sha256}\n"
+    )
+
+
+def _admit_and_activate(store: CoordinationStore, worker: str):
+    admission = store.admit(worker)
+    assert admission is not None
+    store.pin_prompt(admission.slot_id, _bound_coordination_prompt(admission))
+    return store.activate(admission.slot_id)
+
+
+def _stage_next_gateway_generation(store: CoordinationStore) -> None:
+    status = store.project_status()
+    assert status["phase"] == "owner_action_required"
+    generation = int(status["generation"]) + 1
+    for worker in (status["root_worker"], status["critic_worker"]):
+        if isinstance(worker, str):
+            store.stage_task_assignment(
+                worker,
+                (
+                    "# Gateway test task\n\n"
+                    f"Exact generation {generation} assignment for {worker}.\n"
+                ),
+            )
 
 
 def _reasoning_recommendation(
@@ -118,10 +152,7 @@ def _reasoning_recommendation(
     )
     store.complete(root.slot_id, outcome="terminal_rc_0")
     store.complete(critic.slot_id, outcome="terminal_rc_0")
-    review = store.admit("xhigh2")
-    assert review is not None
-    store.pin_prompt(review.slot_id, review.directive)
-    store.activate(review.slot_id)
+    review = _admit_and_activate(store, "xhigh2")
     confirmation = store.confirm_root_evidence(
         "xhigh2",
         str(evidence["entry_id"]),
@@ -132,6 +163,7 @@ def _reasoning_recommendation(
     assert isinstance(recommendation_id, str)
     if complete_review:
         store.complete(review.slot_id, outcome="terminal_rc_0")
+        _stage_next_gateway_generation(store)
     return store, recommendation_id, review
 
 
@@ -139,9 +171,7 @@ def _submitted_browser_request(
     project: Path, *, prompt: str = "Bounded offline advisor question"
 ) -> tuple[BrowserAdvisorBroker, dict]:
     broker = BrowserAdvisorBroker(project)
-    request = _prepare_browser_request(
-        broker, prompt, context_id="gateway-race-cycle"
-    )
+    request = _prepare_browser_request(broker, prompt, context_id="gateway-race-cycle")
     broker.authorize(
         request["request_id"],
         prompt_sha256=request["prompt_sha256"],
@@ -426,12 +456,13 @@ def test_reasoning_first_gm_add_requires_fresh_exact_designated_review(
     }
     (project / "project.json").write_text(json.dumps(metadata), encoding="utf-8")
     store = CoordinationStore(project, metadata)
-    root = store.admit("xhigh")
-    critic = store.admit("xhigh2")
-    assert root is not None and critic is not None
-    for slot in (root, critic):
-        store.pin_prompt(slot.slot_id, slot.directive)
-        store.activate(slot.slot_id)
+    for worker in ("xhigh", "xhigh2"):
+        store.stage_task_assignment(
+            worker,
+            f"# Gateway test task\n\nExact generation assignment for {worker}.\n",
+        )
+    root = _admit_and_activate(store, "xhigh")
+    critic = _admit_and_activate(store, "xhigh2")
 
     with _env(
         DANUS_PROJECT_DIR=str(project),
@@ -480,10 +511,8 @@ def test_reasoning_first_gm_add_requires_fresh_exact_designated_review(
     store.complete(critic.slot_id, outcome="terminal_rc_0")
     review_status = store.complete(root.slot_id, outcome="terminal_rc_0")
     assert review_status["phase"] == "critic_obstacle_review"
-    review = store.admit("xhigh2")
-    assert review is not None and review.slot_id != critic.slot_id
-    store.pin_prompt(review.slot_id, review.directive)
-    store.activate(review.slot_id)
+    review = _admit_and_activate(store, "xhigh2")
+    assert review.slot_id != critic.slot_id
 
     with _env(
         DANUS_PROJECT_DIR=str(project),
@@ -543,10 +572,7 @@ def test_reasoning_review_record_cap_rejects_before_global_memory_append(
 
     store.complete(root.slot_id, outcome="terminal_rc_0")
     store.complete(critic.slot_id, outcome="terminal_rc_0")
-    review = store.admit("xhigh2")
-    assert review is not None
-    store.pin_prompt(review.slot_id, review.directive)
-    store.activate(review.slot_id)
+    _admit_and_activate(store, "xhigh2")
     before = root_path.read_bytes()
     with _env(
         DANUS_PROJECT_DIR=str(project),
@@ -641,10 +667,7 @@ def test_designated_critic_append_cut_exact_retry_recovers_one_recommendation(
         root_entry = server.gm_add("dead_end", claim="exact critic cut root")
     store.complete(critic.slot_id, outcome="terminal_rc_0")
     store.complete(root.slot_id, outcome="terminal_rc_0")
-    review = store.admit("xhigh2")
-    assert review is not None
-    store.pin_prompt(review.slot_id, review.directive)
-    store.activate(review.slot_id)
+    review = _admit_and_activate(store, "xhigh2")
 
     original_confirm = CoordinationStore.confirm_root_evidence
 
@@ -2571,64 +2594,271 @@ def test_fact_submit_rechecks_project_glossary_after_verification():
         assert "write_error" not in result
 
 
-def test_fact_submit_correct_glossary_conflict_is_not_promoted_or_written():
-    """A correct verdict is not a successful publication if glossary CAS fails."""
-    with (
-        tempfile.TemporaryDirectory() as d,
-        _env(
-            DANUS_PROJECT_DIR=d,
-            DANUS_AGENTS_ROOT=None,
-            DANUS_AUTHOR="worker_high",
-            DANUS_VERIFY_URL="http://mock",
-            DANUS_PROBLEM_ID="P",
-        ),
-        _mock_verify("correct"),
-    ):
-        fg = FactGraph(Path(d))
+@pytest.mark.parametrize("conflict_scope", ["project", "global"])
+def test_fact_submit_known_glossary_conflict_blocks_before_candidate_and_verify(
+    tmp_path: Path, conflict_scope: str
+):
+    """A known semantic conflict must consume neither paid work nor graph state."""
+    project = tmp_path / "known-glossary-conflict"
+    store, _admissions = _active_reasoning_store(project)
+    fg = FactGraph(project)
+    if conflict_scope == "project":
+        term = "Q_X"
+        established_definition = "the existing project object"
         existing = fg.add(
             problem_id="P",
             author="other",
             statement="Q_X is fixed",
             proof="definition proof",
-            glossary_introduces={"Q_X": "the existing project object"},
+            glossary_introduces={term: established_definition},
         )
-
-        def graph_bytes() -> dict[str, bytes]:
-            return {
-                str(path.relative_to(fg.dir)): path.read_bytes()
-                for path in sorted(fg.dir.rglob("*"))
-                if path.is_file()
-            }
-
-        before_graph = graph_bytes()
-        before_glossary = fg.glossary_path.read_bytes()
-        result = server.fact_submit(
-            statement="Q_X has another property",
-            proof="A complete proof for the proposed meaning of Q_X.",
-            glossary_introduces={"Q_X": "a conflicting project object"},
+    else:
+        term, established_definition = next(iter(_glossary.global_glossary().items()))
+        existing = fg.add(
+            problem_id="P",
+            author="other",
+            statement="A harmless seed fact",
+            proof="A harmless seed proof.",
         )
+    conflicting_definition = established_definition + " (conflicting meaning)"
 
-        # ``accepted`` keeps its historical verifier-only meaning. The explicit
-        # promotion fields are the fail-honest publication signal.
-        assert result["accepted"] is True
-        assert result["verification_verdict"] == "correct"
-        assert result["promoted"] is False
-        assert result["submission_status"] == "verified_not_promoted"
-        assert result["fact_id"] is None
-        assert "glossary_conflict" in result["write_error"]
+    def graph_bytes() -> dict[str, bytes]:
+        return {
+            str(path.relative_to(fg.dir)): path.read_bytes()
+            for path in sorted(fg.dir.rglob("*"))
+            if path.is_file()
+        }
 
-        assert fg.list() == [existing]
-        assert fg.glossary_path.read_bytes() == before_glossary
-        assert graph_bytes() == before_graph
-        assert not fg.pending_add_path.exists()
+    before_graph = graph_bytes()
+    verification_path = project / "global_memory" / "verification.jsonl"
+    before_verification = (
+        verification_path.read_bytes() if verification_path.exists() else None
+    )
+    calls = {"count": 0}
+    allow_verify = {"value": False}
 
-        trace = GlobalMemory(Path(d)).read("verification")[-1]
-        assert trace["verdict"] == "correct"
-        assert trace["verification_verdict"] == "correct"
-        assert trace["promoted"] is False
-        assert trace["submission_status"] == "verified_not_promoted"
-        assert trace["fact_id"] is None
-        assert "glossary_conflict" in trace["write_error"]
+    def verify(statement, proof, fact_context=None, glossary_introduces=None):
+        calls["count"] += 1
+        if not allow_verify["value"]:
+            raise AssertionError("known glossary conflict must block the verifier")
+        return _verify_response(fact_context, candidate_proof=proof)
+
+    original_verify = server._verify
+    server._verify = verify
+    try:
+        with _env(
+            DANUS_PROJECT_DIR=str(project),
+            DANUS_AGENTS_ROOT=None,
+            DANUS_AUTHOR="xhigh",
+            DANUS_ROLE="worker",
+            DANUS_VERIFY_URL="http://mock",
+            DANUS_PROBLEM_ID="P",
+        ):
+            result = server.fact_submit(
+                statement=f"{term} has another property",
+                proof=f"A complete proof for the proposed meaning of {term}.",
+                glossary_introduces={term: conflicting_definition},
+            )
+
+            assert calls["count"] == 0
+            assert result["accepted"] is False
+            assert result["verification_verdict"] is None
+            assert result["promoted"] is False
+            assert result["submission_status"] == "error"
+            assert result["verification_calls"] == 0
+            assert "glossary_conflict" in result["error"]
+            assert term in result["repair_hints"]
+            assert "candidate_receipt_id" not in result
+            assert store.project_status()["candidate"] is None
+            assert store.list_candidates() == []
+            assert fg.list() == [existing]
+            assert graph_bytes() == before_graph
+            assert (
+                verification_path.read_bytes() if verification_path.exists() else None
+            ) == before_verification
+
+            allow_verify["value"] = True
+            repaired = server.fact_submit(
+                statement=f"{term} has another property",
+                proof=f"A complete proof for the proposed meaning of {term}.",
+                glossary_introduces={term: established_definition},
+            )
+    finally:
+        server._verify = original_verify
+
+    assert calls["count"] == 1
+    assert repaired["verification_calls"] == 1
+    assert repaired["promoted"] is True
+    assert repaired["fact_id"] is not None
+    assert store.project_status()["candidate"] is None
+    assert len(store.list_candidates()) == 1
+
+
+def test_fact_submit_glossary_integrity_failure_blocks_before_paid_work(
+    tmp_path: Path,
+):
+    project = tmp_path / "glossary-integrity-preflight"
+    store, _admissions = _active_reasoning_store(project)
+    fg = FactGraph(project)
+    exact_statement = "Existing fact must not bypass glossary integrity"
+    exact_proof = "An existing proof whose active identity is already stored."
+    existing = fg.add(
+        problem_id="P",
+        author="other",
+        statement=exact_statement,
+        proof=exact_proof,
+    )
+    fg.glossary_path.write_text("{not valid json", encoding="utf-8")
+    before_graph = {
+        str(path.relative_to(fg.dir)): path.read_bytes()
+        for path in sorted(fg.dir.rglob("*"))
+        if path.is_file()
+    }
+    verification_path = project / "global_memory" / "verification.jsonl"
+    calls = {"count": 0}
+
+    def must_not_verify(*_args, **_kwargs):
+        calls["count"] += 1
+        raise AssertionError("integrity failure must block the verifier")
+
+    original_verify = server._verify
+    server._verify = must_not_verify
+    try:
+        with _env(
+            DANUS_PROJECT_DIR=str(project),
+            DANUS_AGENTS_ROOT=None,
+            DANUS_AUTHOR="xhigh",
+            DANUS_ROLE="worker",
+            DANUS_VERIFY_URL="http://mock",
+            DANUS_PROBLEM_ID="P",
+        ):
+            result = server.fact_submit(
+                statement=exact_statement,
+                proof=exact_proof,
+            )
+    finally:
+        server._verify = original_verify
+
+    assert calls["count"] == 0
+    assert result["verification_calls"] == 0
+    assert result["verification_verdict"] is None
+    assert result.get("verification_reuse") is None
+    assert "glossary_integrity_error" in result["error"]
+    assert "candidate_receipt_id" not in result
+    assert store.project_status()["candidate"] is None
+    assert store.list_candidates() == []
+    assert fg.list() == [existing]
+    assert {
+        str(path.relative_to(fg.dir)): path.read_bytes()
+        for path in sorted(fg.dir.rglob("*"))
+        if path.is_file()
+    } == before_graph
+    assert not verification_path.exists()
+
+
+def test_fact_submit_concurrent_glossary_conflict_keeps_promotion_cas_and_reverifies(
+    tmp_path: Path,
+):
+    """A post-preflight conflict fails promotion; changed identity gets no reuse."""
+    project = tmp_path / "concurrent-glossary-conflict"
+    store, _admissions = _active_reasoning_store(project)
+    entered_verify = threading.Event()
+    release_verify = threading.Event()
+    calls = {"count": 0}
+    observed_candidates = []
+
+    def verify(statement, proof, fact_context=None, glossary_introduces=None):
+        calls["count"] += 1
+        active = store.project_status()["candidate"]
+        assert active is not None and active["state"] == "active"
+        observed_candidates.append(dict(active))
+        if calls["count"] == 1:
+            entered_verify.set()
+            assert release_verify.wait(timeout=5)
+        return _verify_response(fact_context, candidate_proof=proof)
+
+    original_verify = server._verify
+    server._verify = verify
+    raced_results = []
+    raced_errors = []
+
+    def submit_raced_candidate() -> None:
+        try:
+            raced_results.append(
+                server.fact_submit(
+                    statement="Q_RACE has the candidate property",
+                    proof="A complete proof for the candidate interpretation.",
+                    glossary_introduces={"Q_RACE": "the candidate project object"},
+                )
+            )
+        except BaseException as exc:
+            raced_errors.append(exc)
+
+    try:
+        with _env(
+            DANUS_PROJECT_DIR=str(project),
+            DANUS_AGENTS_ROOT=None,
+            DANUS_AUTHOR="xhigh",
+            DANUS_ROLE="worker",
+            DANUS_VERIFY_URL="http://mock",
+            DANUS_PROBLEM_ID="P",
+        ):
+            thread = threading.Thread(target=submit_raced_candidate)
+            thread.start()
+            assert entered_verify.wait(timeout=5)
+            competing_fact = FactGraph(project).add(
+                problem_id="P",
+                author="other",
+                statement="Q_RACE is established concurrently",
+                proof="A complete competing definition proof.",
+                glossary_introduces={
+                    "Q_RACE": "the concurrently established project object"
+                },
+            )
+            release_verify.set()
+            thread.join(timeout=10)
+            assert not thread.is_alive()
+            assert raced_errors == []
+            assert len(raced_results) == 1
+            raced = raced_results[0]
+            assert raced["verification_calls"] == 1
+            assert raced["verification_verdict"] == "correct"
+            assert raced["promoted"] is False
+            assert raced["submission_status"] == "verified_not_promoted"
+            assert "glossary_conflict" in raced["write_error"]
+
+            repaired = server.fact_submit(
+                statement="Q_RACE has the candidate property",
+                proof="A complete proof for the candidate interpretation.",
+                glossary_introduces={
+                    "Q_RACE": "the concurrently established project object"
+                },
+            )
+    finally:
+        release_verify.set()
+        server._verify = original_verify
+
+    assert repaired["verification_calls"] == 1
+    assert repaired["promoted"] is True
+    assert repaired["fact_id"] is not None
+    assert calls["count"] == 2
+    assert len(observed_candidates) == 2
+    assert (
+        observed_candidates[0]["candidate_fact_identity"]
+        != observed_candidates[1]["candidate_fact_identity"]
+    )
+    assert (
+        observed_candidates[0]["candidate_receipt_id"]
+        != observed_candidates[1]["candidate_receipt_id"]
+    )
+    assert (
+        repaired["candidate_receipt_id"]
+        == observed_candidates[1]["candidate_receipt_id"]
+    )
+    assert set(FactGraph(project).list()) == {competing_fact, repaired["fact_id"]}
+    candidates = store.list_candidates()
+    assert len(candidates) == 2
+    assert all(candidate["state"] == "terminal" for candidate in candidates)
 
 
 def test_fact_submit_empty_write_exceptions_are_not_promoted_or_written():
@@ -3544,7 +3774,9 @@ def test_project_resolution_by_name_and_validation():
                 "master_guidance", claim="try route X", evidence="", project="proj_a"
             )
             assert out["id"]
-            assert server.gm_get(out["id"], project="proj_a")["kind"] == "master_guidance"
+            assert (
+                server.gm_get(out["id"], project="proj_a")["kind"] == "master_guidance"
+            )
             assert GlobalMemory(Path(root) / "proj_a").read("master_guidance")
             # path-escape / bad names are rejected
             for bad in ("../evil", "a/b", "", "/abs"):
@@ -3572,8 +3804,7 @@ def test_master_guidance_browser_provenance_requires_adopted_receipt():
         other.mkdir()
         broker = BrowserAdvisorBroker(project)
         prepared = _prepare_browser_request(
-            broker,
-            prompt, elaboration_id="elaboration-1", context_id="cycle-1"
+            broker, prompt, elaboration_id="elaboration-1", context_id="cycle-1"
         )
         broker.authorize(
             prepared["request_id"],
@@ -4283,6 +4514,7 @@ def test_reasoning_advisor_checkpoint_binds_only_exact_ready_recommendation(
         assert GlobalMemory(project).read("advisor_checkpoint") == []
 
         store.complete(review.slot_id, outcome="terminal_rc_0")
+        _stage_next_gateway_generation(store)
         with pytest.raises(RuntimeError, match="exact current ready recommendation"):
             checkpoint("recommendation_wrong")
         assert GlobalMemory(project).read("advisor_checkpoint") == []
@@ -4297,10 +4529,13 @@ def test_reasoning_advisor_checkpoint_binds_only_exact_ready_recommendation(
         recommendation = store.project_status()["recommendation"]
         assert recommendation["browser_dispatch_authorized"] is False
         assert recommendation["advisor_request_id"] is None
-        assert BrowserAdvisorBroker.recommendation_request(
-            project,
-            recommendation_id=recommendation_id,
-        ) is None
+        assert (
+            BrowserAdvisorBroker.recommendation_request(
+                project,
+                recommendation_id=recommendation_id,
+            )
+            is None
+        )
 
         store.resolve_recommendation(
             recommendation_id,
@@ -4677,10 +4912,6 @@ def main() -> None:
     print("  [ok] fact_submit accept -> writes fact + verification trace")
     test_fact_submit_reject_writes_nothing_but_traces()
     print("  [ok] fact_submit reject -> writes nothing, still traces")
-    test_fact_submit_correct_glossary_conflict_is_not_promoted_or_written()
-    print(
-        "  [ok] correct + glossary conflict -> verified, not promoted, no graph change"
-    )
     test_fact_submit_verify_error_is_clean()
     print("  [ok] fact_submit verify-error -> clean error, no verdict")
     test_fact_submit_sends_full_statement_closure_and_no_ancestor_proofs()

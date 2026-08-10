@@ -13,6 +13,7 @@ from __future__ import annotations
 from .cli import (
     build_parser,
     do_assign,
+    do_encourage,
     do_interrupt_turn,
     do_list,
     do_messages,
@@ -28,6 +29,7 @@ from .cli import (
 __all__ = [
     "do_new",
     "do_assign",
+    "do_encourage",
     "do_say",
     "do_messages",
     "do_interrupt_turn",

@@ -28,16 +28,18 @@ verifier) decides; and a result only *exists* once that authority has accepted i
   strategy loop, assigns work, monitors, and drives the report/paper skills. It
   *structurally cannot* fabricate a result (it has no `fact_submit` tool).
 - **The codex workers.** A roster of autonomous proof workers. In the default
-    reasoning-first mode the roster is `max:2,high:5`: durable admission pins
-    the two `max` workers as root and independent critic, while the five `high`
-    loops stay dormant. Dormant loops do not start Codex and are not
-    automatically rotated, promoted, or used as failover. Explicit roles may
-    override the roster; legacy retains its `high:3,xhigh:4` default. Each new
-    terminal coordination slot starts a fresh
-    app-server thread; only crash recovery of that same pinned slot resumes. Each
-    paid turn has a 2700-second cap, which does not promise whole-phase
-    completion. Each admitted worker reads its bounded
-  directive and shared state, reasons deeply, and submits consolidated results;
+  reasoning-first mode the roster is `max:2,high:5`: durable admission pins the
+  two `max` workers as root and independent critic, while the five `high` loops
+  stay dormant. Dormant loops do not start Codex and are not automatically
+  rotated, promoted, or used as failover. Explicit roles may override the
+  roster; legacy retains its `high:3,xhigh:4` default. Each new terminal
+  coordination slot starts a fresh app-server thread; only crash recovery of
+  that same pinned slot resumes. Each paid turn has a 2700-second cap, which
+  does not promise whole-phase completion. Each admitted slot receives a
+  hash-attested snapshot of that generation's durable paid-lane task; the
+  `TASK.md` visible in its model workspace is a projection of that snapshot,
+  not mutable host authority. Each admitted worker reads its bounded directive
+  and shared state, reasons deeply, and submits consolidated results;
   an active candidate freezes new branch admission. An `outcome_unknown`
   candidate has no TTL or retry path and remains frozen until exact owner
   resolution.
@@ -95,6 +97,13 @@ citations (`external_refs`).
 - **Self-contained.** A lightweight glossary check keeps every fact readable — no
   fact silently uses an undefined symbol.
 
+Before candidate admission or a paid verifier call, the gateway reads one
+linearizable glossary snapshot and rejects definitions that already conflict
+with project or immutable global terms. This avoids paying to verify a candidate
+that is already known to be unpublishable. It is deliberately only a preflight:
+the authoritative promotion path repeats glossary and context checks under the
+graph mutation lock, so a concurrent definition still blocks the write.
+
 For the on-disk shapes and exact fields, see `../danus/core/DATA_MODEL.md`.
 
 ## The strategy loop (how the swarm is steered)
@@ -110,7 +119,10 @@ new state:
 3. **Record & dispatch** — store an actual API/CLI reply under the consult
    contract, or explicitly review/adopt an authorized browser report. When off,
    dispatch directly from the elaboration. Assign the fixed root/critic lanes
-   (`danus assign`).
+   (`danus assign`). Paid-lane assignment is a durable generation staging
+   operation; during an owner gate, all next-generation lanes must be ready
+   before the exact resolution freezes them. An ordinary no-owner generation
+   advance carries the preceding frozen tasks forward exactly.
 4. **Monitor** — watch progress; repeat when there is genuinely new state.
 
 The consult transport defaults to **`off`** (the main agent reasons from its
@@ -118,6 +130,13 @@ synthesis, no consult). **`gpt_pro`** (paid OpenAI-compatible API),
 **`claude_api`** (Anthropic API), and **`claude_code`** (Claude subscription via
 the CLI) are explicit opt-ins. Workers and the verifier always run on your own
 codex backend.
+
+Human morale support is a separate optional input. `danus encourage` can bind a
+short note to the canonical currently started paid turn, but cannot create or
+queue a turn. The note is explicitly non-authoritative: it is not a task,
+coordination directive, mathematical premise, fact, or verification result.
+Danus neither sends encouragement automatically nor claims that it causes better
+reasoning.
 
 Only the exact current coordinator recommendation, derived from the fixed root
 obstruction and independent critic confirmation, permits the active main agent

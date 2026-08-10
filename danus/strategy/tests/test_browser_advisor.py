@@ -253,7 +253,38 @@ def _reasoning_project(tmp_path: Path) -> tuple[Path, CoordinationStore]:
         "coordination": dict(DEFAULT_COORDINATION),
     }
     (project / "project.json").write_text(json.dumps(metadata), encoding="utf-8")
-    return project, CoordinationStore(project, metadata)
+    store = CoordinationStore(project, metadata)
+    generation = int(store.project_status()["generation"])
+    for worker in ("xhigh", "xhigh2"):
+        staged = store.stage_task_assignment(
+            worker,
+            f"# Generation {generation} assignment for {worker}\n",
+        )
+        assert staged["generation"] == generation
+    return project, store
+
+
+def _bound_coordination_prompt(admission) -> str:
+    return (
+        f"{admission.directive}\n\n"
+        f"coordination_slot_id={admission.slot_id}\n"
+        f"generation={admission.generation}\n"
+        f"task_sha256={admission.task_sha256}\n"
+    )
+
+
+def _stage_next_generation_tasks(store: CoordinationStore) -> None:
+    status = store.project_status()
+    assert status["phase"] == "owner_action_required"
+    generation = int(status["generation"]) + 1
+    for worker in (status["root_worker"], status["critic_worker"]):
+        if worker is not None:
+            staged = store.stage_task_assignment(
+                str(worker),
+                f"# Generation {generation} assignment for {worker}\n",
+            )
+            assert staged["generation"] == generation
+    assert store.staged_task_assignments(generation)["ready"] is True
 
 
 def _open_reasoning_recommendation(store: CoordinationStore) -> str:
@@ -262,7 +293,7 @@ def _open_reasoning_recommendation(store: CoordinationStore) -> str:
     critic = store.admit("xhigh2")
     assert root is not None and critic is not None
     for admission in (root, critic):
-        store.pin_prompt(admission.slot_id, admission.directive)
+        store.pin_prompt(admission.slot_id, _bound_coordination_prompt(admission))
         store.activate(admission.slot_id)
     root_entry_id = f"root_obstacle_g{generation}"
     evidence = store.record_root_evidence(
@@ -275,7 +306,7 @@ def _open_reasoning_recommendation(store: CoordinationStore) -> str:
     store.complete(critic.slot_id, outcome="terminal_rc_0")
     review = store.admit("xhigh2")
     assert review is not None
-    store.pin_prompt(review.slot_id, review.directive)
+    store.pin_prompt(review.slot_id, _bound_coordination_prompt(review))
     store.activate(review.slot_id)
     confirmation = store.confirm_root_evidence(
         "xhigh2",
@@ -723,6 +754,7 @@ def test_reasoning_prepare_requires_exact_open_recommendation_and_is_idempotent(
             recommendation_id=recommendation_id,
         )
 
+    _stage_next_generation_tasks(store)
     store.resolve_recommendation(
         recommendation_id,
         resolution="continue_without_advisor",
@@ -885,6 +917,7 @@ def test_v5_dispatch_rechecks_current_recommendation_and_active_facts(tmp_path: 
         **checkpoint,
     )
     _authorize(broker, request)
+    _stage_next_generation_tasks(store)
     store.resolve_recommendation(
         recommendation_id,
         resolution="continue_without_advisor",
@@ -1006,6 +1039,7 @@ def test_recommendation_changes_binding_even_with_same_prompt_and_context(
     )
     completed = _complete_existing_request(broker, first)
     broker.import_result(completed["request_id"], response=DEFAULT_RESPONSE)
+    _stage_next_generation_tasks(store)
     store.resolve_recommendation(
         first_recommendation,
         resolution="continue_without_advisor",
@@ -1036,6 +1070,7 @@ def test_local_continuation_keeps_context_but_uses_new_recommendation(
     )
     completed = _complete_existing_request(broker, first)
     broker.import_result(completed["request_id"], response=DEFAULT_RESPONSE)
+    _stage_next_generation_tasks(store)
     store.resolve_recommendation(
         first_recommendation,
         resolution="continue_without_advisor",
@@ -2942,6 +2977,7 @@ def test_schema_v4_reasoning_replay_survives_resolution_but_cannot_dispatch(
         assert raw is not None
         legacy_receipt = BrowserAdvisorBroker._receipt_sha256(dict(raw))
 
+    _stage_next_generation_tasks(store)
     store.resolve_recommendation(
         recommendation_id,
         resolution="continue_without_advisor",

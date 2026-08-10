@@ -20,6 +20,7 @@ from pathlib import Path
 from danus.coordination import CoordinationStore, candidate_receipt_id
 from danus.core import FactGraph
 from danus.execution import layout as L
+from danus.execution import loop as execution_loop
 from danus.orchestration import cli
 
 
@@ -84,6 +85,17 @@ def _wait_until(pred, timeout=15.0, interval=0.05) -> bool:
 
 def _st(project: str, worker: str) -> dict:
     return cli.worker_status(L.WorkerLayout(L.worker_dir(project, worker)))
+
+
+def _pinned_prompt(project: str, admission) -> str:
+    return execution_loop.kickoff(
+        project,
+        admission.worker,
+        admission.directive,
+        coordination_slot_id=admission.slot_id,
+        generation=admission.generation,
+        task_sha256=admission.task_sha256,
+    )
 
 
 def _kill_project(project: str):
@@ -164,11 +176,12 @@ def test_list(tmp: Path):
 def test_status_and_list_expose_active_candidate_overlay(tmp: Path):
     with _project_env(tmp):
         cli.do_new("P", roles="high:1")
+        cli.do_assign("P/high", "candidate overlay assignment")
         project = L.project_dir("P")
         store = CoordinationStore(project, create=False)
         root = store.admit("high")
         assert root is not None
-        store.pin_prompt(root.slot_id, root.directive)
+        store.pin_prompt(root.slot_id, _pinned_prompt("P", root))
         store.activate(root.slot_id)
         receipt = candidate_receipt_id(
             slot_id=root.slot_id,
@@ -260,11 +273,12 @@ def test_status_and_list_expose_active_candidate_overlay(tmp: Path):
 def test_owner_resolution_checks_exact_full_fact_identity(tmp: Path):
     with _project_env(tmp):
         cli.do_new("P", roles="high:1")
+        cli.do_assign("P/high", "candidate identity assignment")
         project = L.project_dir("P")
         store = CoordinationStore(project, create=False)
         root = store.admit("high")
         assert root is not None
-        store.pin_prompt(root.slot_id, root.directive)
+        store.pin_prompt(root.slot_id, _pinned_prompt("P", root))
         store.activate(root.slot_id)
         graph = FactGraph(project)
         fact_id = graph.add(
@@ -315,11 +329,12 @@ def test_owner_resolution_checks_exact_full_fact_identity(tmp: Path):
 def test_owner_resolution_ignores_active_short_id_collision(tmp: Path):
     with _project_env(tmp):
         cli.do_new("P", roles="high:1")
+        cli.do_assign("P/high", "candidate collision assignment")
         project = L.project_dir("P")
         store = CoordinationStore(project, create=False)
         root = store.admit("high")
         assert root is not None
-        store.pin_prompt(root.slot_id, root.directive)
+        store.pin_prompt(root.slot_id, _pinned_prompt("P", root))
         store.activate(root.slot_id)
         graph = FactGraph(project)
         fact_id = graph.add(
@@ -379,6 +394,13 @@ def test_loop_runs_rounds_then_exits(tmp: Path):
         try:
             res = cli.do_start("P/high")
             assert res[0]["result"] == "started"
+            # PID publication is asynchronous. First observe that the worker
+            # actually left its scaffolded state; otherwise an immediate
+            # ``not alive`` read can pass before the child registers itself.
+            assert _wait_until(
+                lambda: _st("P", "high")["state"] != "created"
+                or _st("P", "high")["round"] > 0
+            ), "loop should publish a launched round or terminal state"
             assert _wait_until(lambda: not _st("P", "high")["alive"]), (
                 "loop should exit at backstop"
             )
@@ -402,6 +424,7 @@ def test_graceful_stop(tmp: Path):
         FAKE_CODEX_SLEEP="0.1",
     ):
         cli.do_new("P", roles="high:1")
+        cli.do_assign("P/high", "Run the graceful-stop integration round.")
         try:
             cli.do_start("P/high")
             assert _wait_until(lambda: _st("P", "high")["round"] >= 1), (
@@ -430,6 +453,7 @@ def test_force_stop(tmp: Path, monkeypatch):
         FAKE_CODEX_SLEEP="30",
     ):
         cli.do_new("P", roles="high:1")
+        cli.do_assign("P/high", "Run the force-stop integration round.")
         wl = L.WorkerLayout(L.worker_dir("P", "high"))
         external_signals = []
         real_kill = os.kill
@@ -514,6 +538,7 @@ def test_missing_codex_returns_error_state(tmp: Path):
         DANUS_MAX_ROUNDS="0",
     ):
         cli.do_new("P", roles="high:1")
+        cli.do_assign("P/high", "Exercise the missing-codex error path.")
         try:
             cli.do_start("P/high")
             # rc 127 => loop must not spin; it errors out immediately

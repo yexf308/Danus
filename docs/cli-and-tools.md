@@ -22,22 +22,32 @@ there is no default project.
 |---|---|---|
 | `list` | `danus list [--json]` | all projects + physical liveness and reasoning-first paid/waiting counts |
 | `new` | `danus new <project> [--roles ROLES] [--model M] [--coordination reasoning-first\|legacy]` | scaffold a project + worker dirs; reasoning-first defaults to two `max` root/critic workers plus five dormant `high` observers, while explicit legacy defaults to `high:3,xhigh:4` |
-| `assign` | `danus assign <project>/<worker> (--task "…" \| --file P \| --stdin)` | write that worker's per-round `TASK.md` (**replaces**, not appends) |
+| `assign` | `danus assign <project>/<worker> (--task "…" \| --file P \| --stdin)` | replace an assignment; for a reasoning-first paid lane, stage the exact task bytes for the current generation (or the gated next generation) before refreshing the host `TASK.md` projection |
 | `say` | `danus say <project>/<worker> (--text "…" \| --file P \| --stdin) [--client-id ID] [--fallback queue\|fail]` | durably hot-join owner guidance into the exact active app-server turn; fallback defaults to `queue` |
+| `encourage` | `danus encourage <project>/<worker> [--text "…" \| --file P \| --stdin] [--client-id ID]` | send non-authoritative morale support to the canonical currently started paid turn only; omitted text uses the built-in encouragement, and delivery never queues for a later turn |
 | `messages` | `danus messages <project>[/<worker>] [--limit N] [--json]` | inspect human-message delivery receipts |
 | `interrupt-turn` | `danus interrupt-turn <project>/<worker> [--client-id ID]` | explicit owner-only active-turn interrupt |
 | `cancel-prepared-intent` | `danus cancel-prepared-intent <project>/<worker> --thread-id ID --client-id ID --reason TEXT` | exact-CAS cancellation of an authoritatively unspent prepared intent under the worker lifecycle lock; append-only receipt, then reset/rotate separately |
 | `abandon-intent` | `danus abandon-intent <project>/<worker> --thread-id ID --client-id ID --expected-state STATE --reason TEXT --acknowledge-paid-outcome-unknown` | fail-stopped exact-CAS of one unreconcilable paid outcome; append-only risk receipt, no retry/deletion, and old-thread dispatch remains fenced until reset/rotation |
 | `resolve-candidate` | `danus resolve-candidate <project> --receipt ID --outcome known-no-promotion\|abandon-unknown --acknowledge-paid-outcome-unknown` | explicitly reconcile an `outcome_unknown` reasoning-first verification candidate; explicit unknown-outcome acknowledgement is required for either resolution; checks the bound FactGraph identity under lock, writes an owner audit, and never retries verification |
-| `resolve-recommendation` | `danus resolve-recommendation <project> --recommendation-id ID --resolution adopted-master-guidance\|continue-without-advisor --acknowledge-recommendation-id ID --acknowledge-resume-paid-reasoning [--master-guidance-entry-id ID]` | exact owner CAS that closes the current reviewed recommendation and starts a fresh paid generation; adopted guidance must link the exact recommendation, while continue-without-advisor requires no live/ambiguous/unreleased browser request |
+| `resolve-recommendation` | `danus resolve-recommendation <project> --recommendation-id ID --resolution adopted-master-guidance\|continue-without-advisor --acknowledge-recommendation-id ID --acknowledge-resume-paid-reasoning [--master-guidance-entry-id ID]` | exact owner CAS that closes the current reviewed recommendation and starts a fresh paid generation; every next-generation paid lane must first have a staged task, which the resolution freezes atomically |
 | `reset-thread` | `danus reset-thread <project>/<worker> --expected-thread-id ID` | CAS-fenced reset of a server-deleted thread mapping; fail closed for a live/busy worker and share `start`'s `.pid.lock` |
 | `rotate-thread` | `danus rotate-thread <project>/<worker> --expected-thread-id ID --reason TEXT` | explicitly accept terminal conversation-context loss after bounded resume failure; fail closed for a live/busy worker, share `start`'s `.pid.lock`, and preserve research stores |
 | `finalize` | `danus finalize <project> [--paper <paper_id>] [<fact_id> …]` | record the approved target theorem(s) in the paper's `TARGET.md` (what write-paper reads; default paper → `<project>/TARGET.md`, a non-default `--paper` → `<project>/papers/<paper_id>/TARGET.md`). **With no id:** print candidate terminal facts as suggestions (writes nothing) |
 | `start` | `danus start <project>[/<worker>]` | launch the autonomous worker loop(s); a live loop is not necessarily a paid model turn |
-| `status` | `danus status <project>[/<worker>] [--json]` | liveness, round, lane/generation, paid-active vs waiting admission, candidate/recovery state, and last-turn telemetry |
+| `status` | `danus status <project>[/<worker>] [--json]` | liveness, round, lane/generation, paid-active vs waiting admission, task staging, candidate/paid-intent state, and last-turn telemetry |
 | `stop` | `danus stop <project>[/<worker>] [--force]` | graceful (finish the round, exit at the boundary) or `--force` (durably request the worker to interrupt its active turn/direct child and exit) |
 
 Notes:
+- In reasoning-first mode, the paid task source of truth is the coordinator's
+  generation/slot snapshot, identified by its SHA-256 and byte count. The host
+  and model-workspace `TASK.md` files are projections of that binding, not an
+  independent source of paid work. `assign` stages a paid lane before updating
+  the host projection. During `owner_action_required`, it targets generation
+  `N+1`; stage every paid lane and confirm `task_staging.ready=true` in
+  `status --json` before resolving the recommendation. The owner resolution
+  freezes that complete set. A generation advance that needs no owner decision
+  carries the preceding frozen task bytes forward exactly.
 - In reasoning-first JSON status, `advisor_reachable` is only the structural
   fact that the roster has an independent critic and can eventually produce an
   advisor recommendation. It does not mean one exists or may be prepared.
@@ -54,6 +64,17 @@ Notes:
 - Reasoning telemetry in `status --json` is content-free, root-thread-only, and
   diagnostic. Missing data is `unavailable`/`partial`, never inferred as zero and
   never used as proof state or browser authority.
+- A live worker with a canonical `prepared`, `dispatching`, or `started` paid
+  intent reports `paid_intent_status: "in_progress"` and no
+  `recovery_required` action. Live `delivery_unknown` is reported separately as
+  `outcome_unknown_while_worker_live`, also without an abandon command. Recovery
+  argv appears only after the worker is fail-stopped (or its PID identity is
+  unsafe) and the exact ledger state can be read.
+- For `encourage`, `--client-id` binds the semantic channel, note, target, and
+  exact expected thread/turn. It replays only that same active binding; reuse
+  after a turn change conflicts. A lost steer acknowledgement may be
+  `delivery_unknown`, but is never retried or queued for another turn; inspect
+  it with `messages`.
 - An `outcome_unknown` candidate has no TTL. Do not retry or resubmit it; use the
   exact owner-only `resolve-candidate` command after inspecting its receipt.
 
@@ -71,7 +92,7 @@ main agent runs as `role=main`.
 | `gm_add` | `kind, claim, evidence, verifiable?, glossary?, links?, consult_provenance?, input_tokens?, output_tokens?, cost_usd?, project?` | publish a finding to shared global memory; consult metadata is master-guidance-only, and browser provenance is accepted only after explicit adoption |
 | `gm_get` | `entry_id, project?` | retrieve exactly one global-memory record by its canonical 16-lowercase-hex id; absent/duplicate ids fail, serialized output is capped at 16 KiB; designated critic review must use this rather than BM25 search |
 | `gm_search` | `query, kinds?, limit_per_kind?, project?` | search global-memory findings |
-| `fact_submit` | `statement, proof, predecessors?, glossary_introduces?, intuition?, source_id?, external_refs?` | **the write-gate** — after `correct`, recheck the exact context and add under the graph lock; `promoted` + non-null `fact_id` mean publication, while a write failure preserves the correct `verification_verdict` but returns `promoted: false` + `write_error`; audit-trace failures never hide a written fact id |
+| `fact_submit` | `statement, proof, predecessors?, glossary_introduces?, intuition?, source_id?, external_refs?` | **the write-gate** — known glossary conflicts fail during a read-only preflight before candidate admission or paid verification; after `correct`, recheck the exact context and glossary under the graph lock before adding; only `promoted` + non-null `fact_id` mean publication |
 | `fact_search` | `query, limit?, project?` | full-text BM25 discovery whose result payload contains statement summaries only |
 | `fact_context` | `fact_ids, predecessor_depth?, proof_mode?, max_chars?, project?` | lazy explicit-id context; statements/relations by default, proofs opt-in, with completeness metadata |
 | `fact_revoke` | `fact_id, reason, project?` | cascade-revoke a fact + its dependents |
@@ -93,13 +114,17 @@ verifier returned a valid final `correct` verdict. Consumers and monitors must
 count a published fact only when `promoted` is true and `fact_id` is non-null.
 `submission_status` is one of `promoted`, `verified_not_promoted`,
 `promotion_unknown`, `rejected`, or `error`; `verification_verdict` keeps
-`correct`/`wrong` separate from graph-write success. `promotion_unknown` carries
-`promoted: null` when an fsync failure made the crash-recovery outcome ambiguous;
-it is not counted as publication. On `verified_not_promoted`, use `write_error`
-to repair the conflicting
-glossary introduction, refresh stale predecessors/context, or retry the failed
-write. For responses from an older gateway without `promoted`, only a valid
-non-null `fact_id` is a safe publication fallback.
+`correct`/`wrong` separate from graph-write success. A glossary conflict already
+present at submission preflight returns no verifier verdict and makes zero
+verification calls; repair the introduction before resubmitting. The preflight
+is an optimization, not write authority: a concurrent definition can still
+appear, so promotion repeats the glossary and context checks under the mutation
+lock. Such a post-verification conflict is `verified_not_promoted` with a
+`correct` verification verdict and an explicit `write_error`. `promotion_unknown`
+carries `promoted: null` when an fsync failure made the crash-recovery outcome
+ambiguous; it is not counted as publication. For responses from an older gateway
+without `promoted`, only a valid non-null `fact_id` is a safe publication
+fallback.
 
 ---
 

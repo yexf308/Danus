@@ -1,9 +1,9 @@
 """Crash-durable SQLite admission for reasoning-first paid worker rounds.
 
-The database stores orchestration identities and lifecycle state only. It never
-stores mathematical claims, prompts from the task, advisor prose, or model
-output; the one exception is the bounded generated kickoff needed to make an
-ambiguous app-server retry byte-identical.
+The database stores orchestration identities and lifecycle state, plus the
+bounded task and generated kickoff snapshots required to make every paid turn
+generation-exact and an ambiguous app-server retry byte-identical.  It never
+stores mathematical claims, advisor prose, or model output.
 """
 
 from __future__ import annotations
@@ -37,9 +37,10 @@ from .policy import (
     select_lane_roster,
 )
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 MAX_PROJECT_METADATA_BYTES = 1_000_000
 MAX_PINNED_PROMPT_BYTES = 131_072
+MAX_TASK_BYTES = 131_072
 MAX_OUTCOME_BYTES = 512
 MAX_RECONCILE_ENTRIES = 10_000
 PREPARED_DEADLINE_OUTCOME = "phase_deadline_known_not_dispatched"
@@ -63,6 +64,9 @@ class Admission:
     generation: int
     phase: str
     directive: str
+    task: str
+    task_sha256: str
+    task_bytes: int
     prompt: str | None
     prompt_sha256: str | None
     state: str
@@ -440,6 +444,28 @@ class CoordinationStore:
             connection.close()
             raise
 
+    @staticmethod
+    def _create_generation_tasks_table_locked(
+        connection: sqlite3.Connection,
+    ) -> None:
+        connection.execute(
+            """
+            CREATE TABLE generation_tasks (
+                worker TEXT NOT NULL,
+                generation INTEGER NOT NULL CHECK (generation >= 1),
+                lane TEXT NOT NULL CHECK (lane IN ('root', 'critic')),
+                task TEXT NOT NULL,
+                task_sha256 TEXT NOT NULL,
+                task_bytes INTEGER NOT NULL CHECK (
+                    task_bytes > 0 AND task_bytes <= 131072
+                ),
+                staged_at REAL NOT NULL,
+                frozen_at REAL,
+                PRIMARY KEY (worker, generation)
+            )
+            """
+        )
+
     def _initialize(self, *, create: bool) -> None:
         if not create:
             self._verify_database()
@@ -472,6 +498,13 @@ class CoordinationStore:
                         state IN ('prepared', 'active', 'ambiguous', 'terminal')
                     ),
                     directive TEXT NOT NULL,
+                    task TEXT,
+                    task_sha256 TEXT,
+                    task_bytes INTEGER,
+                    prompt_task_sha256 TEXT,
+                    legacy_task_binding INTEGER NOT NULL DEFAULT 0 CHECK (
+                        legacy_task_binding IN (0, 1)
+                    ),
                     prompt TEXT,
                     prompt_sha256 TEXT,
                     created_at REAL NOT NULL,
@@ -611,6 +644,7 @@ class CoordinationStore:
                 "SELECT * FROM project_state WHERE singleton=1"
             ).fetchone()
             if row is None:
+                self._create_generation_tasks_table_locked(connection)
                 connection.execute(
                     """
                     INSERT INTO project_state(
@@ -683,7 +717,7 @@ class CoordinationStore:
                             "coordination schema migration lost its CAS"
                         )
                     schema_version = 5
-                elif schema_version not in {5, SCHEMA_VERSION}:
+                elif schema_version not in {5, 6, SCHEMA_VERSION}:
                     raise CoordinationError(
                         f"unsupported coordination schema version {schema_version}"
                     )
@@ -750,15 +784,117 @@ class CoordinationStore:
                     changed = connection.execute(
                         """
                         UPDATE project_state
-                        SET schema_version=?, updated_at=?
+                        SET schema_version=6, updated_at=?
                         WHERE singleton=1 AND schema_version=5
                         """,
-                        (SCHEMA_VERSION, now),
+                        (now,),
                     ).rowcount
                     if changed != 1:
                         raise CoordinationError(
                             "coordination review schema migration lost its CAS"
                         )
+                    schema_version = 6
+                if schema_version == 6:
+                    nonterminal_slots = int(
+                        connection.execute(
+                            """
+                            SELECT COUNT(*) FROM round_slots
+                            WHERE state!='terminal'
+                            """
+                        ).fetchone()[0]
+                    )
+                    if nonterminal_slots:
+                        raise CoordinationError(
+                            "coordination schema v6 has a nonterminal paid slot "
+                            "whose exact task binding cannot be safely migrated"
+                        )
+                    migration_project = self._state(connection)
+                    current_generation = int(migration_project["generation"])
+                    current_slots = int(
+                        connection.execute(
+                            """
+                            SELECT COUNT(*) FROM round_slots
+                            WHERE generation=?
+                            """,
+                            (current_generation,),
+                        ).fetchone()[0]
+                    )
+                    if current_slots:
+                        recommendation_id = migration_project["recommendation_id"]
+                        if (
+                            migration_project["phase"] != OWNER_ACTION_REQUIRED_PHASE
+                            or recommendation_id is None
+                        ):
+                            raise CoordinationError(
+                                "coordination schema v6 has current-generation paid "
+                                "slot history whose complete exact task binding cannot "
+                                "be safely migrated"
+                            )
+                        # The sole safe exception is immutable terminal history at
+                        # an exact owner gate.  That transition freezes a complete
+                        # generation+1 task set and never carries these legacy
+                        # current-generation tasks forward.
+                        try:
+                            self._open_recommendation_projection_locked(
+                                connection,
+                                str(recommendation_id),
+                            )
+                        except CoordinationError as exc:
+                            raise CoordinationError(
+                                "coordination schema v6 owner-action slot history is "
+                                "not a complete terminal recommendation and cannot be "
+                                "safely migrated"
+                            ) from exc
+                    if (
+                        connection.execute(
+                            """
+                            SELECT 1 FROM sqlite_master
+                            WHERE type='table' AND name='generation_tasks'
+                            """
+                        ).fetchone()
+                        is not None
+                    ):
+                        raise CoordinationError(
+                            "coordination schema v6 has an unexpected task table"
+                        )
+                    slot_columns = {
+                        str(column["name"])
+                        for column in connection.execute(
+                            "PRAGMA table_info(round_slots)"
+                        ).fetchall()
+                    }
+                    task_columns = {
+                        "task": "TEXT",
+                        "task_sha256": "TEXT",
+                        "task_bytes": "INTEGER",
+                        "prompt_task_sha256": "TEXT",
+                        "legacy_task_binding": (
+                            "INTEGER NOT NULL DEFAULT 1 CHECK "
+                            "(legacy_task_binding IN (0, 1))"
+                        ),
+                    }
+                    for name, column_type in task_columns.items():
+                        if name in slot_columns:
+                            raise CoordinationError(
+                                "coordination schema v6 has partial task-binding columns"
+                            )
+                        connection.execute(
+                            f"ALTER TABLE round_slots ADD COLUMN {name} {column_type}"
+                        )
+                    self._create_generation_tasks_table_locked(connection)
+                    changed = connection.execute(
+                        """
+                        UPDATE project_state
+                        SET schema_version=?, updated_at=?
+                        WHERE singleton=1 AND schema_version=6
+                        """,
+                        (SCHEMA_VERSION, now),
+                    ).rowcount
+                    if changed != 1:
+                        raise CoordinationError(
+                            "coordination task-binding schema migration lost its CAS"
+                        )
+                    schema_version = SCHEMA_VERSION
                 invalid_overlay = int(
                     connection.execute(
                         """
@@ -776,6 +912,7 @@ class CoordinationStore:
                     raise CoordinationError(
                         "active candidate has no canonical full fact identity"
                     )
+            self._audit_task_bindings_locked(connection)
             connection.commit()
         except BaseException:
             if connection.in_transaction:
@@ -783,6 +920,220 @@ class CoordinationStore:
             raise
         finally:
             connection.close()
+
+    @staticmethod
+    def _task_identity(task: str) -> tuple[str, int]:
+        if not isinstance(task, str) or not task.strip():
+            raise CoordinationError("task assignment must be non-empty text")
+        try:
+            encoded = task.encode("utf-8", errors="strict")
+        except UnicodeEncodeError as exc:
+            raise CoordinationError("task assignment is not valid UTF-8") from exc
+        if len(encoded) > MAX_TASK_BYTES:
+            raise CoordinationError("task assignment exceeds its hard limit")
+        return hashlib.sha256(encoded).hexdigest(), len(encoded)
+
+    def _validate_generation_task_row(
+        self,
+        row: sqlite3.Row,
+    ) -> tuple[str, int]:
+        worker = str(row["worker"])
+        lane = str(row["lane"])
+        if self.roster.lanes.get(worker) != lane:
+            raise CoordinationError(
+                "generation task is outside the protected paid-lane roster"
+            )
+        generation = row["generation"]
+        if (
+            isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or generation < 1
+        ):
+            raise CoordinationError("generation task has an invalid generation")
+        digest, byte_count = self._task_identity(row["task"])
+        if (
+            row["task_sha256"] != digest
+            or isinstance(row["task_bytes"], bool)
+            or row["task_bytes"] != byte_count
+        ):
+            raise CoordinationError(
+                "generation task bytes do not match their durable identity"
+            )
+        for value in (row["staged_at"], row["frozen_at"]):
+            if value is not None and (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+            ):
+                raise CoordinationError("generation task has an invalid timestamp")
+        if row["frozen_at"] is not None and float(row["frozen_at"]) < float(
+            row["staged_at"]
+        ):
+            raise CoordinationError(
+                "generation task freeze predates its durable staging"
+            )
+        return digest, byte_count
+
+    @staticmethod
+    def _prompt_binding_markers(slot: sqlite3.Row) -> tuple[str, str, str]:
+        return (
+            f"coordination_slot_id={slot['slot_id']}",
+            f"generation={int(slot['generation'])}",
+            f"task_sha256={slot['task_sha256']}",
+        )
+
+    def _validate_slot_task_binding_locked(
+        self,
+        connection: sqlite3.Connection,
+        slot: sqlite3.Row,
+    ) -> None:
+        legacy = slot["legacy_task_binding"]
+        if legacy == 1:
+            if slot["state"] != "terminal" or any(
+                slot[key] is not None
+                for key in (
+                    "task",
+                    "task_sha256",
+                    "task_bytes",
+                    "prompt_task_sha256",
+                )
+            ):
+                raise CoordinationError(
+                    "legacy task binding is not an exact terminal migration"
+                )
+            return
+        if legacy != 0:
+            raise CoordinationError("round slot has an invalid task-binding version")
+        digest, byte_count = self._task_identity(slot["task"])
+        if (
+            slot["task_sha256"] != digest
+            or isinstance(slot["task_bytes"], bool)
+            or slot["task_bytes"] != byte_count
+        ):
+            raise CoordinationError("round slot task snapshot failed its durable hash")
+        assignment = connection.execute(
+            """
+            SELECT * FROM generation_tasks
+            WHERE worker=? AND generation=?
+            """,
+            (slot["worker"], slot["generation"]),
+        ).fetchone()
+        if assignment is None:
+            raise CoordinationError(
+                "round slot has no matching durable generation task"
+            )
+        self._validate_generation_task_row(assignment)
+        if (
+            assignment["lane"] != slot["lane"]
+            or assignment["task"] != slot["task"]
+            or assignment["task_sha256"] != digest
+            or assignment["task_bytes"] != byte_count
+            or assignment["frozen_at"] is None
+        ):
+            raise CoordinationError(
+                "round slot conflicts with its durable generation task"
+            )
+        prompt = slot["prompt"]
+        prompt_digest = slot["prompt_sha256"]
+        prompt_task_digest = slot["prompt_task_sha256"]
+        if prompt is None:
+            if prompt_digest is not None or prompt_task_digest is not None:
+                raise CoordinationError(
+                    "round slot has a partial generated-prompt binding"
+                )
+            if slot["state"] in {"active", "ambiguous"}:
+                raise CoordinationError("dispatched round slot has no pinned prompt")
+            return
+        if not isinstance(prompt, str) or not prompt:
+            raise CoordinationError("round slot has an invalid pinned prompt")
+        try:
+            encoded = prompt.encode("utf-8", errors="strict")
+        except UnicodeEncodeError as exc:
+            raise CoordinationError("round slot prompt is not valid UTF-8") from exc
+        prompt_lines = set(prompt.splitlines())
+        if (
+            len(encoded) > MAX_PINNED_PROMPT_BYTES
+            or not isinstance(prompt_digest, str)
+            or _SHA256_RE.fullmatch(prompt_digest) is None
+            or hashlib.sha256(encoded).hexdigest() != prompt_digest
+            or prompt_task_digest != digest
+            or any(
+                marker not in prompt_lines
+                for marker in self._prompt_binding_markers(slot)
+            )
+        ):
+            raise CoordinationError(
+                "round slot prompt conflicts with its task/slot/generation binding"
+            )
+
+    def _audit_task_bindings_locked(self, connection: sqlite3.Connection) -> None:
+        project = self._state(connection)
+        if int(project["schema_version"]) != SCHEMA_VERSION:
+            raise CoordinationError(
+                "coordination task-binding schema version is inconsistent"
+            )
+        slot_columns = {
+            str(column["name"])
+            for column in connection.execute(
+                "PRAGMA table_info(round_slots)"
+            ).fetchall()
+        }
+        required_slot_columns = {
+            "task",
+            "task_sha256",
+            "task_bytes",
+            "prompt_task_sha256",
+            "legacy_task_binding",
+        }
+        if not required_slot_columns.issubset(slot_columns):
+            raise CoordinationError(
+                "coordination schema is missing round-slot task bindings"
+            )
+        task_table = connection.execute(
+            """
+            SELECT 1 FROM sqlite_master
+            WHERE type='table' AND name='generation_tasks'
+            """
+        ).fetchone()
+        if task_table is None:
+            raise CoordinationError(
+                "coordination schema is missing durable generation tasks"
+            )
+        task_columns = {
+            str(column["name"])
+            for column in connection.execute(
+                "PRAGMA table_info(generation_tasks)"
+            ).fetchall()
+        }
+        if task_columns != {
+            "worker",
+            "generation",
+            "lane",
+            "task",
+            "task_sha256",
+            "task_bytes",
+            "staged_at",
+            "frozen_at",
+        }:
+            raise CoordinationError("coordination generation-task schema is malformed")
+        current_generation = int(project["generation"])
+        for assignment in connection.execute(
+            "SELECT * FROM generation_tasks"
+        ).fetchall():
+            self._validate_generation_task_row(assignment)
+            if int(assignment["generation"]) > current_generation + 1:
+                raise CoordinationError(
+                    "generation task targets an impossible future generation"
+                )
+            if (
+                int(assignment["generation"]) == current_generation + 1
+                and project["phase"] != OWNER_ACTION_REQUIRED_PHASE
+            ):
+                raise CoordinationError(
+                    "future generation task exists outside owner-action staging"
+                )
+        for slot in connection.execute("SELECT * FROM round_slots").fetchall():
+            self._validate_slot_task_binding_locked(connection, slot)
 
     def _state(self, connection: sqlite3.Connection) -> sqlite3.Row:
         row = connection.execute(
@@ -795,6 +1146,328 @@ class CoordinationStore:
     def _worker_lane(self, worker: str) -> str:
         _validate_identifier(worker, "worker")
         return self.roster.lanes.get(worker, "observer")
+
+    def _required_task_workers(self) -> tuple[tuple[str, str], ...]:
+        workers: list[tuple[str, str]] = [(self.roster.root, "root")]
+        if self.roster.critic is not None:
+            workers.append((self.roster.critic, "critic"))
+        return tuple(workers)
+
+    def _task_staging_projection_locked(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        generation: int,
+    ) -> dict[str, Any]:
+        required = self._required_task_workers()
+        rows = {
+            str(row["worker"]): row
+            for row in connection.execute(
+                """
+                SELECT * FROM generation_tasks
+                WHERE generation=?
+                ORDER BY lane, worker
+                """,
+                (generation,),
+            ).fetchall()
+        }
+        assignments: list[dict[str, Any]] = []
+        missing: list[str] = []
+        for worker, lane in required:
+            row = rows.get(worker)
+            if row is None:
+                missing.append(worker)
+                continue
+            self._validate_generation_task_row(row)
+            if row["lane"] != lane:
+                raise CoordinationError(
+                    "generation task lane conflicts with the protected roster"
+                )
+            assignments.append(
+                {
+                    "worker": worker,
+                    "lane": lane,
+                    "generation": generation,
+                    "task_sha256": str(row["task_sha256"]),
+                    "task_bytes": int(row["task_bytes"]),
+                    "frozen": row["frozen_at"] is not None,
+                }
+            )
+        unexpected = set(rows).difference(worker for worker, _lane in required)
+        if unexpected:
+            raise CoordinationError(
+                "generation task includes a worker outside the paid roster"
+            )
+        return {
+            "generation": generation,
+            "required_workers": [worker for worker, _lane in required],
+            "assignments": assignments,
+            "missing_workers": missing,
+            "ready": not missing,
+        }
+
+    def staged_task_assignments(
+        self,
+        generation: int | None = None,
+    ) -> dict[str, Any]:
+        """Return digest-only coverage for one durable task generation."""
+
+        connection = self._connect()
+        try:
+            project = self._state(connection)
+            current = int(project["generation"])
+            target = (
+                current + 1
+                if generation is None
+                and project["phase"] == OWNER_ACTION_REQUIRED_PHASE
+                else current
+                if generation is None
+                else generation
+            )
+            if (
+                isinstance(target, bool)
+                or not isinstance(target, int)
+                or target < 1
+                or target > current + 1
+            ):
+                raise CoordinationError(
+                    "task-staging generation is outside the durable horizon"
+                )
+            return self._task_staging_projection_locked(
+                connection,
+                generation=target,
+            )
+        finally:
+            connection.close()
+
+    def stage_task_assignment(
+        self,
+        worker: str,
+        task: str,
+        *,
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        """Stage exact task bytes for current admission or the gated next generation.
+
+        A conflicting assignment may replace an unfrozen staged row, preserving
+        assign overwrite semantics. Once any slot exists for that worker and
+        generation, or owner resolution freezes the next generation, only
+        byte-identical replay is accepted.
+        """
+
+        worker = _validate_identifier(worker, "worker")
+        lane = self._worker_lane(worker)
+        if lane not in {"root", "critic"}:
+            raise CoordinationError(
+                "only protected paid-lane workers have durable task assignments"
+            )
+        digest, byte_count = self._task_identity(task)
+        staged_at = None if now is None else float(now)
+        if staged_at is not None and not math.isfinite(staged_at):
+            raise CoordinationError("task assignment timestamp is invalid")
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            if staged_at is None:
+                staged_at = time.time()
+            project = self._state(connection)
+            generation = int(project["generation"])
+            phase = str(project["phase"])
+            if self._active_candidate(connection) is not None:
+                raise CoordinationError(
+                    "active candidate freezes durable task assignment"
+                )
+            target_generation = (
+                generation + 1 if phase == OWNER_ACTION_REQUIRED_PHASE else generation
+            )
+            existing = connection.execute(
+                """
+                SELECT * FROM generation_tasks
+                WHERE worker=? AND generation=?
+                """,
+                (worker, target_generation),
+            ).fetchone()
+            slot_exists = connection.execute(
+                """
+                SELECT 1 FROM round_slots
+                WHERE worker=? AND generation=?
+                """,
+                (worker, target_generation),
+            ).fetchone()
+            if existing is not None:
+                self._validate_generation_task_row(existing)
+                same = (
+                    existing["lane"] == lane
+                    and existing["task"] == task
+                    and existing["task_sha256"] == digest
+                    and existing["task_bytes"] == byte_count
+                )
+                if same:
+                    connection.commit()
+                    return {
+                        "worker": worker,
+                        "lane": lane,
+                        "generation": target_generation,
+                        "task_sha256": digest,
+                        "task_bytes": byte_count,
+                        "frozen": existing["frozen_at"] is not None,
+                        "replayed": True,
+                        "replaced": False,
+                    }
+                if existing["frozen_at"] is not None or slot_exists is not None:
+                    raise CoordinationError(
+                        "durable task assignment is frozen for this generation"
+                    )
+                changed = connection.execute(
+                    """
+                    UPDATE generation_tasks
+                    SET lane=?, task=?, task_sha256=?, task_bytes=?, staged_at=?
+                    WHERE worker=? AND generation=? AND frozen_at IS NULL
+                    """,
+                    (
+                        lane,
+                        task,
+                        digest,
+                        byte_count,
+                        staged_at,
+                        worker,
+                        target_generation,
+                    ),
+                ).rowcount
+                if changed != 1:
+                    raise CoordinationError("task assignment replacement lost its CAS")
+                replaced = True
+            else:
+                if slot_exists is not None:
+                    raise CoordinationError(
+                        "round slot exists without its durable task assignment"
+                    )
+                connection.execute(
+                    """
+                    INSERT INTO generation_tasks(
+                        worker, generation, lane, task, task_sha256, task_bytes,
+                        staged_at, frozen_at
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, NULL)
+                    """,
+                    (
+                        worker,
+                        target_generation,
+                        lane,
+                        task,
+                        digest,
+                        byte_count,
+                        staged_at,
+                    ),
+                )
+                replaced = False
+            connection.commit()
+            return {
+                "worker": worker,
+                "lane": lane,
+                "generation": target_generation,
+                "task_sha256": digest,
+                "task_bytes": byte_count,
+                "frozen": False,
+                "replayed": False,
+                "replaced": replaced,
+            }
+        except BaseException:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def _freeze_required_generation_tasks_locked(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        generation: int,
+        frozen_at: float,
+    ) -> dict[str, Any]:
+        projection = self._task_staging_projection_locked(
+            connection,
+            generation=generation,
+        )
+        if not projection["ready"]:
+            missing = ", ".join(projection["missing_workers"])
+            raise CoordinationError(
+                f"generation {generation} task staging is incomplete: {missing}"
+            )
+        changed = connection.execute(
+            """
+            UPDATE generation_tasks
+            SET frozen_at=?
+            WHERE generation=? AND frozen_at IS NULL
+            """,
+            (frozen_at, generation),
+        ).rowcount
+        expected_unfrozen = sum(
+            not bool(item["frozen"]) for item in projection["assignments"]
+        )
+        if changed != expected_unfrozen:
+            raise CoordinationError("generation task freeze lost its exact CAS")
+        return self._task_staging_projection_locked(
+            connection,
+            generation=generation,
+        )
+
+    def _copy_forward_generation_tasks_locked(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        generation: int,
+        staged_at: float,
+    ) -> None:
+        source = self._task_staging_projection_locked(
+            connection,
+            generation=generation,
+        )
+        if not source["ready"] or any(
+            not bool(item["frozen"]) for item in source["assignments"]
+        ):
+            raise CoordinationError(
+                "completed generation has no exact frozen task set to carry forward"
+            )
+        if (
+            connection.execute(
+                "SELECT 1 FROM generation_tasks WHERE generation=?",
+                (generation + 1,),
+            ).fetchone()
+            is not None
+        ):
+            raise CoordinationError(
+                "automatic generation advance found conflicting future tasks"
+            )
+        for worker, lane in self._required_task_workers():
+            row = connection.execute(
+                """
+                SELECT * FROM generation_tasks
+                WHERE worker=? AND generation=?
+                """,
+                (worker, generation),
+            ).fetchone()
+            if row is None:
+                raise CoordinationError(
+                    "completed generation task disappeared during carry-forward"
+                )
+            connection.execute(
+                """
+                INSERT INTO generation_tasks(
+                    worker, generation, lane, task, task_sha256, task_bytes,
+                    staged_at, frozen_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, NULL)
+                """,
+                (
+                    worker,
+                    generation + 1,
+                    lane,
+                    row["task"],
+                    row["task_sha256"],
+                    row["task_bytes"],
+                    staged_at,
+                ),
+            )
 
     def _canonical_paid_slot(
         self,
@@ -823,6 +1496,7 @@ class CoordinationStore:
             row["lane"]
         ) != self._worker_lane(worker):
             raise CoordinationError("paid slot is not in the current canonical phase")
+        self._validate_slot_task_binding_locked(connection, row)
         return row
 
     def _terminal_reconciliation_slot(
@@ -1500,6 +2174,7 @@ class CoordinationStore:
 
         if slot["state"] != "prepared":
             raise CoordinationError("only a prepared slot is expiry-terminalizable")
+        self._validate_slot_task_binding_locked(connection, slot)
         changed = connection.execute(
             """
             UPDATE round_slots
@@ -1524,7 +2199,14 @@ class CoordinationStore:
             observed_at=observed_at,
         )
 
-    def _admission(self, row: sqlite3.Row, *, resumed: bool) -> Admission:
+    def _admission(
+        self,
+        connection: sqlite3.Connection,
+        row: sqlite3.Row,
+        *,
+        resumed: bool,
+    ) -> Admission:
+        self._validate_slot_task_binding_locked(connection, row)
         expected_directive = coordination_directive(
             lane=str(row["lane"]),
             generation=int(row["generation"]),
@@ -1547,6 +2229,9 @@ class CoordinationStore:
             generation=int(row["generation"]),
             phase=str(row["phase"]),
             directive=str(row["directive"]),
+            task=str(row["task"]),
+            task_sha256=str(row["task_sha256"]),
+            task_bytes=int(row["task_bytes"]),
             prompt=str(row["prompt"]) if row["prompt"] is not None else None,
             prompt_sha256=(
                 str(row["prompt_sha256"]) if row["prompt_sha256"] is not None else None
@@ -1571,6 +2256,8 @@ class CoordinationStore:
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
+            if now is None:
+                observed_at = time.time()
             project = self._state(connection)
             generation = int(project["generation"])
             phase = str(project["phase"])
@@ -1602,8 +2289,9 @@ class CoordinationStore:
                     phase=str(existing["phase"]),
                     now=observed_at,
                 )
+                admission = self._admission(connection, existing, resumed=True)
                 connection.commit()
-                return self._admission(existing, resumed=True)
+                return admission
 
             candidate_overlay = self._active_candidate(connection)
             review = self._active_review(connection)
@@ -1671,6 +2359,36 @@ class CoordinationStore:
             designated_root_entry_id = (
                 str(slot_review["root_entry_id"]) if slot_review is not None else None
             )
+            task_assignment = connection.execute(
+                """
+                SELECT * FROM generation_tasks
+                WHERE worker=? AND generation=?
+                """,
+                (worker, generation),
+            ).fetchone()
+            if task_assignment is None:
+                raise CoordinationError(
+                    "current generation has no durable task assignment for worker"
+                )
+            task_digest, task_bytes = self._validate_generation_task_row(
+                task_assignment
+            )
+            if task_assignment["lane"] != lane:
+                raise CoordinationError(
+                    "current generation task lane conflicts with admission"
+                )
+            if task_assignment["frozen_at"] is None:
+                frozen = connection.execute(
+                    """
+                    UPDATE generation_tasks SET frozen_at=?
+                    WHERE worker=? AND generation=? AND frozen_at IS NULL
+                    """,
+                    (observed_at, worker, generation),
+                ).rowcount
+                if frozen != 1:
+                    raise CoordinationError(
+                        "generation task admission freeze lost its CAS"
+                    )
             directive = coordination_directive(
                 lane=lane,
                 generation=generation,
@@ -1683,11 +2401,13 @@ class CoordinationStore:
                 """
                 INSERT INTO round_slots(
                     slot_id, worker, lane, generation, phase, state, directive,
+                    task, task_sha256, task_bytes, prompt_task_sha256,
+                    legacy_task_binding,
                     prompt, prompt_sha256, created_at, activated_at,
                     terminal_at, outcome, review_id, designated_root_entry_id
                 ) VALUES(
-                    ?, ?, ?, ?, ?, 'prepared', ?, NULL, NULL, ?, NULL, NULL,
-                    NULL, ?, ?
+                    ?, ?, ?, ?, ?, 'prepared', ?, ?, ?, ?, NULL, 0,
+                    NULL, NULL, ?, NULL, NULL, NULL, ?, ?
                 )
                 """,
                 (
@@ -1697,6 +2417,9 @@ class CoordinationStore:
                     generation,
                     phase,
                     directive,
+                    task_assignment["task"],
+                    task_digest,
+                    task_bytes,
                     observed_at,
                     review_id,
                     designated_root_entry_id,
@@ -1731,10 +2454,11 @@ class CoordinationStore:
                 """,
                 (slot_id,),
             ).fetchone()
-            connection.commit()
             if row is None:
                 raise CoordinationError("admitted round slot disappeared")
-            return self._admission(row, resumed=False)
+            result = self._admission(connection, row, resumed=False)
+            connection.commit()
+            return result
         except BaseException:
             if connection.in_transaction:
                 connection.rollback()
@@ -1760,13 +2484,23 @@ class CoordinationStore:
             ).fetchone()
             if row is None or row["state"] not in {"prepared", "active", "ambiguous"}:
                 raise CoordinationError("round slot is not prompt-pinnable")
+            self._validate_slot_task_binding_locked(connection, row)
+            prompt_lines = set(prompt.splitlines())
+            if any(
+                marker not in prompt_lines
+                for marker in self._prompt_binding_markers(row)
+            ):
+                raise CoordinationError(
+                    "pinned prompt does not bind exact slot/generation/task identity"
+                )
             if row["prompt"] is None:
                 connection.execute(
                     """
-                    UPDATE round_slots SET prompt=?, prompt_sha256=?
+                    UPDATE round_slots
+                    SET prompt=?, prompt_sha256=?, prompt_task_sha256=?
                     WHERE slot_id=? AND prompt IS NULL
                     """,
-                    (prompt, digest, slot_id),
+                    (prompt, digest, row["task_sha256"], slot_id),
                 )
             elif row["prompt"] != prompt or row["prompt_sha256"] != digest:
                 # Existing pins are immutable. Return them rather than allowing
@@ -1781,10 +2515,15 @@ class CoordinationStore:
                 """,
                 (slot_id,),
             ).fetchone()
-            connection.commit()
             if joined is None:
                 raise CoordinationError("round slot disappeared while pinning prompt")
-            return self._admission(joined, resumed=row["prompt"] is not None)
+            result = self._admission(
+                connection,
+                joined,
+                resumed=row["prompt"] is not None,
+            )
+            connection.commit()
+            return result
         except BaseException:
             if connection.in_transaction:
                 connection.rollback()
@@ -1805,6 +2544,7 @@ class CoordinationStore:
             ).fetchone()
             if row is None or row["state"] not in {"prepared", "active", "ambiguous"}:
                 raise CoordinationError("round slot is not activatable")
+            self._validate_slot_task_binding_locked(connection, row)
             if row["prompt"] is None or row["prompt_sha256"] is None:
                 raise CoordinationError("round slot has no pinned prompt")
             if row["state"] == "prepared":
@@ -1835,10 +2575,15 @@ class CoordinationStore:
                 """,
                 (slot_id,),
             ).fetchone()
-            connection.commit()
             if joined is None:
                 raise CoordinationError("round slot disappeared during activation")
-            return self._admission(joined, resumed=row["state"] != "prepared")
+            result = self._admission(
+                connection,
+                joined,
+                resumed=row["state"] != "prepared",
+            )
+            connection.commit()
+            return result
         except BaseException:
             if connection.in_transaction:
                 connection.rollback()
@@ -1860,6 +2605,7 @@ class CoordinationStore:
                 "ambiguous",
             }:
                 raise CoordinationError("round slot is not ambiguity-preservable")
+            self._validate_slot_task_binding_locked(connection, slot)
             changed = connection.execute(
                 """
                 UPDATE round_slots SET state='ambiguous'
@@ -1961,6 +2707,11 @@ class CoordinationStore:
                 raise CoordinationError(
                     "unconfirmed critic review terminal transition lost its CAS"
                 )
+        self._copy_forward_generation_tasks_locked(
+            connection,
+            generation=generation,
+            staged_at=observed_at,
+        )
         changed = connection.execute(
             """
             UPDATE project_state
@@ -2002,6 +2753,7 @@ class CoordinationStore:
             ).fetchone()
             if slot is None:
                 raise CoordinationError("round slot does not exist")
+            self._validate_slot_task_binding_locked(connection, slot)
             if slot["state"] == "terminal":
                 if slot["outcome"] != outcome:
                     raise CoordinationError("round terminal outcome conflicts")
@@ -2220,8 +2972,22 @@ class CoordinationStore:
                     recommendation_ready = True
                 except CoordinationError:
                     recommendation_ready = False
+            task_staging_generation = (
+                int(project["generation"]) + 1
+                if project["phase"] == OWNER_ACTION_REQUIRED_PHASE
+                else int(project["generation"])
+            )
+            task_staging = self._task_staging_projection_locked(
+                connection,
+                generation=task_staging_generation,
+            )
             fail_stop_reason = None
-            if project["phase"] == OWNER_ACTION_REQUIRED_PHASE:
+            if (
+                project["phase"] == OWNER_ACTION_REQUIRED_PHASE
+                and not task_staging["ready"]
+            ):
+                fail_stop_reason = "durable_task_assignment_required"
+            elif project["phase"] == OWNER_ACTION_REQUIRED_PHASE:
                 fail_stop_reason = "owner_recommendation_resolution_required"
             elif phase_deadline_exceeded:
                 fail_stop_reason = (
@@ -2229,6 +2995,8 @@ class CoordinationStore:
                     if paid_active
                     else "phase_deadline_exceeded_no_new_paid_admission"
                 )
+            elif not task_staging["ready"]:
+                fail_stop_reason = "durable_task_assignment_required"
             result: dict[str, Any] = {
                 "mode": project["mode"],
                 "generation": int(project["generation"]),
@@ -2248,6 +3016,7 @@ class CoordinationStore:
                 "recommendation": recommendation,
                 "resolution": resolution,
                 "candidate": candidate,
+                "task_staging": task_staging,
             }
             if worker is not None:
                 lane = self._worker_lane(worker)
@@ -2495,6 +3264,8 @@ class CoordinationStore:
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
+            if now is None:
+                resolved_at = time.time()
             prior = connection.execute(
                 "SELECT * FROM recommendation_resolutions WHERE recommendation_id=?",
                 (recommendation_id,),
@@ -2578,6 +3349,11 @@ class CoordinationStore:
                     "legacy recommendation has an inconsistent active review pointer"
                 )
 
+            self._freeze_required_generation_tasks_locked(
+                connection,
+                generation=generation + 1,
+                frozen_at=resolved_at,
+            )
             connection.execute(
                 """
                 INSERT INTO recommendation_resolutions(

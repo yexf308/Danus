@@ -106,9 +106,7 @@ def test_consult_provenance_schema1_shape_is_unchanged():
         ("checkpoint_sha256", "a" * 64),
         ("checkpoint_bytes", 1),
     ):
-        _reject_consult_provenance(
-            {**browser, checkpoint_field: checkpoint_value}
-        )
+        _reject_consult_provenance({**browser, checkpoint_field: checkpoint_value})
 
 
 def test_consult_provenance_schema2_exact_checkpoint_projection():
@@ -155,13 +153,9 @@ def test_consult_provenance_schema2_validates_checkpoint_identity_and_size():
     for invalid_id in ("9" * 15, "9" * 17, "A" * 16, "g" * 16, None, 9):
         _reject_consult_provenance({**schema2, "checkpoint_id": invalid_id})
     for invalid_sha256 in ("a" * 63, "a" * 65, "A" * 64, "g" * 64, None, 1):
-        _reject_consult_provenance(
-            {**schema2, "checkpoint_sha256": invalid_sha256}
-        )
+        _reject_consult_provenance({**schema2, "checkpoint_sha256": invalid_sha256})
     for invalid_bytes in (0, -1, 32 * 1024 + 1, True, 1.0, None):
-        _reject_consult_provenance(
-            {**schema2, "checkpoint_bytes": invalid_bytes}
-        )
+        _reject_consult_provenance({**schema2, "checkpoint_bytes": invalid_bytes})
 
 
 def test_local_memory_edge_cases():
@@ -271,9 +265,7 @@ def test_global_memory_strict_reader_bounds_before_decode_or_json_parse(
     gm = GlobalMemory(tmp_path / "project")
     path = gm._path("advisor_checkpoint")
     path.parent.mkdir(parents=True)
-    path.write_bytes(
-        b"{" + b"x" * _global_memory.GM_IMMUTABLE_MAX_PHYSICAL_LINE_BYTES
-    )
+    path.write_bytes(b"{" + b"x" * _global_memory.GM_IMMUTABLE_MAX_PHYSICAL_LINE_BYTES)
     calls = {"loads": 0}
 
     def forbidden_loads(_value):
@@ -343,11 +335,7 @@ def test_checkpoint_scoped_immutable_lookup_is_bounded_and_channel_local(
         b'{"id":"0000000000000000","value":1e999}\n',
         b'{"id":"0000000000000000","id":"2222222222222222"}\n',
         b'{"id":"0000000000000000","nested":{"x":1,"x":2}}\n',
-        (
-            b'{"id":"0000000000000000","padding":"'
-            + b"z" * (32 * 1024)
-            + b'"}\n'
-        ),
+        (b'{"id":"0000000000000000","padding":"' + b"z" * (32 * 1024) + b'"}\n'),
     ],
 )
 def test_checkpoint_scoped_lookup_rejects_nonmatching_noncanonical_rows(
@@ -2915,6 +2903,35 @@ def test_project_glossary_cannot_change_global_semantics():
             assert False, "project glossary must not shadow a global definition"
         except ValueError as exc:
             assert "glossary_conflict" in str(exc)
+
+
+def test_glossary_conflict_preflight_is_a_read_only_snapshot():
+    with tempfile.TemporaryDirectory() as d:
+        fg = FactGraph(Path(d) / "glossary-preflight")
+        fg.add(
+            problem_id="P",
+            author="w",
+            statement="Q_X is fixed",
+            proof="definition proof",
+            glossary_introduces={"Q_X": "the established project object"},
+        )
+
+        def graph_bytes() -> dict[str, bytes]:
+            return {
+                str(path.relative_to(fg.dir)): path.read_bytes()
+                for path in sorted(fg.dir.rglob("*"))
+                if path.is_file()
+            }
+
+        before = graph_bytes()
+        assert fg.glossary_conflicts(
+            {
+                "Q_X": "a conflicting project object",
+                "Q_Y": "a new compatible project object",
+            }
+        ) == ["Q_X"]
+        assert fg.glossary_conflicts({"Q_X": "the established project object"}) == []
+        assert graph_bytes() == before
 
 
 def test_factgraph_mutation_lock_serializes_add_and_revoke():

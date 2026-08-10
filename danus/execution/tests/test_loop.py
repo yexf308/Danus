@@ -19,6 +19,7 @@ Runs standalone (``python -m danus.execution.tests.test_loop``) and pytest.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import runpy
@@ -35,6 +36,7 @@ from pathlib import Path
 
 from danus.coordination import (
     DEFAULT_COORDINATION,
+    CoordinationError,
     CoordinationStore,
     candidate_receipt_id,
 )
@@ -96,7 +98,26 @@ def _enable_reasoning(
         "coordination": dict(DEFAULT_COORDINATION),
     }
     (wl.project_dir / "project.json").write_text(json.dumps(metadata), encoding="utf-8")
-    return CoordinationStore(wl.project_dir, metadata)
+    store = CoordinationStore(wl.project_dir, metadata)
+    status = store.project_status()
+    for worker in {status.get("root_worker"), status.get("critic_worker")}:
+        if isinstance(worker, str):
+            store.stage_task_assignment(
+                worker,
+                f"# Task\n\nPinned test assignment for {worker}.\n",
+            )
+    return store
+
+
+def _coordination_prompt(wl: L.WorkerLayout, admission) -> str:
+    return loop.kickoff(
+        wl.project,
+        admission.worker,
+        admission.directive,
+        coordination_slot_id=admission.slot_id,
+        generation=admission.generation,
+        task_sha256=admission.task_sha256,
+    )
 
 
 def _write_fake_codex(tmp: Path, body: str) -> Path:
@@ -736,11 +757,26 @@ def test_reasoning_first_root_uses_pinned_directive_and_2700_timeout(
         ),
         encoding="utf-8",
     )
+    admission = store.admit("high")
+    assert admission is not None
+    store.pin_prompt(admission.slot_id, _coordination_prompt(wl, admission))
+    wl.task.write_text("externally mutated host task\n", encoding="utf-8")
     observed = []
     evidence_ids = []
 
-    def one_round(_worker, _role, prompt, log_path, hard_timeout):
+    def one_round(
+        _worker,
+        _role,
+        prompt,
+        log_path,
+        hard_timeout,
+        *,
+        model_workspace,
+    ):
         observed.append((prompt, hard_timeout, log_path.name))
+        assert model_workspace.joinpath("TASK.md").read_text(encoding="utf-8") == (
+            "# Task\n\nPinned test assignment for high.\n"
+        )
         provenance = store.paid_slot_provenance("high")
         assert provenance is not None
         evidence_ids.append(
@@ -797,6 +833,10 @@ def test_reasoning_first_unset_transport_defaults_to_app_server(
 ):
     wl = _mk_worker(tmp)
     store = _enable_reasoning(wl, roles="high:1", workers=["high"])
+    admission = store.admit("high")
+    assert admission is not None
+    store.pin_prompt(admission.slot_id, _coordination_prompt(wl, admission))
+    wl.task.write_text("externally mutated host task\n", encoding="utf-8")
     calls = []
 
     class FakeHotJoinStore:
@@ -814,9 +854,15 @@ def test_reasoning_first_unset_transport_defaults_to_app_server(
         hard_timeout,
         *,
         coordination_provenance,
+        task_snapshot,
+        task_sha256,
+        task_bytes,
     ):
         calls.append((prompt, hard_timeout))
         assert coordination_provenance["lane"] == "root"
+        assert task_snapshot == "# Task\n\nPinned test assignment for high.\n"
+        assert hashlib.sha256(task_snapshot.encode()).hexdigest() == task_sha256
+        assert len(task_snapshot.encode()) == task_bytes
         log_path.write_text("app-server terminal\n", encoding="utf-8")
         return 0
 
@@ -866,7 +912,7 @@ def test_terminal_hotjoin_receipt_reconciles_before_attempt_or_transport(
     store = _enable_reasoning(wl, roles="high:1", workers=["high"])
     admission = store.admit("high")
     assert admission is not None
-    prompt = loop.kickoff(wl.project, "high", admission.directive)
+    prompt = _coordination_prompt(wl, admission)
     admission = store.pin_prompt(admission.slot_id, prompt)
     admission = store.activate(admission.slot_id)
 
@@ -968,7 +1014,7 @@ def test_critic_review_terminal_receipt_retires_thread_and_never_needs_redispatc
     critic = store.admit("high2")
     assert root is not None and critic is not None
     for admission in (root, critic):
-        store.pin_prompt(admission.slot_id, admission.directive)
+        store.pin_prompt(admission.slot_id, _coordination_prompt(wl, admission))
         store.activate(admission.slot_id)
     store.record_root_evidence(
         "high",
@@ -982,7 +1028,7 @@ def test_critic_review_terminal_receipt_retires_thread_and_never_needs_redispatc
     assert review is not None
     review = store.pin_prompt(
         review.slot_id,
-        loop.kickoff(wl.project, "high2", review.directive),
+        _coordination_prompt(wl, review),
     )
     review = store.activate(review.slot_id)
 
@@ -1055,7 +1101,7 @@ def test_concurrent_terminal_receipt_restarts_are_idempotent(tmp: Path):
     assert admission is not None
     admission = store.pin_prompt(
         admission.slot_id,
-        loop.kickoff(wl.project, "high", admission.directive),
+        _coordination_prompt(wl, admission),
     )
     admission = store.activate(admission.slot_id)
 
@@ -1162,7 +1208,7 @@ def test_operator_terminal_receipt_never_redispatches_coordination_slot(
     assert admission is not None
     admission = store.pin_prompt(
         admission.slot_id,
-        loop.kickoff(wl.project, "high", admission.directive),
+        _coordination_prompt(wl, admission),
     )
     admission = store.activate(admission.slot_id)
 
@@ -1238,7 +1284,7 @@ def test_reasoning_first_exec_restart_never_redispatches_unknown_paid_slot(
     store = _enable_reasoning(wl, roles="high:1", workers=["high"])
     prior = store.admit("high")
     assert prior is not None
-    store.pin_prompt(prior.slot_id, "pinned before exec crash")
+    store.pin_prompt(prior.slot_id, _coordination_prompt(wl, prior))
     store.activate(prior.slot_id)
     if ambiguous:
         store.mark_ambiguous(prior.slot_id)
@@ -1309,7 +1355,7 @@ def test_active_candidate_makes_new_lane_wait_without_paid_attempt(
     )
     root = store.admit("xhigh")
     assert root is not None
-    store.pin_prompt(root.slot_id, root.directive)
+    store.pin_prompt(root.slot_id, _coordination_prompt(critic_wl, root))
     store.activate(root.slot_id)
     receipt = candidate_receipt_id(
         slot_id=root.slot_id,
@@ -1371,10 +1417,15 @@ def test_app_server_ambiguous_restart_reuses_exact_pinned_prompt(
         hard_timeout,
         *,
         coordination_provenance,
+        task_snapshot,
+        task_sha256,
+        task_bytes,
     ):
         prompts.append(prompt)
         assert hard_timeout == 2700
         assert coordination_provenance["lane"] == "root"
+        assert hashlib.sha256(task_snapshot.encode()).hexdigest() == task_sha256
+        assert len(task_snapshot.encode()) == task_bytes
         return results.pop(0)
 
     terminal_calls = 0
@@ -1686,6 +1737,44 @@ def test_kickoff_mentions_worker_and_project():
     assert "wkrY" in p and "ProjX" in p and "TASK.md" in p
 
 
+def test_reasoning_kickoff_binds_exact_slot_generation_and_task_digest():
+    digest = hashlib.sha256(b"pinned task\n").hexdigest()
+    prompt = loop.kickoff(
+        "ProjX",
+        "wkrY",
+        "protected directive",
+        coordination_slot_id="slot_exact",
+        generation=7,
+        task_sha256=digest,
+    )
+    lines = set(prompt.splitlines())
+    assert "coordination_slot_id=slot_exact" in lines
+    assert "generation=7" in lines
+    assert f"task_sha256={digest}" in lines
+    with pytest.raises(CoordinationError, match="exact slot/generation/task"):
+        loop.kickoff(
+            "ProjX",
+            "wkrY",
+            "protected directive",
+            coordination_slot_id="slot_exact",
+        )
+
+
+def test_model_workspace_uses_supplied_slot_task_not_host_projection(tmp: Path):
+    wl = _mk_worker(tmp)
+    wl.task.write_text("externally changed host projection\n", encoding="utf-8")
+    workspace = loop._prepare_model_workspace(
+        wl,
+        task_snapshot="durably pinned slot task\n",
+    )
+    assert workspace.joinpath("TASK.md").read_text(encoding="utf-8") == (
+        "durably pinned slot task\n"
+    )
+    assert wl.task.read_text(encoding="utf-8") == (
+        "externally changed host projection\n"
+    )
+
+
 # --- __main__ entry -------------------------------------------------------- #
 
 
@@ -1908,9 +1997,7 @@ def test_weakened_runtime_attestation_fails_before_turn_start(
                     "data": [
                         {
                             "id": "release-model",
-                            "supportedReasoningEfforts": [
-                                {"reasoningEffort": "max"}
-                            ],
+                            "supportedReasoningEfforts": [{"reasoningEffort": "max"}],
                         }
                     ]
                 }
@@ -1928,7 +2015,11 @@ def test_weakened_runtime_attestation_fails_before_turn_start(
     monkeypatch.setattr(loop, "resolved_executable", lambda value: value)
     monkeypatch.setattr(loop.codex, "subprocess_env", lambda _binary: {})
     monkeypatch.setattr(loop, "preflight_app_server", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(loop, "_prepare_model_workspace", lambda _worker: wl.dir)
+    monkeypatch.setattr(
+        loop,
+        "_prepare_model_workspace",
+        lambda _worker, **_kwargs: wl.dir,
+    )
     monkeypatch.setattr(loop, "AppServerClient", FakeClient)
 
     log = wl.dir / f"attestation-{field}.log"

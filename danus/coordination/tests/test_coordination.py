@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import threading
@@ -65,7 +66,7 @@ def test_full_identity_separates_forced_short_id_collision_and_fences_overlay(
     store = CoordinationStore(project, metadata)
     root = store.admit("xhigh")
     assert root is not None
-    store.pin_prompt(root.slot_id, root.directive)
+    store.pin_prompt(root.slot_id, _bound_prompt(root))
     store.activate(root.slot_id)
     common = {
         "slot_id": root.slot_id,
@@ -138,7 +139,170 @@ def _project(
         "coordination": dict(DEFAULT_COORDINATION),
     }
     (project / "project.json").write_text(json.dumps(metadata), encoding="utf-8")
+    bootstrap = CoordinationStore(project, metadata)
+    status = bootstrap.project_status()
+    for worker in (status["root_worker"], status["critic_worker"]):
+        if worker is not None:
+            bootstrap.stage_task_assignment(
+                str(worker),
+                f"# Generation 1 assignment for {worker}\n",
+            )
     return project, metadata
+
+
+def _bound_prompt(admission, body: str | None = None) -> str:
+    content = admission.directive if body is None else body
+    return (
+        f"{content}\n\n"
+        f"coordination_slot_id={admission.slot_id}\n"
+        f"generation={admission.generation}\n"
+        f"task_sha256={admission.task_sha256}\n"
+    )
+
+
+def _stage_next_generation(store: CoordinationStore) -> dict[str, object]:
+    status = store.project_status()
+    assert status["phase"] == "owner_action_required"
+    target = int(status["generation"]) + 1
+    for worker in (status["root_worker"], status["critic_worker"]):
+        if worker is not None:
+            store.stage_task_assignment(
+                str(worker),
+                f"# Generation {target} assignment for {worker}\n",
+            )
+    return store.staged_task_assignments()
+
+
+def test_new_store_starts_task_empty_and_admission_fails_closed(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "empty-task-project"
+    project.mkdir()
+    metadata: dict[str, object] = {
+        "name": "empty-task-project",
+        "model": "model",
+        "roles": "xhigh:2",
+        "workers": ["xhigh", "xhigh2"],
+        "coordination": dict(DEFAULT_COORDINATION),
+    }
+    (project / "project.json").write_text(json.dumps(metadata), encoding="utf-8")
+    store = CoordinationStore(project, metadata)
+
+    coverage = store.staged_task_assignments()
+    assert coverage == {
+        "generation": 1,
+        "required_workers": ["xhigh", "xhigh2"],
+        "assignments": [],
+        "missing_workers": ["xhigh", "xhigh2"],
+        "ready": False,
+    }
+    assert store.project_status()["fail_stop_reason"] == (
+        "durable_task_assignment_required"
+    )
+    with pytest.raises(CoordinationError, match="no durable task assignment"):
+        store.admit("xhigh")
+
+    root_task = "# Exact root task\n"
+    staged = store.stage_task_assignment("xhigh", root_task, now=10.0)
+    assert staged["task_sha256"] == hashlib.sha256(root_task.encode()).hexdigest()
+    assert staged["task_bytes"] == len(root_task.encode())
+    assert staged["generation"] == 1
+    assert staged["frozen"] is False
+    assert root_task not in json.dumps(store.project_status())
+    with pytest.raises(CoordinationError, match="exceeds its hard limit"):
+        store.stage_task_assignment("xhigh2", "x" * 131_073)
+
+
+def test_task_stage_replace_replay_and_post_slot_freeze(
+    tmp_path: Path,
+) -> None:
+    project, metadata = _project(
+        tmp_path,
+        roles="xhigh:2",
+        workers=["xhigh", "xhigh2"],
+    )
+    store = CoordinationStore(project, metadata)
+    replacement = "# Replacement root task\n"
+    first = store.stage_task_assignment("xhigh", replacement)
+    replay = store.stage_task_assignment("xhigh", replacement)
+    assert first["replaced"] is True
+    assert replay["replayed"] is True
+    assert replay["task_sha256"] == first["task_sha256"]
+
+    root = store.admit("xhigh")
+    assert root is not None
+    assert root.task == replacement
+    assert root.task_sha256 == first["task_sha256"]
+    assert root.task_bytes == len(replacement.encode())
+    with pytest.raises(CoordinationError, match="frozen for this generation"):
+        store.stage_task_assignment("xhigh", "# Too late\n")
+    assert (
+        store.stage_task_assignment(
+            "xhigh",
+            replacement,
+        )["replayed"]
+        is True
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "generation_task",
+        "slot_task",
+        "prompt_task_digest",
+        "prompt_markers",
+        "legacy_live_slot",
+    ],
+)
+def test_generation_slot_and_prompt_task_tamper_fail_closed(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    project, metadata = _project(tmp_path, roles="xhigh:1", workers=["xhigh"])
+    store = CoordinationStore(project, metadata)
+    root = store.admit("xhigh")
+    assert root is not None
+    store.pin_prompt(root.slot_id, _bound_prompt(root))
+    with sqlite3.connect(store.path) as connection:
+        if mutation == "generation_task":
+            connection.execute(
+                """
+                UPDATE generation_tasks SET task='# Forged assignment\n'
+                WHERE worker='xhigh' AND generation=1
+                """
+            )
+        elif mutation == "slot_task":
+            connection.execute(
+                "UPDATE round_slots SET task='# Forged slot task\n' WHERE slot_id=?",
+                (root.slot_id,),
+            )
+        elif mutation == "prompt_task_digest":
+            connection.execute(
+                "UPDATE round_slots SET prompt_task_sha256=? WHERE slot_id=?",
+                ("0" * 64, root.slot_id),
+            )
+        elif mutation == "prompt_markers":
+            forged = "prompt without any durable binding markers"
+            connection.execute(
+                """
+                UPDATE round_slots SET prompt=?, prompt_sha256=?
+                WHERE slot_id=?
+                """,
+                (
+                    forged,
+                    hashlib.sha256(forged.encode()).hexdigest(),
+                    root.slot_id,
+                ),
+            )
+        else:
+            connection.execute(
+                "UPDATE round_slots SET legacy_task_binding=1 WHERE slot_id=?",
+                (root.slot_id,),
+            )
+
+    with pytest.raises(CoordinationError, match="task|prompt|legacy"):
+        CoordinationStore(project, metadata, create=False)
 
 
 def test_concurrent_admission_selects_one_root_and_one_critic(tmp_path: Path) -> None:
@@ -164,9 +328,12 @@ def test_concurrent_admission_selects_one_root_and_one_critic(tmp_path: Path) ->
     assert status["waiting_admission"] == len(workers) - 2
 
     for result in admitted:
-        pinned = store.pin_prompt(result.slot_id, f"kickoff {result.lane}")
+        pinned = store.pin_prompt(
+            result.slot_id,
+            _bound_prompt(result, f"kickoff {result.lane}"),
+        )
         active = store.activate(pinned.slot_id)
-        assert active.prompt == f"kickoff {result.lane}"
+        assert active.prompt == _bound_prompt(result, f"kickoff {result.lane}")
     assert store.project_status()["paid_active"] == 2
 
 
@@ -177,7 +344,10 @@ def test_crash_reopen_preserves_slot_prompt_and_ambiguous_identity(
     first_store = CoordinationStore(project, metadata)
     first = first_store.admit("xhigh")
     assert first is not None and first.prompt is None
-    pinned = first_store.pin_prompt(first.slot_id, "original pinned kickoff")
+    pinned = first_store.pin_prompt(
+        first.slot_id,
+        _bound_prompt(first, "original pinned kickoff"),
+    )
     first_store.activate(pinned.slot_id)
     first_store.mark_ambiguous(pinned.slot_id)
 
@@ -186,9 +356,12 @@ def test_crash_reopen_preserves_slot_prompt_and_ambiguous_identity(
     assert resumed is not None
     assert resumed.resumed is True
     assert resumed.slot_id == first.slot_id
-    assert resumed.prompt == "original pinned kickoff"
-    immutable = reopened.pin_prompt(resumed.slot_id, "changed kickoff")
-    assert immutable.prompt == "original pinned kickoff"
+    assert resumed.prompt == _bound_prompt(first, "original pinned kickoff")
+    immutable = reopened.pin_prompt(
+        resumed.slot_id,
+        _bound_prompt(resumed, "changed kickoff"),
+    )
+    assert immutable.prompt == _bound_prompt(first, "original pinned kickoff")
     assert immutable.prompt_sha256 == pinned.prompt_sha256
 
 
@@ -199,7 +372,7 @@ def test_generation_advances_only_after_both_lanes_terminal(tmp_path: Path) -> N
     critic = store.admit("xhigh2")
     assert root is not None and critic is not None
     for admission in (root, critic):
-        store.pin_prompt(admission.slot_id, admission.directive)
+        store.pin_prompt(admission.slot_id, _bound_prompt(admission))
         store.activate(admission.slot_id)
 
     after_root = store.complete(root.slot_id, outcome="terminal_rc_0")
@@ -207,8 +380,18 @@ def test_generation_advances_only_after_both_lanes_terminal(tmp_path: Path) -> N
     assert store.admit("xhigh") is None
     after_critic = store.complete(critic.slot_id, outcome="terminal_rc_0")
     assert after_critic["generation"] == 2
+    carried = store.staged_task_assignments()
+    assert carried["generation"] == 2
+    assert carried["ready"] is True
+    assert {item["task_sha256"] for item in carried["assignments"]} == {
+        root.task_sha256,
+        critic.task_sha256,
+    }
+    assert all(item["frozen"] is False for item in carried["assignments"])
     next_root = store.admit("xhigh")
     assert next_root is not None and next_root.generation == 2
+    assert next_root.task == root.task
+    assert next_root.task_sha256 == root.task_sha256
     before_replay = store.project_status("xhigh")
     replay = store.complete(root.slot_id, outcome="terminal_rc_0")
     assert replay["generation"] == 2
@@ -226,7 +409,7 @@ def test_recommendation_requires_exact_same_generation_root_critic_pair(
     critic_slot = store.admit("xhigh2")
     assert root_slot is not None and critic_slot is not None
     for admission in (root_slot, critic_slot):
-        store.pin_prompt(admission.slot_id, admission.directive)
+        store.pin_prompt(admission.slot_id, _bound_prompt(admission))
         store.activate(admission.slot_id)
     root = store.record_root_evidence(
         "xhigh",
@@ -274,7 +457,7 @@ def test_recommendation_requires_exact_same_generation_root_critic_pair(
     assert root["entry_id"] in review_slot.directive
     assert f"gm_get(entry_id={root['entry_id']})" in review_slot.directive
     assert "never substitute gm_search/BM25" in review_slot.directive
-    store.pin_prompt(review_slot.slot_id, review_slot.directive)
+    store.pin_prompt(review_slot.slot_id, _bound_prompt(review_slot))
     store.activate(review_slot.slot_id)
 
     with pytest.raises(CoordinationError, match="exact designated review slot"):
@@ -341,7 +524,7 @@ def test_terminal_reconciliation_rejects_generic_pre_name_then_reviews_exact_slo
     critic = store.admit("xhigh2")
     assert root is not None and critic is not None
     for admission in (root, critic):
-        store.pin_prompt(admission.slot_id, admission.directive)
+        store.pin_prompt(admission.slot_id, _bound_prompt(admission))
         store.activate(admission.slot_id)
 
     critic_entry = _memory_entry(
@@ -377,7 +560,7 @@ def test_terminal_reconciliation_rejects_generic_pre_name_then_reviews_exact_slo
 
     review = store.admit("xhigh2")
     assert review is not None
-    store.pin_prompt(review.slot_id, review.directive)
+    store.pin_prompt(review.slot_id, _bound_prompt(review))
     store.activate(review.slot_id)
     designated = _memory_entry(
         review,
@@ -407,7 +590,7 @@ def test_terminal_reconciliation_ignores_self_reported_or_wrong_slot_provenance(
     store = CoordinationStore(project, metadata)
     root = store.admit("xhigh")
     assert root is not None
-    store.pin_prompt(root.slot_id, root.directive)
+    store.pin_prompt(root.slot_id, _bound_prompt(root))
     store.activate(root.slot_id)
     correct = _memory_entry(
         root,
@@ -461,7 +644,7 @@ def _create_review_recommendation(
     critic = store.admit("xhigh2")
     assert root is not None and critic is not None
     for admission in (root, critic):
-        store.pin_prompt(admission.slot_id, admission.directive)
+        store.pin_prompt(admission.slot_id, _bound_prompt(admission))
         store.activate(admission.slot_id)
     evidence = store.record_root_evidence(
         "xhigh",
@@ -474,7 +657,7 @@ def _create_review_recommendation(
     assert status["phase"] == CRITIC_REVIEW_PHASE
     review = store.admit("xhigh2")
     assert review is not None
-    store.pin_prompt(review.slot_id, review.directive)
+    store.pin_prompt(review.slot_id, _bound_prompt(review))
     store.activate(review.slot_id)
     confirmation = store.confirm_root_evidence(
         "xhigh2",
@@ -496,7 +679,7 @@ def test_unconfirmed_review_terminal_advances_to_fresh_generation(
     critic = store.admit("xhigh2")
     assert root is not None and critic is not None
     for admission in (root, critic):
-        store.pin_prompt(admission.slot_id, admission.directive)
+        store.pin_prompt(admission.slot_id, _bound_prompt(admission))
         store.activate(admission.slot_id)
     evidence = store.record_root_evidence(
         "xhigh",
@@ -509,7 +692,7 @@ def test_unconfirmed_review_terminal_advances_to_fresh_generation(
     review = store.admit("xhigh2")
     assert review is not None
     assert review.designated_root_entry_id == evidence["entry_id"]
-    store.pin_prompt(review.slot_id, review.directive)
+    store.pin_prompt(review.slot_id, _bound_prompt(review))
     store.activate(review.slot_id)
 
     status = store.complete(review.slot_id, outcome="terminal_rc_0")
@@ -577,6 +760,7 @@ def test_owner_resolution_is_terminal_exact_cas_and_replay_idempotent(
             owner_acknowledgement="different_recommendation",
         )
 
+    _stage_next_generation(store)
     resolved = store.resolve_recommendation(
         recommendation_id,
         resolution="continue_without_advisor",
@@ -620,6 +804,7 @@ def test_concurrent_exact_owner_resolution_has_one_durable_result(
         complete_review=True,
     )
     recommendation_id = str(confirmation["recommendation_id"])
+    _stage_next_generation(store)
     barrier = threading.Barrier(2)
 
     def resolve() -> dict[str, object]:
@@ -638,6 +823,123 @@ def test_concurrent_exact_owner_resolution_has_one_durable_result(
             "SELECT COUNT(*) FROM recommendation_resolutions"
         ).fetchone()[0]
     assert count == 1
+    assert store.project_status()["generation"] == 2
+
+
+def test_owner_resolution_requires_complete_next_generation_tasks_and_freezes_exactly(
+    tmp_path: Path,
+) -> None:
+    project, metadata = _project(
+        tmp_path,
+        roles="xhigh:2",
+        workers=["xhigh", "xhigh2"],
+    )
+    store = CoordinationStore(project, metadata)
+    _root, _critic, _review, confirmation = _create_review_recommendation(
+        store,
+        complete_review=True,
+    )
+    recommendation_id = str(confirmation["recommendation_id"])
+
+    assert store.staged_task_assignments()["missing_workers"] == [
+        "xhigh",
+        "xhigh2",
+    ]
+    with pytest.raises(CoordinationError, match="incomplete: xhigh, xhigh2"):
+        store.resolve_recommendation(
+            recommendation_id,
+            resolution="continue_without_advisor",
+            owner_acknowledgement=recommendation_id,
+        )
+    root_task = "# Next root task\n"
+    critic_task = "# Next critic task\n"
+    store.stage_task_assignment("xhigh", root_task)
+    with pytest.raises(CoordinationError, match="incomplete: xhigh2"):
+        store.resolve_recommendation(
+            recommendation_id,
+            resolution="continue_without_advisor",
+            owner_acknowledgement=recommendation_id,
+        )
+    assert store.staged_task_assignments()["assignments"][0]["frozen"] is False
+    store.stage_task_assignment("xhigh2", critic_task)
+    resolved = store.resolve_recommendation(
+        recommendation_id,
+        resolution="continue_without_advisor",
+        owner_acknowledgement=recommendation_id,
+    )
+    assert resolved["generation"] == 1
+    coverage = store.staged_task_assignments()
+    assert coverage["generation"] == 2
+    assert coverage["ready"] is True
+    assert len(coverage["assignments"]) == 2
+    assert all(item["frozen"] is True for item in coverage["assignments"])
+    with sqlite3.connect(store.path) as connection:
+        count, frozen_count = connection.execute(
+            """
+            SELECT COUNT(*), SUM(frozen_at IS NOT NULL)
+            FROM generation_tasks WHERE generation=2
+            """
+        ).fetchone()
+    assert (count, frozen_count) == (2, 2)
+    with pytest.raises(CoordinationError, match="frozen for this generation"):
+        store.stage_task_assignment("xhigh", "# Post-resolve mutation\n")
+    assert store.stage_task_assignment("xhigh", root_task)["replayed"] is True
+    assert (
+        store.resolve_recommendation(
+            recommendation_id,
+            resolution="continue_without_advisor",
+            owner_acknowledgement=recommendation_id,
+        )
+        == resolved
+    )
+
+
+def test_stage_last_task_vs_owner_resolution_serializes_and_retry_is_exact(
+    tmp_path: Path,
+) -> None:
+    project, metadata = _project(
+        tmp_path,
+        roles="xhigh:2",
+        workers=["xhigh", "xhigh2"],
+    )
+    store = CoordinationStore(project, metadata)
+    _root, _critic, _review, confirmation = _create_review_recommendation(
+        store,
+        complete_review=True,
+    )
+    recommendation_id = str(confirmation["recommendation_id"])
+    store.stage_task_assignment("xhigh", "# Concurrent next root\n")
+    barrier = threading.Barrier(2)
+
+    def stage_last() -> str:
+        barrier.wait()
+        store.stage_task_assignment("xhigh2", "# Concurrent next critic\n")
+        return "staged"
+
+    def resolve() -> str:
+        barrier.wait()
+        try:
+            store.resolve_recommendation(
+                recommendation_id,
+                resolution="continue_without_advisor",
+                owner_acknowledgement=recommendation_id,
+            )
+        except CoordinationError as exc:
+            assert "task staging is incomplete" in str(exc)
+            return "retry_required"
+        return "resolved"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        staged_future = executor.submit(stage_last)
+        resolve_future = executor.submit(resolve)
+        outcomes = {staged_future.result(), resolve_future.result()}
+    assert "staged" in outcomes
+    resolved = store.resolve_recommendation(
+        recommendation_id,
+        resolution="continue_without_advisor",
+        owner_acknowledgement=recommendation_id,
+    )
+    assert resolved["recommendation_id"] == recommendation_id
     assert store.project_status()["generation"] == 2
 
 
@@ -681,6 +983,7 @@ def test_owner_resolution_rejects_live_candidate_overlay(tmp_path: Path) -> None
         outcome="wrong",
     )
     assert store.validate_open_recommendation(recommendation_id)["ready"] is True
+    _stage_next_generation(store)
     resolved = store.resolve_recommendation(
         recommendation_id,
         resolution="continue_without_advisor",
@@ -698,7 +1001,7 @@ def test_prepared_slot_deadline_is_known_unspent_and_replay_safe(
     deadline = store.project_status()["phase_deadline_at"]
     root = store.admit("xhigh", now=deadline - 1)
     assert root is not None
-    store.pin_prompt(root.slot_id, root.directive)
+    store.pin_prompt(root.slot_id, _bound_prompt(root))
 
     with pytest.raises(CoordinationError, match="deadline exceeded"):
         store.activate(root.slot_id, now=deadline)
@@ -722,7 +1025,7 @@ def test_expiry_vs_activate_serializes_without_ambiguous_slot(tmp_path: Path) ->
     deadline = store.project_status()["phase_deadline_at"]
     root = store.admit("xhigh", now=deadline - 2)
     assert root is not None
-    store.pin_prompt(root.slot_id, root.directive)
+    store.pin_prompt(root.slot_id, _bound_prompt(root))
     barrier = threading.Barrier(2)
 
     def activate() -> str:
@@ -760,7 +1063,7 @@ def test_expired_prepared_baseline_completes_review_phase_decision(
     critic = store.admit("xhigh2", now=deadline - 3)
     assert root is not None and critic is not None
     for admission in (root, critic):
-        store.pin_prompt(admission.slot_id, admission.directive)
+        store.pin_prompt(admission.slot_id, _bound_prompt(admission))
     store.activate(root.slot_id, now=deadline - 2)
     evidence = store.record_root_evidence(
         "xhigh",
@@ -810,7 +1113,7 @@ def test_no_critic_root_obstacle_does_not_create_unreachable_review(
     store = CoordinationStore(project, metadata)
     root = store.admit("xhigh")
     assert root is not None
-    store.pin_prompt(root.slot_id, root.directive)
+    store.pin_prompt(root.slot_id, _bound_prompt(root))
     store.activate(root.slot_id)
     evidence = store.record_root_evidence(
         "xhigh",
@@ -847,7 +1150,11 @@ def test_expired_owner_action_keeps_structural_advisor_resolution_reachable(
     assert status["advisor_reachable"] is True
     assert status["advisor_recommendation_present"] is True
     assert status["advisor_recommendation_ready"] is True
-    assert status["fail_stop_reason"] == "owner_recommendation_resolution_required"
+    assert status["fail_stop_reason"] == "durable_task_assignment_required"
+    _stage_next_generation(store)
+    assert store.project_status()["fail_stop_reason"] == (
+        "owner_recommendation_resolution_required"
+    )
     resolved = store.resolve_recommendation(
         recommendation_id,
         resolution="continue_without_advisor",
@@ -884,7 +1191,7 @@ def test_candidate_overlay_preserves_open_lanes_and_freezes_advance_until_termin
     critic = store.admit("xhigh2")
     assert root is not None and critic is not None
     for admission in (root, critic):
-        store.pin_prompt(admission.slot_id, admission.directive)
+        store.pin_prompt(admission.slot_id, _bound_prompt(admission))
         store.activate(admission.slot_id)
     receipt = candidate_receipt_id(
         slot_id=root.slot_id,
@@ -942,7 +1249,7 @@ def test_candidate_outcome_unknown_survives_reopen_without_ttl_release(
     store = CoordinationStore(project, metadata)
     root = store.admit("xhigh")
     assert root is not None
-    store.pin_prompt(root.slot_id, root.directive)
+    store.pin_prompt(root.slot_id, _bound_prompt(root))
     store.activate(root.slot_id)
     receipt = candidate_receipt_id(
         slot_id=root.slot_id,
@@ -1046,7 +1353,7 @@ def test_owner_can_acknowledge_and_abandon_active_candidate_after_process_crash(
     store = CoordinationStore(project, metadata)
     root = store.admit("xhigh")
     assert root is not None
-    store.pin_prompt(root.slot_id, root.directive)
+    store.pin_prompt(root.slot_id, _bound_prompt(root))
     store.activate(root.slot_id)
     receipt = candidate_receipt_id(
         slot_id=root.slot_id,
@@ -1092,6 +1399,188 @@ def test_owner_can_acknowledge_and_abandon_active_candidate_after_process_crash(
     assert resolved["candidate_fact_active_at_resolution"] is True
 
 
+def _remove_v7_task_schema(connection: sqlite3.Connection) -> None:
+    connection.execute("DROP TABLE generation_tasks")
+    for column in (
+        "task",
+        "task_sha256",
+        "task_bytes",
+        "prompt_task_sha256",
+        "legacy_task_binding",
+    ):
+        connection.execute(f"ALTER TABLE round_slots DROP COLUMN {column}")
+
+
+def test_schema_v6_owner_gate_migrates_legacy_terminal_slots_but_no_future_tasks(
+    tmp_path: Path,
+) -> None:
+    project, metadata = _project(
+        tmp_path,
+        roles="xhigh:2",
+        workers=["xhigh", "xhigh2"],
+    )
+    store = CoordinationStore(project, metadata)
+    _root, _critic, _review, confirmation = _create_review_recommendation(
+        store,
+        complete_review=True,
+    )
+    recommendation_id = str(confirmation["recommendation_id"])
+    with sqlite3.connect(store.path) as connection:
+        _remove_v7_task_schema(connection)
+        connection.execute(
+            "UPDATE project_state SET schema_version=6 WHERE singleton=1"
+        )
+
+    migrated = CoordinationStore(project, metadata, create=False)
+    status = migrated.project_status()
+    assert status["generation"] == 1
+    assert status["phase"] == "owner_action_required"
+    assert status["fail_stop_reason"] == "durable_task_assignment_required"
+    assert status["task_staging"]["missing_workers"] == ["xhigh", "xhigh2"]
+    with sqlite3.connect(migrated.path) as connection:
+        version = connection.execute(
+            "SELECT schema_version FROM project_state WHERE singleton=1"
+        ).fetchone()[0]
+        legacy_slots = connection.execute(
+            """
+            SELECT COUNT(*), SUM(legacy_task_binding)
+            FROM round_slots WHERE state='terminal'
+            """
+        ).fetchone()
+    assert version == 7
+    assert legacy_slots[0] == legacy_slots[1]
+
+    with pytest.raises(CoordinationError, match="incomplete: xhigh, xhigh2"):
+        migrated.resolve_recommendation(
+            recommendation_id,
+            resolution="continue_without_advisor",
+            owner_acknowledgement=recommendation_id,
+        )
+    migrated.stage_task_assignment("xhigh", "# Migrated next root\n")
+    with pytest.raises(CoordinationError, match="incomplete: xhigh2"):
+        migrated.resolve_recommendation(
+            recommendation_id,
+            resolution="continue_without_advisor",
+            owner_acknowledgement=recommendation_id,
+        )
+    migrated.stage_task_assignment("xhigh2", "# Migrated next critic\n")
+    resolved = migrated.resolve_recommendation(
+        recommendation_id,
+        resolution="continue_without_advisor",
+        owner_acknowledgement=recommendation_id,
+    )
+    reopened = CoordinationStore(project, metadata, create=False)
+    assert reopened.project_status()["generation"] == 2
+    assert (
+        reopened.resolve_recommendation(
+            recommendation_id,
+            resolution="continue_without_advisor",
+            owner_acknowledgement=recommendation_id,
+        )
+        == resolved
+    )
+
+
+def test_schema_v6_nonterminal_slot_task_identity_fails_atomically(
+    tmp_path: Path,
+) -> None:
+    project, metadata = _project(tmp_path, roles="xhigh:1", workers=["xhigh"])
+    store = CoordinationStore(project, metadata)
+    root = store.admit("xhigh")
+    assert root is not None and root.state == "prepared"
+    with sqlite3.connect(store.path) as connection:
+        _remove_v7_task_schema(connection)
+        connection.execute(
+            "UPDATE project_state SET schema_version=6 WHERE singleton=1"
+        )
+
+    with pytest.raises(CoordinationError, match="nonterminal paid slot"):
+        CoordinationStore(project, metadata, create=False)
+    with sqlite3.connect(store.path) as connection:
+        assert (
+            connection.execute(
+                "SELECT schema_version FROM project_state WHERE singleton=1"
+            ).fetchone()[0]
+            == 6
+        )
+        assert (
+            connection.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type='table' AND name='generation_tasks'"
+            ).fetchone()
+            is None
+        )
+        columns = {
+            str(row[1]) for row in connection.execute("PRAGMA table_info(round_slots)")
+        }
+    assert "task_sha256" not in columns
+    assert "legacy_task_binding" not in columns
+
+
+def test_schema_v6_partial_terminal_generation_fails_atomically_on_reopen(
+    tmp_path: Path,
+) -> None:
+    project, metadata = _project(
+        tmp_path,
+        roles="xhigh:2",
+        workers=["xhigh", "xhigh2"],
+    )
+    store = CoordinationStore(project, metadata)
+    root = store.admit("xhigh")
+    assert root is not None
+    store.pin_prompt(root.slot_id, _bound_prompt(root))
+    store.activate(root.slot_id)
+    status = store.complete(root.slot_id, outcome="terminal_rc_0")
+    assert status["generation"] == 1
+    assert status["phase"] == "root_critic_reasoning"
+    assert store.admit("xhigh") is None
+
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute(
+            """
+            SELECT lane, state FROM round_slots
+            WHERE generation=1 ORDER BY lane
+            """
+        ).fetchall() == [("root", "terminal")]
+        _remove_v7_task_schema(connection)
+        connection.execute(
+            "UPDATE project_state SET schema_version=6 WHERE singleton=1"
+        )
+
+    for _attempt in range(2):
+        with pytest.raises(
+            CoordinationError,
+            match="current-generation paid slot history.*cannot be safely migrated",
+        ):
+            CoordinationStore(project, metadata, create=False)
+        with sqlite3.connect(store.path) as connection:
+            assert (
+                connection.execute(
+                    "SELECT schema_version FROM project_state WHERE singleton=1"
+                ).fetchone()[0]
+                == 6
+            )
+            assert connection.execute(
+                """
+                SELECT lane, state FROM round_slots
+                WHERE generation=1 ORDER BY lane
+                """
+            ).fetchall() == [("root", "terminal")]
+            assert (
+                connection.execute(
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE type='table' AND name='generation_tasks'"
+                ).fetchone()
+                is None
+            )
+            columns = {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(round_slots)")
+            }
+        assert "task_sha256" not in columns
+        assert "legacy_task_binding" not in columns
+
+
 def test_schema_v4_without_overlay_migrates_full_identity_column(
     tmp_path: Path,
 ) -> None:
@@ -1099,6 +1588,7 @@ def test_schema_v4_without_overlay_migrates_full_identity_column(
     CoordinationStore(project, metadata)
     database = project / ".coordination" / "state.sqlite3"
     with sqlite3.connect(database) as connection:
+        _remove_v7_task_schema(connection)
         connection.execute("ALTER TABLE candidates DROP COLUMN candidate_fact_identity")
         connection.execute(
             "UPDATE project_state SET schema_version=4 WHERE singleton=1"
@@ -1113,7 +1603,7 @@ def test_schema_v4_without_overlay_migrates_full_identity_column(
             str(row[1])
             for row in connection.execute("PRAGMA table_info(candidates)").fetchall()
         }
-    assert version == 6
+    assert version == 7
     assert "candidate_fact_identity" in columns
 
 
@@ -1124,7 +1614,7 @@ def test_schema_v4_active_overlay_without_full_identity_fails_closed(
     store = CoordinationStore(project, metadata)
     root = store.admit("xhigh")
     assert root is not None
-    store.pin_prompt(root.slot_id, root.directive)
+    store.pin_prompt(root.slot_id, _bound_prompt(root))
     store.activate(root.slot_id)
     receipt = candidate_receipt_id(
         slot_id=root.slot_id,
@@ -1144,6 +1634,7 @@ def test_schema_v4_active_overlay_without_full_identity_fails_closed(
     )
     database = project / ".coordination" / "state.sqlite3"
     with sqlite3.connect(database) as connection:
+        _remove_v7_task_schema(connection)
         connection.execute("ALTER TABLE candidates DROP COLUMN candidate_fact_identity")
         connection.execute(
             "UPDATE project_state SET schema_version=4 WHERE singleton=1"
@@ -1153,7 +1644,7 @@ def test_schema_v4_active_overlay_without_full_identity_fails_closed(
         CoordinationStore(project, metadata, create=False)
 
 
-def test_schema_v5_single_root_obstacle_migrates_to_pending_exact_review(
+def test_schema_v5_nonterminal_slot_fails_closed_before_task_migration(
     tmp_path: Path,
 ) -> None:
     project, metadata = _project(tmp_path, roles="xhigh:2", workers=["xhigh", "xhigh2"])
@@ -1161,7 +1652,7 @@ def test_schema_v5_single_root_obstacle_migrates_to_pending_exact_review(
     root = store.admit("xhigh")
     critic = store.admit("xhigh2")
     assert root is not None and critic is not None
-    store.pin_prompt(root.slot_id, root.directive)
+    store.pin_prompt(root.slot_id, _bound_prompt(root))
     store.activate(root.slot_id)
     evidence = store.record_root_evidence(
         "xhigh",
@@ -1170,22 +1661,25 @@ def test_schema_v5_single_root_obstacle_migrates_to_pending_exact_review(
         slot_id=root.slot_id,
     )
     with sqlite3.connect(store.path) as connection:
+        _remove_v7_task_schema(connection)
         connection.execute(
             "UPDATE project_state SET schema_version=5, active_review_id=NULL "
             "WHERE singleton=1"
         )
         connection.execute("DELETE FROM obstacle_reviews")
 
-    reopened = CoordinationStore(project, metadata, create=False)
-    status = reopened.project_status()
-    assert status["review"] is not None
-    assert status["review"]["state"] == "pending"
-    assert status["review"]["root_entry_id"] == evidence["entry_id"]
+    with pytest.raises(CoordinationError, match="nonterminal paid slot"):
+        CoordinationStore(project, metadata, create=False)
     with sqlite3.connect(store.path) as connection:
         version = connection.execute(
             "SELECT schema_version FROM project_state WHERE singleton=1"
         ).fetchone()[0]
-    assert version == 6
+        task_table = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='generation_tasks'"
+        ).fetchone()
+    assert evidence["entry_id"] == "legacy_v5_obstacle"
+    assert version == 5
+    assert task_table is None
 
 
 def test_schema_v5_multiple_root_obstacles_fail_closed_as_ambiguous(
@@ -1195,7 +1689,7 @@ def test_schema_v5_multiple_root_obstacles_fail_closed_as_ambiguous(
     store = CoordinationStore(project, metadata)
     root = store.admit("xhigh")
     assert root is not None
-    store.pin_prompt(root.slot_id, root.directive)
+    store.pin_prompt(root.slot_id, _bound_prompt(root))
     store.activate(root.slot_id)
     store.record_root_evidence(
         "xhigh",
@@ -1204,6 +1698,7 @@ def test_schema_v5_multiple_root_obstacles_fail_closed_as_ambiguous(
         slot_id=root.slot_id,
     )
     with sqlite3.connect(store.path) as connection:
+        _remove_v7_task_schema(connection)
         connection.execute(
             "UPDATE project_state SET schema_version=5, active_review_id=NULL "
             "WHERE singleton=1"
@@ -1292,6 +1787,7 @@ def test_owner_resolution_mid_transaction_failure_rolls_back_and_exact_retry_rep
     recommendation_id = str(confirmation["recommendation_id"])
     before = store.project_status()
     assert before["advisor_recommendation_ready"] is True
+    _stage_next_generation(store)
 
     with sqlite3.connect(store.path) as connection:
         connection.execute(
@@ -1336,6 +1832,15 @@ def test_owner_resolution_mid_transaction_failure_rolls_back_and_exact_retry_rep
             recommendation_id,
             review.review_id,
         )
+        assert (
+            connection.execute(
+                """
+                SELECT COUNT(*) FROM generation_tasks
+                WHERE generation=2 AND frozen_at IS NOT NULL
+                """
+            ).fetchone()[0]
+            == 0
+        )
         connection.execute("DROP TRIGGER fail_owner_resolution_project_cas")
 
     resolved = store.resolve_recommendation(
@@ -1344,6 +1849,16 @@ def test_owner_resolution_mid_transaction_failure_rolls_back_and_exact_retry_rep
         owner_acknowledgement=recommendation_id,
     )
     assert resolved["resolution"] == "continue_without_advisor"
+    with sqlite3.connect(store.path) as connection:
+        assert (
+            connection.execute(
+                """
+                SELECT COUNT(*) FROM generation_tasks
+                WHERE generation=2 AND frozen_at IS NOT NULL
+                """
+            ).fetchone()[0]
+            == 2
+        )
     assert (
         CoordinationStore(project, metadata, create=False).resolve_recommendation(
             recommendation_id,
@@ -1362,12 +1877,13 @@ def test_owner_resolution_mid_transaction_failure_rolls_back_and_exact_retry_rep
 
 
 def _downgrade_ready_recommendation_database_to_real_v5(database: Path) -> None:
-    """Rebuild v6-owned tables with the actual pre-review v5 column shape."""
+    """Rebuild v7-owned tables with the actual pre-review v5 column shape."""
 
     with sqlite3.connect(database) as connection:
         connection.execute("PRAGMA foreign_keys=OFF")
         connection.executescript(
             """
+            DROP TABLE generation_tasks;
             ALTER TABLE project_state RENAME TO project_state_v6;
             CREATE TABLE project_state (
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -1496,7 +2012,7 @@ def _real_v5_open_recommendation(
     )
 
 
-def test_real_v5_open_recommendation_migrates_to_resolvable_v6_review(
+def test_real_v5_open_recommendation_migrates_to_resolvable_v7_review(
     tmp_path: Path,
 ) -> None:
     (
@@ -1519,7 +2035,7 @@ def test_real_v5_open_recommendation_migrates_to_resolvable_v6_review(
                 "PRAGMA table_info(advisor_recommendations)"
             ).fetchall()
         }
-    assert version == 6
+    assert version == 7
     assert "review_id" in columns
     ready = migrated.validate_open_recommendation(recommendation_id)
     assert ready["ready"] is True
@@ -1533,6 +2049,7 @@ def test_real_v5_open_recommendation_migrates_to_resolvable_v6_review(
             == 1
         )
 
+    _stage_next_generation(second_open)
     resolved = second_open.resolve_recommendation(
         recommendation_id,
         resolution="continue_without_advisor",

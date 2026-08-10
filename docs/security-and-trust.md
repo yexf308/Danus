@@ -71,22 +71,26 @@ Load-bearing separations:
 The single path a fact enters truth is a worker's `fact_submit`, which is a
 state machine, not a suggestion:
 
-1. load the complete transitive ancestor statement/edge/fact-local-definition
+1. take a read-only, linearizable glossary snapshot and reject any already-known
+   project/global definition conflict before candidate admission or paid
+   verification; a malformed glossary also fails closed at this boundary;
+2. load the complete transitive ancestor statement/edge/fact-local-definition
    closure and selected immutable definitions, with no ancestor proof in round
    zero, and block missing, revoked, incomplete, or over-budget context;
-2. call the verify service with the statement, proof, and complete authoritative
+3. call the verify service with the statement, proof, and complete authoritative
    fact context; both context and returned verdict are checked by deterministic
    schemas, not only prompts, and the service must attest the context digest;
-3. if the verifier needs exact ancestor proofs, allow only strict closure ids and
+4. if the verifier needs exact ancestor proofs, allow only strict closure ids and
    hydrate their whole canonical records within bounded fresh-session rounds;
    Graphify/discovery never participates in completeness, hydration, digest, or
    judgment;
-4. after final verification, rebuild the exact expansion snapshot under the graph's
+5. after final verification, rebuild the exact expansion snapshot under the graph's
    cross-process mutation lock;
-5. only after a `final/correct` verdict and unchanged locked snapshot, attempt the fact
-   add; revoke uses the same lock, closing add/revoke races, while storage errors
-   remain explicit verified-but-not-promoted outcomes;
-6. durably attempt to trace every adaptive round and the final verdict to global memory (accept, reject,
+6. only after a `final/correct` verdict and unchanged locked snapshot, repeat the
+   glossary conflict check and attempt the fact add; revoke and concurrent
+   definitions use the same mutation lock, while storage errors remain explicit
+   verified-but-not-promoted outcomes;
+7. durably attempt to trace every adaptive round and the final verdict to global memory (accept, reject,
    or write-failed). A trace I/O failure is returned explicitly as `trace_error`
    without hiding an already-written fact id.
 
@@ -180,10 +184,15 @@ a fresh Python process, an editable checkout is still not an immutable code
 deployment: production must use one pinned wheel/image and restart services to
 upgrade.
 
-The response separates mathematical acceptance from publication. The legacy
+The response separates mathematical acceptance from publication. A glossary
+conflict present at preflight makes zero verifier calls and returns no
+mathematical verdict; repair the definition and submit the changed identity for
+a fresh check. The read-only preflight cannot authorize a later write, so a
+definition introduced concurrently after it is still caught by the locked
+promotion CAS. The legacy
 `accepted` field means the verifier returned `correct`; the authoritative
 end-to-end signal is `promoted: true` together with a non-null `fact_id`.
-Glossary conflicts, stale context, and storage failures preserve
+Post-verification glossary races, stale context, and storage failures preserve
 `verification_verdict: "correct"` for repair diagnostics but return
 `promoted: false`, `submission_status: "verified_not_promoted"`, `fact_id: null`,
 and `write_error`. If storage cannot durably establish whether an uncertain
@@ -224,6 +233,18 @@ workspace-write root. Delivery is bound by `expectedTurnId` and a stable client
 id; an acknowledgement-lost crash is marked `delivery_unknown` and is not retried
 automatically.
 
+`danus encourage <project>/<worker> [--text ... | --file P | --stdin] [--client-id ID]`
+is the narrower morale-only channel. It requires an
+authoritatively live worker plus exactly one canonical `started` paid intent,
+snapshots that intent's thread and turn ids atomically, and always uses fail-only
+delivery. A terminal-to-next-turn race therefore records failure before any
+later-turn steer; the note is never queued and the command cannot create or
+start a paid turn. Omitted note input uses the built-in encouragement. Danus
+does not invoke this command automatically and makes no claim that encouragement
+causes a reasoning improvement. Its client-id digest commits the note, target,
+and expected thread/turn; the same key conflicts after a turn change. A lost RPC
+acknowledgement may remain `delivery_unknown`, but is never retried or queued.
+
 For this transport the actual model cwd is `<worker>/model_workspace`, not the
 worker control directory. Host PID/role/status/log files and the canonical
 SQLite lifecycle audit stay outside the declared writable roots. The requested
@@ -231,6 +252,15 @@ model and effort come from protected project metadata, not the model-writable
 `.role` projection. Codex app-server remains experimental; generated-schema and
 runtime attestations therefore fail closed rather than guessing across protocol
 versions.
+
+In reasoning-first mode, paid task authority also stays in the protected
+coordinator. `danus assign` stages the exact current- or next-generation bytes
+before refreshing the host `TASK.md`; admission copies the frozen assignment
+into the slot, binds its digest into the kickoff prompt, and materializes the
+model-workspace `TASK.md` from that slot snapshot. Neither `TASK.md` projection
+can retarget paid work after the binding. Owner recommendation resolution
+requires complete next-generation paid-lane staging and freezes it atomically;
+an advance with no owner gate carries the prior frozen set forward exactly.
 
 Reasoning telemetry is content-free and projected only from the root app-server
 thread. It is diagnostic—not proof, correctness, liveness, admission, or browser
@@ -271,7 +301,13 @@ converts that incident into a fresh paid turn: the abandoned thread stays fenced
 until a separate reset or rotation succeeds.
 The exact CAS values are public only through the read-only `status --json`
 projection `unfinished_paid_intent`; inability to read it yields a separate
-`intent_ledger_error`, never inferred state. `prepared` is authoritatively
+`intent_ledger_error`, never inferred state. While the worker is authoritatively
+live, `prepared`, `dispatching`, and `started` project as
+`paid_intent_status="in_progress"` with no `recovery_required`; live
+`delivery_unknown` is labeled `outcome_unknown_while_worker_live`, also with no
+abandon argv. Recovery is surfaced only after fail-stop (or an unsafe PID
+identity) and remains guarded by the command's lifecycle recheck. For a
+fail-stopped worker, `prepared` is authoritatively
 pre-dispatch and recommends resuming the immutable intent, not accepting an
 unknown paid outcome. If immutable configuration drift makes that resume
 impossible, the owner may instead run the exact status-provided
@@ -287,8 +323,12 @@ Owner death therefore revokes the group, and an immediate replacement cannot
 start overlapping paid work. External lifecycle commands never act on an
 inspected numeric PID/PGID; `--force` is a durable cooperative request.
 
-This input can change research direction, but cannot grant correctness or write
-authority. The ledger/transcript has no direct channel into FactGraph contexts,
+Ordinary `say` input can change research direction, but cannot grant correctness
+or write authority. Encouragement is narrower still: its envelope tells the
+worker to treat the quoted text as morale support only, never as a task,
+coordination directive, mathematical evidence, proof step, fact, verification,
+or permission to change scope. The ledger/transcript has no direct channel into
+FactGraph contexts,
 context digests, or verifier prompts. If a worker incorporates human-supplied
 mathematics into a candidate statement or proof, that candidate text is sent to
 the verifier through the normal `fact_submit` path. Direct `userMessage` protocol records are excluded from

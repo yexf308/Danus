@@ -34,6 +34,7 @@ import pytest
 from danus.coordination import CoordinationStore
 from danus.core import FactGraph, GlobalMemory
 from danus.execution import layout as L
+from danus.execution import loop as execution_loop
 from danus.gateway import server as gateway_server
 from danus.hotjoin import HotJoinStore
 from danus.orchestration import cli
@@ -146,16 +147,23 @@ def _write_pid_record(
     return record
 
 
-def _terminal_recommendation(project: str) -> tuple[CoordinationStore, str]:
+def _terminal_recommendation(
+    project: str, *, stage_next: bool = True
+) -> tuple[CoordinationStore, str]:
     project_dir = L.project_dir(project)
     store = CoordinationStore.open_existing(project_dir)
     assert store is not None
+    missing = set(store.staged_task_assignments()["missing_workers"])
+    if "xhigh" in missing:
+        cli.do_assign(f"{project}/xhigh", "# Task\n\nPinned root assignment.\n")
+    if "xhigh2" in missing:
+        cli.do_assign(f"{project}/xhigh2", "# Task\n\nPinned critic assignment.\n")
     generation = int(store.project_status()["generation"])
     root = store.admit("xhigh")
     critic = store.admit("xhigh2")
     assert root is not None and critic is not None
     for admission in (root, critic):
-        store.pin_prompt(admission.slot_id, admission.directive)
+        store.pin_prompt(admission.slot_id, _pinned_prompt(project, admission))
         store.activate(admission.slot_id)
     evidence = store.record_root_evidence(
         "xhigh",
@@ -167,7 +175,7 @@ def _terminal_recommendation(project: str) -> tuple[CoordinationStore, str]:
     store.complete(critic.slot_id, outcome="terminal_rc_0")
     review = store.admit("xhigh2")
     assert review is not None
-    store.pin_prompt(review.slot_id, review.directive)
+    store.pin_prompt(review.slot_id, _pinned_prompt(project, review))
     store.activate(review.slot_id)
     confirmation = store.confirm_root_evidence(
         "xhigh2",
@@ -178,7 +186,27 @@ def _terminal_recommendation(project: str) -> tuple[CoordinationStore, str]:
     store.complete(review.slot_id, outcome="terminal_rc_0")
     recommendation_id = confirmation["recommendation_id"]
     assert isinstance(recommendation_id, str)
+    if stage_next:
+        cli.do_assign(
+            f"{project}/xhigh",
+            "# Task\n\nFresh next-generation root assignment.\n",
+        )
+        cli.do_assign(
+            f"{project}/xhigh2",
+            "# Task\n\nFresh next-generation critic assignment.\n",
+        )
     return store, recommendation_id
+
+
+def _pinned_prompt(project: str, admission) -> str:
+    return execution_loop.kickoff(
+        project,
+        admission.worker,
+        admission.directive,
+        coordination_slot_id=admission.slot_id,
+        generation=admission.generation,
+        task_sha256=admission.task_sha256,
+    )
 
 
 def _gateway_recommendation_checkpoint(
@@ -506,6 +534,7 @@ def test_worker_status_exposes_canonical_unfinished_paid_intent_and_recovery_arg
                 "prompt_sha256": hashlib.sha256(f"prompt-{index}".encode()).hexdigest(),
             }
             assert status["intent_ledger_error"] is None
+            assert status["paid_intent_status"] == "recovery_required"
             recovery = status["recovery_required"]
             if state == "prepared":
                 assert recovery["action"] == "resume_or_cancel_prepared_intent"
@@ -554,6 +583,118 @@ def test_worker_status_exposes_canonical_unfinished_paid_intent_and_recovery_arg
         status = cli.worker_status(bad)
         assert status["unfinished_paid_intent"] is None
         assert "canonical paid-intent ledger" in status["intent_ledger_error"]
+
+
+@pytest.mark.parametrize(
+    ("intent_state", "expected_status"),
+    (
+        ("prepared", "in_progress"),
+        ("dispatching", "in_progress"),
+        ("started", "in_progress"),
+        ("delivery_unknown", "outcome_unknown_while_worker_live"),
+    ),
+)
+def test_worker_status_live_intent_is_not_actionable_recovery(
+    tmp: Path, intent_state: str, expected_status: str
+):
+    with _project_env(tmp):
+        cli.do_new("P", roles="high:1")
+        wl = _wl("P", "high")
+        store = HotJoinStore(wl.project_dir)
+        store.set_thread_id("high", "thread-live")
+        intent = store.round_intent(
+            "high",
+            "thread-live",
+            prompt_sha256=hashlib.sha256(b"live prompt").hexdigest(),
+            requested_model="offline-model",
+            requested_effort="low",
+        )
+        if intent_state != "prepared":
+            store.record_round_intent(
+                intent["client_id"], "dispatching", expected_states={"prepared"}
+            )
+        if intent_state == "started":
+            store.record_round_intent(
+                intent["client_id"],
+                "started",
+                turn_id="turn-live",
+                expected_states={"dispatching"},
+            )
+        elif intent_state == "delivery_unknown":
+            store.record_round_intent(
+                intent["client_id"],
+                "delivery_unknown",
+                expected_states={"dispatching"},
+            )
+        _write_pid_record(wl, os.getpid())
+        wl.status.write_text(
+            json.dumps(
+                {
+                    "state": "running",
+                    "round": 1,
+                    "round_started_at": time.time(),
+                    # Even a stale supervisor projection must not leak through
+                    # while the canonical intent owner is alive.
+                    "recovery_required": {"action": "abandon_intent"},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with _fake_process_identity(os.getpid()):
+            status = cli.worker_status(wl)
+
+        assert status["alive"] is True
+        assert status["paid_intent_status"] == expected_status
+        assert status["recovery_required"] is None
+        assert status["unfinished_paid_intent"]["state"] == intent_state
+
+        # Once the same worker is proven fail-stopped, the exact-CAS owner
+        # recovery becomes appropriate and preserves the canonical ledger key.
+        wl.pid.unlink()
+        stopped = cli.worker_status(wl)
+        assert stopped["paid_intent_status"] == "recovery_required"
+        expected_action = (
+            "resume_or_cancel_prepared_intent"
+            if intent_state == "prepared"
+            else "abandon_intent"
+        )
+        assert stopped["recovery_required"]["action"] == expected_action
+        assert stopped["recovery_required"]["argv"][2] == "P/high"
+
+
+def test_worker_status_pid_unsafe_does_not_claim_live_intent(tmp: Path):
+    with _project_env(tmp):
+        cli.do_new("P", roles="high:1")
+        wl = _wl("P", "high")
+        store = HotJoinStore(wl.project_dir)
+        store.set_thread_id("high", "thread-unsafe")
+        intent = store.round_intent(
+            "high",
+            "thread-unsafe",
+            prompt_sha256=hashlib.sha256(b"unsafe prompt").hexdigest(),
+            requested_model="offline-model",
+            requested_effort="low",
+        )
+        store.record_round_intent(
+            intent["client_id"], "dispatching", expected_states={"prepared"}
+        )
+        store.record_round_intent(
+            intent["client_id"],
+            "started",
+            turn_id="turn-unsafe",
+            expected_states={"dispatching"},
+        )
+        _write_pid_record(wl, os.getpid(), token="expected-birth")
+
+        with _fake_process_identity(os.getpid(), token="different-birth"):
+            status = cli.worker_status(wl)
+
+        assert status["alive"] is False
+        assert status["label"] == "pid-unsafe"
+        assert status["pid_record_error"]
+        assert status["paid_intent_status"] == "recovery_required"
+        assert status["recovery_required"]["action"] == "abandon_intent"
 
 
 def test_alive_permission_error_means_alive():
@@ -1362,7 +1503,9 @@ def test_resolve_recommendation_continue_requires_exact_owner_ack(
                 cli,
                 "load_project_metadata",
                 lambda *_args, **_kwargs: (_ for _ in ()).throw(
-                    AssertionError("missing owner acknowledgement read coordinator state")
+                    AssertionError(
+                        "missing owner acknowledgement read coordinator state"
+                    )
                 ),
             )
             failure = _expect_exit(
@@ -1398,6 +1541,87 @@ def test_resolve_recommendation_continue_requires_exact_owner_ack(
             )
             == resolved
         )
+
+
+def test_resolve_requires_complete_next_generation_tasks_and_host_drift_is_ignored(
+    tmp: Path,
+):
+    with _project_env(tmp):
+        cli.do_new("P", roles="xhigh:2")
+        store, recommendation_id = _terminal_recommendation(
+            "P",
+            stage_next=False,
+        )
+        initial = cli.do_status("P/xhigh")[0]
+        assert initial["task_staging"]["generation"] == 2
+        assert initial["task_staging"]["missing_workers"] == ["xhigh", "xhigh2"]
+        assert initial["fail_stop_reason"] == "durable_task_assignment_required"
+
+        root_assignment = cli.do_assign(
+            "P/xhigh",
+            "# Task\n\nGeneration two root route.\n",
+        )
+        assert root_assignment["generation_staged"] is True
+        assert root_assignment["task_generation"] == 2
+        assert len(root_assignment["task_sha256"]) == 64
+        partial = cli.do_status("P/xhigh")[0]
+        assert partial["task_staging"]["missing_workers"] == ["xhigh2"]
+
+        blocked = _expect_exit(
+            cli.do_resolve_recommendation,
+            "P",
+            recommendation_id,
+            resolution="continue-without-advisor",
+            acknowledge_recommendation_id=recommendation_id,
+            acknowledge_resume_paid_reasoning=True,
+            master_guidance_entry_id=None,
+        )
+        assert "generation 2 task staging is incomplete: xhigh2" in str(blocked)
+        assert store.project_status()["generation"] == 1
+
+        critic_assignment = cli.do_assign(
+            "P/xhigh2",
+            "# Task\n\nGeneration two critic route.\n",
+        )
+        assert critic_assignment["task_generation"] == 2
+        assert cli.do_status("P/xhigh")[0]["task_staging"]["ready"] is True
+
+        # TASK.md is an operator projection, not the paid source of truth.
+        _wl("P", "xhigh").task.write_text(
+            "host changed after durable stage\n",
+            encoding="utf-8",
+        )
+        _wl("P", "xhigh2").task.write_text(
+            "host critic changed after durable stage\n",
+            encoding="utf-8",
+        )
+        cli.do_resolve_recommendation(
+            "P",
+            recommendation_id,
+            resolution="continue-without-advisor",
+            acknowledge_recommendation_id=recommendation_id,
+            acknowledge_resume_paid_reasoning=True,
+            master_guidance_entry_id=None,
+        )
+        root = store.admit("xhigh")
+        critic = store.admit("xhigh2")
+        assert root is not None and critic is not None
+        assert root.generation == critic.generation == 2
+        assert root.task == "# Task\n\nGeneration two root route.\n"
+        assert critic.task == "# Task\n\nGeneration two critic route.\n"
+        assert root.task_sha256 == root_assignment["task_sha256"]
+        assert critic.task_sha256 == critic_assignment["task_sha256"]
+
+
+def test_reasoning_assign_keeps_dormant_observer_as_host_projection(tmp: Path):
+    with _project_env(tmp):
+        cli.do_new("P", roles="high:3")
+        assigned = cli.do_assign("P/high3", "observe only")
+        assert assigned["generation_staged"] is False
+        assert assigned["assignment_scope"] == "dormant_observer_projection"
+        assert _wl("P", "high3").task.read_text(encoding="utf-8") == ("observe only\n")
+        staging = cli.do_status("P/high3")[0]["task_staging"]
+        assert staging["missing_workers"] == ["high", "high2"]
 
 
 def test_checkpoint_prepare_abandon_continue_is_one_no_send_e2e(
@@ -1549,9 +1773,10 @@ def test_resolve_recommendation_adopted_guidance_binds_entry_link_and_digest(
             allow_nan=False,
         ).encode("utf-8")
         assert resolved["master_guidance_entry_id"] == entry_id
-        assert resolved["master_guidance_record_sha256"] == hashlib.sha256(
-            canonical
-        ).hexdigest()
+        assert (
+            resolved["master_guidance_record_sha256"]
+            == hashlib.sha256(canonical).hexdigest()
+        )
         assert resolved["browser_request_id"] is None
         assert store.project_status()["generation"] == 2
         memory.set_status(entry_id, "supported")
@@ -1820,10 +2045,13 @@ def test_recommendation_continue_resolution_wins_fence_before_prepare(
             outcomes.get("prepare_error"),
             browser_advisor_module.BrowserAdvisorStateError,
         )
-        assert BrowserAdvisorBroker.recommendation_request(
-            project_dir,
-            recommendation_id=recommendation_id,
-        ) is None
+        assert (
+            BrowserAdvisorBroker.recommendation_request(
+                project_dir,
+                recommendation_id=recommendation_id,
+            )
+            is None
+        )
         assert store.project_status()["generation"] == 2
 
 
@@ -1896,9 +2124,10 @@ def test_resolve_recommendation_accepts_exact_same_project_adopted_browser_recei
         )
         assert adopted["authorities"] == []
         assert adopted["consult_provenance"]["schema_version"] == 2
-        assert adopted["consult_provenance"]["checkpoint_id"] == checkpoint[
-            "checkpoint_id"
-        ]
+        assert (
+            adopted["consult_provenance"]["checkpoint_id"]
+            == checkpoint["checkpoint_id"]
+        )
         with _env(
             DANUS_PROJECT_DIR=None,
             DANUS_AUTHOR="main_agent",
@@ -1933,9 +2162,10 @@ def test_resolve_recommendation_accepts_exact_same_project_adopted_browser_recei
         )
         assert resolved["master_guidance_entry_id"] == entry_id
         stored = GlobalMemory(project_dir).get(entry_id)
-        assert stored["consult_provenance"]["checkpoint_sha256"] == checkpoint[
-            "checkpoint_sha256"
-        ]
+        assert (
+            stored["consult_provenance"]["checkpoint_sha256"]
+            == checkpoint["checkpoint_sha256"]
+        )
         assert store.project_status()["generation"] == 2
 
 
@@ -2036,9 +2266,12 @@ def test_v5_recommendation_continuation_keeps_context_and_rotates_exact_identity
                 predecessor_request_id=request1["request_id"],
                 predecessor_conversation_url=url,
             )
-        assert BrowserAdvisorBroker.recommendation_request(
-            project_dir, recommendation_id=recommendation2
-        ) is None
+        assert (
+            BrowserAdvisorBroker.recommendation_request(
+                project_dir, recommendation_id=recommendation2
+            )
+            is None
+        )
 
         request2 = broker.prepare(
             prompt2,
@@ -2055,9 +2288,7 @@ def test_v5_recommendation_continuation_keeps_context_and_rotates_exact_identity
         assert request2["checkpoint_id"] != request1["checkpoint_id"]
         assert request2["prompt_sha256"] != request1["prompt_sha256"]
         assert request2["context_id"] == request1["context_id"]
-        assert request2["lineage"]["predecessor_request_id"] == request1[
-            "request_id"
-        ]
+        assert request2["lineage"]["predecessor_request_id"] == request1["request_id"]
         assert request2["lineage"]["conversation_url_sha256"] == (
             hashlib.sha256(url.encode("utf-8")).hexdigest()
         )
@@ -2078,7 +2309,9 @@ def test_v5_recommendation_continuation_keeps_context_and_rotates_exact_identity
                 predecessor_conversation_url=url,
             )
         with broker._connect() as db:
-            assert db.execute("SELECT COUNT(*) FROM advisor_requests").fetchone()[0] == 2
+            assert (
+                db.execute("SELECT COUNT(*) FROM advisor_requests").fetchone()[0] == 2
+            )
 
 
 # --------------------------------------------------------------------------- #
@@ -2087,7 +2320,12 @@ def test_v5_recommendation_continuation_keeps_context_and_rotates_exact_identity
 
 
 def test_build_parser_all_verbs():
+    from danus import orchestration
+
+    assert orchestration.do_encourage is cli.do_encourage
     p = cli.build_parser()
+    assert "encourage" in p.format_help()
+    assert "non-authoritative morale support" in p.format_help()
     assert p.parse_args(["list", "--json"]).cmd == "list"
     a = p.parse_args(["new", "P", "--roles", "high:2", "--model", "m"])
     assert (
@@ -2129,6 +2367,14 @@ def test_build_parser_all_verbs():
     assert a.master_guidance_entry_id is None
     a = p.parse_args(["assign", "P/high", "--task", "t"])
     assert a.cmd == "assign" and a.target == "P/high" and a.task == "t"
+    a = p.parse_args(["encourage", "P/high", "--client-id", "morale-1"])
+    assert a.cmd == "encourage" and a.target == "P/high"
+    assert a.text is None and a.file is None and a.stdin is False
+    assert cli._encouragement_from_args(a) == cli.DEFAULT_ENCOURAGEMENT
+    a = p.parse_args(["encourage", "P/high", "--text", "Keep going"])
+    assert cli._encouragement_from_args(a) == "Keep going"
+    with pytest.raises(SystemExit):
+        p.parse_args(["encourage", "P/high", "--text", "one", "--file", "two"])
     a = p.parse_args(["finalize", "P", "fact_a", "fact_b"])
     assert (
         a.cmd == "finalize" and a.project == "P" and a.fact_ids == ["fact_a", "fact_b"]
@@ -2254,7 +2500,41 @@ def test_main_assign(tmp: Path):
         _run_main(["new", "P", "--roles", "high:1"])
         rc, out = _run_main(["assign", "P/high", "--task", "prove lemma 4"])
         assert rc == 0 and "assigned P/high" in out
+        assert "staged generation 1 task_sha256=" in out
         assert _wl("P", "high").task.read_text() == "prove lemma 4\n"
+
+
+def test_main_encourage_dispatch_is_fail_only_surface(monkeypatch):
+    observed = {}
+
+    def fake_encourage(target, text, *, client_id=None):
+        observed.update(target=target, text=text, client_id=client_id)
+        return {
+            "message_id": "morale-message",
+            "state": "persisted",
+            "target": "high",
+            "expected_turn_id": "turn-current",
+        }
+
+    monkeypatch.setattr(cli, "do_encourage", fake_encourage)
+    rc, out = _run_main(
+        [
+            "encourage",
+            "P/high",
+            "--text",
+            "Keep going",
+            "--client-id",
+            "morale-key",
+        ]
+    )
+
+    assert rc == 0
+    assert observed == {
+        "target": "P/high",
+        "text": "Keep going",
+        "client_id": "morale-key",
+    }
+    assert "non-authoritative encouragement for turn-current" in out
 
 
 def test_main_resolve_recommendation_dispatch(tmp: Path):
