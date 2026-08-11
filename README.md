@@ -27,6 +27,23 @@ along the way.
 
 See `ARCHITECTURE.md` for the layered design and the map of every module.
 
+## Two orchestrator options
+
+The workers and the verifier always run on **codex**. The **main agent (the
+orchestrator)** can run on either runtime — pick one:
+
+- **Claude Code — recommended (the [`main` branch](https://github.com/frenzymath/Danus/tree/main)).**
+  Best results with **Fable (`claude-fable-5`)** as the orchestrator model. Requires
+  the Claude Code CLI in addition to your codex backend.
+- **codex — for convenience (this branch, tag `v0.1.0-codex`).** The orchestrator
+  runs on codex too, so you install **nothing beyond codex** — no Claude Code. Same
+  engine, workers, and verifier; only the main-agent runtime differs (`AGENTS.md` +
+  `.codex/config.toml` + `.agents/skills/` in place of `CLAUDE.md` + `.mcp.json` +
+  `.claude/skills/`).
+
+Fable-via-Claude-Code is the recommended orchestrator; **this** fully-codex line
+exists so a codex-only setup works out of the box.
+
 ## How it works
 
 <p align="center"><img src="docs/assets/architecture.png" width="820" alt="Danus architecture: a main agent orchestrates a worker swarm; a stateless verifier gates every fact; global memory and the fact graph are the shared storage"></p>
