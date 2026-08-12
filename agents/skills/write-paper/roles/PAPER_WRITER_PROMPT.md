@@ -159,10 +159,14 @@ essentially always).
    Introduction, Preliminaries, body sections, proofs, the acknowledgement
    subsection (final `\subsection*{Acknowledgements}` inside Section 1), and the
    bibliography.
-4. **Render the math faithfully.** Every theorem/lemma/proposition/definition
-   matches its fact-graph source. Preserve every hypothesis, step, and
-   conclusion. Use `predecessors` to build internal `Theorem~\ref{thm:...}`
-   cross-references. Do not strengthen, weaken, or restate any result.
+4. **Render the math faithfully — faithfully, not verbatim.** Every
+   theorem/lemma/proposition/definition matches its fact-graph source. Preserve every
+   hypothesis, step, and conclusion. Use `predecessors` to build internal
+   `Theorem~\ref{thm:...}` cross-references. Do not strengthen, weaken, or restate any
+   result. **Faithful preservation is about the MATHEMATICS, not the text: never copy
+   a fact's `## proof` verbatim** — a fact's proof is written to pass the verifier
+   (self-quantified, mechanical, standalone), so re-express it in the paper's voice
+   and at the paper's granularity. Preserve the argument; rewrite the prose.
    **With `SELECTED_FACTS` (the curated important results):** present and PROVE
    every one. The paper must read as a SELF-CONTAINED development — a reader (and
    the whole-document verifier) sees only the paper, not the fact graph. So for a

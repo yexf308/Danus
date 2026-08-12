@@ -59,19 +59,36 @@ _ORPHAN_TEX = (
 
 
 @contextmanager
-def _fake_drive(verdict="correct", hints="", report="ok", ok=True):
+def _fake_drive(verdict="correct", hints="", report="ok", ok=True,
+                findings=None, payload=None):
     """Fake ``server._drive`` (the THIRD verifier's codex). ``ok`` False → a non-ok
-    codex run (verify_error path); else a clean run whose stdout ends with the
-    verdict JSON the paper-math verifier is contracted to emit."""
+    codex run (verify_error path); else a clean run whose stdout ends with the JSON
+    the paper-math verifier is contracted to emit.
+
+    New contract: a ``findings`` list, each classified ``class: ignorable|must-fix``.
+    - ``findings=<list>`` → emit exactly that findings list.
+    - ``payload=<dict>`` → emit that raw object verbatim (for the backward-compat
+      old-``{verdict}`` path and malformed-class tests).
+    - otherwise derive from ``verdict``: ``correct`` → empty findings; ``wrong`` → one
+      ``must-fix`` finding carrying ``hints``."""
     orig = server._drive
 
     def fake(prompt, effort=None):
         if not ok:
             return {"status": "error", "returncode": 1, "stdout": "",
                     "stderr_tail": "boom", "error": "verifier codex failed"}
-        payload = json.dumps({"verdict": verdict, "repair_hints": hints, "report": report})
+        if payload is not None:
+            obj = payload
+        elif findings is not None:
+            obj = {"findings": findings, "report": report}
+        elif verdict == "correct":
+            obj = {"findings": [], "report": report}
+        else:
+            obj = {"findings": [{"location": "whole-paper", "issue": hints,
+                                 "class": "must-fix"}], "report": report}
+        payload_json = json.dumps(obj)
         return {"status": "ok", "returncode": 0,
-                "stdout": f"(analysis of the paper …)\n{payload}\n", "stderr_tail": ""}
+                "stdout": f"(analysis of the paper …)\n{payload_json}\n", "stderr_tail": ""}
 
     server._drive = fake
     try:
@@ -251,6 +268,81 @@ def test_tool_no_paper_is_honest():
 
 def test_tool_registered_in_app():
     assert "paper_verify_math" in server._TOOLS
+
+
+# --------------------------------------------------------------------------- #
+# classified findings: ignorable never blocks, must-fix does                   #
+# --------------------------------------------------------------------------- #
+
+def test_ignorable_only_passes_and_is_surfaced():
+    with temp_project(with_ledger=True) as pdir, \
+            env(DANUS_PROJECT_DIR=str(pdir), DANUS_WRITE_PAPER_RUN_LOG="0"):
+        (pdir / "paper" / "main.tex").write_text(_MULTI_TEX, encoding="utf-8")
+        # a finding an undergraduate could fill unaided → ignorable → does NOT block;
+        # the paper passes, and the ignorable finding is surfaced (row + out dict).
+        with _fake_drive(findings=[
+            {"location": "Lem 1 proof", "issue": "the routine expansion is omitted",
+             "class": "ignorable"}]):
+            out = server.paper_verify_math()
+        assert out["status"] == "passed", out
+        assert out["deliver_ok"] is True
+        assert out["verdict"] == "correct"
+        assert out["must_fix"] == 0 and out["ignorable"] == 1
+        assert "routine expansion" in out["ignorable_findings"]
+        rows = pmv.read_ledger(Path(out["ledger_path"]))
+        assert rows["whole-paper"].status == "correct"
+        assert "routine expansion" in rows["whole-paper"].ignorable
+        assert rows["whole-paper"].repair_hints == ""  # ignorable is NOT a repair hint
+
+
+def test_must_fix_blocks_even_with_ignorable_present():
+    with temp_project(with_ledger=True) as pdir, \
+            env(DANUS_PROJECT_DIR=str(pdir), DANUS_WRITE_PAPER_RUN_LOG="0"):
+        (pdir / "paper" / "main.tex").write_text(_MULTI_TEX, encoding="utf-8")
+        with _fake_drive(findings=[
+            {"location": "Thm 2 proof", "issue": "a routine sign check",
+             "class": "ignorable"},
+            {"location": "Thm 2 proof step 3", "issue": "load-bearing bound with no derivation",
+             "class": "must-fix"}]):
+            out = server.paper_verify_math()
+        assert out["status"] == "blocked", out
+        assert out["deliver_ok"] is False
+        assert out["must_fix"] == 1 and out["ignorable"] == 1
+        rows = pmv.read_ledger(Path(out["ledger_path"]))
+        assert rows["whole-paper"].status == "wrong"
+        assert "load-bearing bound" in rows["whole-paper"].repair_hints
+        assert "routine sign check" in rows["whole-paper"].ignorable
+
+
+def test_unknown_or_missing_class_defaults_to_must_fix():
+    with temp_project(with_ledger=True) as pdir, \
+            env(DANUS_PROJECT_DIR=str(pdir), DANUS_WRITE_PAPER_RUN_LOG="0"):
+        (pdir / "paper" / "main.tex").write_text(_MULTI_TEX, encoding="utf-8")
+        # a finding with no class (or a bogus one) is never silently downgraded.
+        with _fake_drive(findings=[
+            {"location": "Prop 4", "issue": "unclear step"},                 # missing class
+            {"location": "Prop 5", "issue": "??", "class": "meh"}]):         # bogus class
+            out = server.paper_verify_math()
+        assert out["status"] == "blocked", out
+        assert out["must_fix"] == 2 and out["ignorable"] == 0
+        assert out["deliver_ok"] is False
+
+
+def test_backward_compat_old_verdict_schema():
+    with temp_project(with_ledger=True) as pdir, \
+            env(DANUS_PROJECT_DIR=str(pdir), DANUS_WRITE_PAPER_RUN_LOG="0"):
+        (pdir / "paper" / "main.tex").write_text(_MULTI_TEX, encoding="utf-8")
+        # a legacy verifier still emitting {verdict, repair_hints} keeps working.
+        with _fake_drive(payload={"verdict": "wrong",
+                                  "repair_hints": "legacy gap here", "report": "r"}):
+            out = server.paper_verify_math()
+        assert out["status"] == "blocked", out
+        assert out["deliver_ok"] is False
+        rows = pmv.read_ledger(Path(out["ledger_path"]))
+        assert "legacy gap here" in rows["whole-paper"].repair_hints
+        with _fake_drive(payload={"verdict": "correct"}):
+            out2 = server.paper_verify_math()
+        assert out2["status"] == "passed" and out2["deliver_ok"] is True
 
 
 # --------------------------------------------------------------------------- #

@@ -1573,16 +1573,44 @@ def _append_revision_log(log_path: Path, *, compile_log: Optional[str],
 # paper_verify_math — whole-paper math verification gate                      #
 # --------------------------------------------------------------------------- #
 
-def _parse_paper_verdict(stdout: str) -> Tuple[Optional[str], str]:
-    """Parse the THIRD verifier's (paper math verifier) output: the LAST JSON object
-    that carries a ``verdict`` of ``correct``/``wrong`` (the prompt tells it to end
-    with exactly that object). Returns ``(verdict, repair_hints)`` — ``verdict`` is
-    the normalized lowercase string or ``None`` when none parses; ``repair_hints`` is
-    the object's hints (empty on ``correct``, else hints or the report). Uses a
-    balanced JSON scan (``raw_decode`` from each ``{``) so repair-hint text containing
-    braces (LaTeX) does not break parsing."""
+def _render_findings(findings: List[Any]) -> str:
+    """Render a list of classified findings into a single-line human string (the
+    ledger stores one line per field, so newlines are avoided). Each finding may be a
+    dict (``location``/``issue``) or a bare string."""
+    out: List[str] = []
+    for f in findings:
+        if isinstance(f, dict):
+            loc = str(f.get("location") or "").strip()
+            iss = str(f.get("issue") or f.get("report") or f.get("hint") or "").strip()
+            out.append((loc + ": " if loc else "") + iss)
+        else:
+            out.append(str(f).strip())
+    return " | ".join(x for x in out if x)
+
+
+def _parse_paper_verdict(stdout: str) -> Tuple[Optional[str], List[Any], List[Any]]:
+    """Parse the THIRD verifier's (paper math verifier) output.
+
+    New contract: the LAST JSON object carrying a ``findings`` list, each finding
+    classified ``class: ignorable|must-fix`` (the prompt tells it to end with exactly
+    that object). Deliverability is DERIVED, not stated: the paper passes
+    (``"correct"``) iff there are ZERO ``must-fix`` findings; any ``must-fix`` ⇒
+    ``"wrong"``. ``ignorable`` findings never block — they are surfaced to the
+    operator. A finding whose ``class`` is missing/unknown defaults to ``must-fix``
+    (never silently downgrade a gap).
+
+    Backward-compatible: an old-style ``{verdict: correct|wrong, repair_hints}`` object
+    with no ``findings`` key is still honored (``wrong`` ⇒ one synthetic must-fix from
+    its hints/report).
+
+    Returns ``(verdict, must_fix, ignorable)``: ``verdict`` is the derived
+    ``"correct"``/``"wrong"`` (or ``None`` when nothing parses); ``must_fix`` and
+    ``ignorable`` are the finding objects in each class. Uses a balanced JSON scan
+    (``raw_decode`` from each ``{``) so text containing braces (LaTeX) does not break
+    parsing."""
     dec = json.JSONDecoder()
-    best: Optional[Dict[str, Any]] = None
+    best_findings: Optional[List[Any]] = None
+    best_verdict_obj: Optional[Dict[str, Any]] = None
     i = 0
     while True:
         j = stdout.find("{", i)
@@ -1594,13 +1622,27 @@ def _parse_paper_verdict(stdout: str) -> Tuple[Optional[str], str]:
             i = j + 1
             continue
         i = end
-        if isinstance(obj, dict) and str(obj.get("verdict", "")).strip().lower() in ("correct", "wrong"):
-            best = obj
-    if best is None:
-        return None, ""
-    verdict = str(best.get("verdict")).strip().lower()
-    hints = "" if verdict == "correct" else str(best.get("repair_hints") or best.get("report") or "")
-    return verdict, hints
+        if not isinstance(obj, dict):
+            continue
+        if isinstance(obj.get("findings"), list):
+            best_findings = obj["findings"]
+        elif str(obj.get("verdict", "")).strip().lower() in ("correct", "wrong"):
+            best_verdict_obj = obj
+    # New schema wins when present (even alongside a stray old-style object).
+    if best_findings is not None:
+        must: List[Any] = []
+        ign: List[Any] = []
+        for f in best_findings:
+            cls = str(f.get("class", "")).strip().lower() if isinstance(f, dict) else ""
+            (ign if cls == "ignorable" else must).append(f)
+        return ("correct" if not must else "wrong"), must, ign
+    if best_verdict_obj is not None:
+        v = str(best_verdict_obj.get("verdict")).strip().lower()
+        if v == "correct":
+            return "correct", [], []
+        hints = str(best_verdict_obj.get("repair_hints") or best_verdict_obj.get("report") or "")
+        return "wrong", ([{"issue": hints}] if hints else [{"issue": "unspecified gap"}]), []
+    return None, [], []
 
 
 def paper_verify_math(project: Optional[str] = None,
@@ -1630,15 +1672,20 @@ def paper_verify_math(project: Optional[str] = None,
 
     Ledger: writes ONE ``whole-paper`` row to ``<paper>/VERIFY_LEDGER.md``
     (status ``correct`` / ``wrong`` / ``oversized`` / ``pending``); ONLY this tool
-    writes verdict rows. Deliver is gated by ``pmv.deliver_ok`` reading the ledger
-    (``correct`` / ``trusted`` / ``overridden`` pass).
+    writes verdict rows. The verifier CLASSIFIES its findings: a paper passes
+    (``correct``) iff it has ZERO ``must-fix`` findings (a step an undergraduate could
+    not fill unaided); any must-fix ⇒ ``wrong``. ``ignorable`` findings (an
+    undergraduate could fill them) never block — they are recorded on the row and
+    surfaced to the operator. Deliver is gated by ``pmv.deliver_ok`` reading the
+    ledger (``correct`` / ``trusted`` / ``overridden`` pass).
 
     **Honesty:** a failed verify RUN (codex error / unparseable verdict) is
     ``status='verify_error'`` — NOT a paper that passed. ``status='passed'``
-    requires an actual ``correct`` verdict.
+    requires an actual all-clear (no must-fix findings).
 
-    Returns ``{status, units_total, correct, wrong, verdict, repair_hints,
-    body_chars, ledger_path, log_path, deliver_ok, blockers}``."""
+    Returns ``{status, units_total, correct, wrong, verdict, repair_hints, must_fix,
+    ignorable, ignorable_findings, body_chars, ledger_path, log_path, deliver_ok,
+    blockers}``."""
     pdir = resolve_project(project)
     ws = assemble.paper_workspace(pdir, paper_id)
     ledger_path = ws / "VERIFY_LEDGER.md"
@@ -1695,25 +1742,34 @@ def paper_verify_math(project: Optional[str] = None,
 
     verify_error: Optional[str] = None
     verdict: Optional[str] = None
+    must_fix: List[Any] = []
+    ignorable: List[Any] = []
     hints = ""
+    ign_text = ""
     res = _drive(prompt)
     if res["status"] != "ok":
         verify_error = res.get("error") or "paper-math verifier codex returned non-ok"
         hints = verify_error
     else:
-        verdict, hints = _parse_paper_verdict(res["stdout"])
+        verdict, must_fix, ignorable = _parse_paper_verdict(res["stdout"])
         if verdict is None:
             verify_error = "could not parse a verdict from the paper-math verifier output"
             hints = verify_error
+        else:
+            hints = _render_findings(must_fix)
+            ign_text = _render_findings(ignorable)
 
     if verify_error is not None:
         status_row, last = "pending", "verify-error"
     else:
+        # DERIVED verdict: any must-fix ⇒ wrong; else correct. ignorable findings are
+        # recorded but never block (surfaced to the operator, not chased).
         status_row = "correct" if verdict == "correct" else "wrong"
         last = str(verdict)
     row = pmv.LedgerRow(
         unit_id="whole-paper", label="whole-paper", source_fact="",
         status=status_row, last_verdict=last, repair_hints=str(hints),
+        ignorable=ign_text,
         attempts=pmv.merge_attempts(prev, "whole-paper"), last_checked_utc=pmv.utc())
     pmv.write_ledger(ledger_path, [row])
 
@@ -1732,6 +1788,9 @@ def paper_verify_math(project: Optional[str] = None,
         "wrong": 1 if status_row == "wrong" else 0,
         "verdict": verdict,
         "repair_hints": str(hints),
+        "must_fix": len(must_fix),
+        "ignorable": len(ignorable),
+        "ignorable_findings": ign_text,
         "body_chars": len(body),
         "ledger_path": str(ledger_path),
         "deliver_ok": ok,
@@ -1743,7 +1802,9 @@ def paper_verify_math(project: Optional[str] = None,
         "paper_verify_math", pdir, prompt, res,
         {"whole_doc": True, "verifier": "paper-math (third verifier)",
          "verdict": verdict, "status_row": status_row,
-         "deliver_ok": ok, "body_chars": len(body), "repair_hints": str(hints)[:500]},
+         "must_fix": len(must_fix), "ignorable": len(ignorable),
+         "deliver_ok": ok, "body_chars": len(body), "repair_hints": str(hints)[:500],
+         "ignorable_findings": ign_text[:500]},
         envelope=out, paper_id=paper_id)
     return out
 

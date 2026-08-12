@@ -142,67 +142,59 @@ live under the paper's own `.runs/` (default `<project>/paper/.runs/`; a non-def
 paper → `<project>/papers/<paper_id>/.runs/`), gitignored; set
 `DANUS_WRITE_PAPER_RUN_LOG=0` to opt out (then `log_path` is `None`).
 
-## Editorial quality bar — LENGTH IS A QUALITY CRITERION (your judgment, applied at every stage)
+## Editorial quality bar — write WELL, not LONG (your judgment, applied at every stage)
 
-You are the paper's editor, and a good mathematics paper has a shape. Hold these
-standards actively; they are as binding as correctness:
+You are the paper's editor. There is **no hard length cap** — some results genuinely
+need many pages, and a fixed ceiling would only force you to mangle them. A good paper
+is short because it is well-SHAPED, not because it was cut to a number. Shaping it is
+YOUR job, and it starts before a single `paper_write` call:
 
-- **Length budget.** Two numbers, both binding: the **CURATION TARGET is ≤ 30
-  pages** (~90K chars of LaTeX source) — size the support layer at stages 0/2 so
-  the FIRST DRAFT lands at or under it, leaving headroom for verify-loop fills —
-  and the **FINAL DELIVERABLE stays within 50 pages** (~150K chars). A few dozen
-  pages is the practical limit of what humans read; past that the paper's flavor
-  NECESSARILY degrades — referees stop reading, the narrative drowns, and results
-  stop being findable. The ONLY exception: the operator EXPLICITLY commissions a
-  detailed technical report (record that in the brief); absent that, a draft
-  heading past ~150K chars means restructure or split (lever #4) — never keep
-  inflating. Only epochal, Fermat-scale results justify hundreds of pages, and
-  even those are published as a SERIES of papers, never one monolith.
-- **Density signals.** Rough health checks: a strong paper carries ~10–30 labeled
-  results; one theorem-sized idea per section; lemmas exist because the narrative
-  needs them, not because the fact graph had them. Red flags that the shape has
-  broken: 100+ labeled results in one document; helper-lemma sprawl around a
-  single proof; repeated setup/notation blocks; proofs that read as computation
-  logs (transcription instead of exposition).
-- **The levers, in order — use these BEFORE accepting length.** (1) curate harder
-  (present fewer results; the support-layer BINDING RULE); (2) cite, don't
-  re-prove (standard machinery → precise citations); (3) render at expert
-  compression (the synthesis doctrine in stage 5.5 — never one-lemma-per-fact);
-  (4) **SPLIT into multiple papers** — the `paper_id` mechanism exists for exactly
-  this: a deep technical development becomes its own companion paper ("Part II" /
-  "technical companion"), and the main paper cites it the way it would cite any
-  published work. The standard human practice for deep theorems is a short main
-  paper + a full-details companion — NOT a 200-page monolith.
-- **Where to apply it:** at stage 0, record a target length in the brief; at
-  stage 2/2b, size the tree so the assembled paper fits the budget; during the
-  verify→revise loop, WATCH the length — length pressure is a STRUCTURE
-  signal, and the durable fix is UPSTREAM (write it right the first time: the
-  proof-style spec, harder curation, cite-don't-re-prove), because post-hoc
-  compression has almost no lever (next bullet); multi-paper restructuring is
-  an operator-initiated fork, not your own exit; at deliver, a paper over
-  budget is a quality defect to report, not to hide.
-  **THE REVISER CANNOT COMPRESS — never order global compression.** Measured
-  on a real paper: a dedicated compression-only round asked for −27K and
-  delivered −0.5K; a retry with explicit per-section subtractive quotas
-  delivered −3.8K; and every "pay by compressing while adding" round
-  under-paid while the paper inflated ~5–14K/round. A patch-style reviser
-  executes located edits; it cannot execute global restructuring. So NEVER
-  issue "compress the paper (by N pages/chars)" — the ask silently
-  under-delivers. What CAN work: YOU find the specific, mechanical
-  redundancies yourself — a lemma proved twice, a definition declared twice,
-  a duplicated setup block, two sections deriving the same identity — and
-  order their removal as POINT EDITS ("delete the second proof under label Y;
-  keep the first at Z; replace the body with \ref{Z}"). If a round or two of
-  such located dedup does not recover the budget, STOP compressing — further
-  rounds make the paper worse, not shorter. Report the overrun honestly as a
-  delivery defect and put the structural fork (re-curate / split) to the
-  operator.
-  **THE CAP IS HARD — the freeze rule.** The moment the draft crosses the
-  cap, ADDITIONS FREEZE — recovery is by the located dedup edits above,
-  never by a global compress order; if they don't suffice, the freeze holds
-  and you report. No goal — not even "make the verifier pass" — overrides
-  the freeze: a verdict bought by inflation is a quality defect, not a
-  success.
+- **A paper is not a stack of facts — and YOU are the one who prevents that.** The two
+  controls that decide the paper's shape are both yours: which facts you SELECT (the
+  support layer) and the editorial `instructions` you write for each `paper_write`. So
+  first UNDERSTAND the proof strategy as a whole; then select the load-bearing results
+  that carry the argument and, in your instructions, direct that the **support layer is
+  developed in proper detail** while **every other fact contributes only the
+  mathematical content the argument needs** — stated, not re-narrated as a full proof.
+  A hundred-fact closure rendered flat, one lemma after another, is exactly the failure
+  this prevents: the writer renders what you hand it and how you tell it to, so the
+  shape is set by your selection and instructions. Calibrate "how much detail" by the
+  bar the whole-paper verifier uses (§5.5): a step a mathematics undergraduate could
+  fill unaided may be abbreviated; anything they could not must be developed or cited.
+  The mechanics of selecting and instructing are the BINDING RULE at stage 2; the
+  levers you apply are below.
+- **Length is a SYMPTOM, never a target.** If a draft feels too long, the cause is
+  almost always a violation of the shaping principle above — re-proving something
+  citable, or re-narrating a routine computation — not "too many pages" as such. Fix
+  the cause, not the page count. A genuinely deep result that is long AFTER honest
+  citation and the right level of detail is SUPPOSED to be long; do not mangle it to
+  hit a number.
+  When one paper's worth of contribution truly spans a book, the human practice is a
+  SERIES of papers (the `paper_id` split, lever #4) — an operator-initiated fork, not
+  a cap you enforce on your own.
+- **Density signals (health checks, not limits).** A strong paper usually carries
+  ~10–30 labeled results, one theorem-sized idea per section, and lemmas that exist
+  because the narrative needs them. Red flags that the shaping broke down:
+  100+ labeled results; helper-lemma sprawl around a single proof; repeated
+  setup/notation blocks; proofs that read as computation logs (transcription instead
+  of exposition). These signal "go re-apply the shaping principle above", not "cut to N pages".
+- **The levers, in order — all serve the shaping principle above, none a page count.** (1)
+  cite, don't re-prove (standard machinery → precise citations); (2) render at the
+  right granularity — full detail on the pivots, method+outcome on routine steps,
+  never one-lemma-per-fact; (3) curate which results the paper PRESENTS (a paper is
+  not every fact you proved; the support-layer BINDING RULE at stage 2); (4) **SPLIT
+  into companion papers** when the contribution genuinely spans more than one paper
+  (the `paper_id` mechanism — a deep development becomes its own "Part II" / technical
+  companion the main paper cites).
+- **The reviser cannot globally compress — so get the granularity right the first
+  time.** Measured on a real paper: a dedicated compression-only round asked for −27K
+  and delivered −0.5K; every "pay by compressing while adding" round under-paid while
+  the paper inflated. A patch-style reviser executes located edits; it cannot execute
+  global restructuring. So NEVER issue "compress the paper by N pages" — it silently
+  under-delivers. What CAN work: YOU find specific mechanical redundancy yourself (a
+  lemma proved twice, a definition declared twice, a duplicated setup block) and order
+  its removal as POINT EDITS. The durable fix, though, is upstream: honest citation +
+  right granularity when the section is first written.
 
 ## The pipeline (you drive these stages in order)
 
@@ -344,7 +336,9 @@ predecessors, dependents (in-closure in-degree — higher = more load-bearing),
 glossary_introduces}` in topological order. Read it, pick the results the paper
 should PRESENT (the headline theorems + the lemmas their proofs actually turn on —
 NOT every granular intermediate step; those get cited), and write short editorial
-`instructions` (how to section, what to foreground). An unset target → the same
+`instructions` (how to section, what to foreground — and encode the editorial shaping
+principle: support layer in detail, everything else stated minimally; see the
+editorial bar). An unset target → the same
 `needs_target` refusal as `paper_write` (run `danus finalize` first).
 
 **Then write** — pass your selection + direction to `paper_write`:
@@ -736,39 +730,49 @@ separate from the fact-submission verifier and the reference verifier; a one-sho
 run, no resident service) reads the **whole** `main.tex` development in reading
 order plus the confirmed `REFERENCE_LEDGER.md`. It **trusts the confirmed precise
 citations** and scrutinizes the paper's **own reasoning and self-containedness** —
-no fact graph, no slicing. A paper that leans on a lemma it never proves or
-notation it never defines is judged `wrong`, correctly: the paper, not the
-verifier, has to be complete. The tool writes ONE `whole-paper` row to
-`<paper>/VERIFY_LEDGER.md` (**only the tool writes verdict rows**) and returns
-`{status, verdict, repair_hints, body_chars, ledger_path, log_path, deliver_ok,
-blockers}`.
+no fact graph, no slicing. **The verifier CLASSIFIES every finding it raises** under
+one strict criterion: `ignorable` if a mathematics **undergraduate** could fill or
+follow the step unaided (a routine computation, a standard manipulation), `must-fix`
+for everything else (a missing definition, a load-bearing step with no derivation
+and no citation, an argument it cannot follow, a wrong deduction). The paper **passes
+(`correct`) iff it has zero `must-fix` findings**; any must-fix ⇒ `wrong`. The tool
+writes ONE `whole-paper` row to `<paper>/VERIFY_LEDGER.md` (**only the tool writes
+verdict rows**), carrying the must-fix findings in `repair_hints` and the ignorable
+ones in the row's `ignorable` field, and returns `{status, verdict, repair_hints,
+must_fix, ignorable, ignorable_findings, body_chars, ledger_path, log_path,
+deliver_ok, blockers}`.
 
 **Honesty:** a failed verify **RUN** (codex error, unparseable verdict) is
 `status="verify_error"` — **NOT** a paper that passed; `status="passed"` requires
-an actual `correct` verdict. Do not treat a `verify_error` as a clean paper.
+an actual all-clear (no `must-fix` findings). Do not treat a `verify_error` as a
+clean paper.
 
-**On `wrong` — the verify → revise loop (you drive it, reading the ledger, not
-your memory).** `repair_hints` carries the verifier's located findings (which
-theorem/paragraph, what is broken). For each finding:
+**The `ignorable` findings — record and surface, never chase.** These are the steps
+the verifier judged an undergraduate could fill. They do **not** block deliver and
+they are **not** yours to fill on a whim: leave the text as written, keep the
+verifier's `ignorable` list verbatim in your deliver report, and — if any of them
+still feels worth expanding — hand THAT decision to the operator. Chasing ignorable
+findings to force a longer paper is exactly the transcription bloat the writing
+principles forbid. Your active work is the `must-fix` list only.
 
-−1. **TRIAGE FIRST — the verifier's verdict is a signal, not an order.** Before
-   fixing anything, classify each finding with YOUR OWN mathematical judgment:
-   - **A real gap** — the paper's own NOVEL load-bearing content is missing,
-     circular, or wrongly argued (a new induction, a new positivity /
-     no-cancellation argument, a new comparison theorem, a genuinely flawed
-     deduction). ONLY these get the fact-curation + revise treatment below.
-   - **A standard-type computation flagged for being summarized** — the step's
-     TYPE is textbook technique an expert reproduces mechanically (a finite
-     explicit low-degree expansion, a standard blowup/projective-bundle
-     pushforward, a routine circuit/rank argument, a Kunneth/direct-sum
-     factorization) and the paper states what is computed and the outcome. Do
-     **NOT** auto-fill these: stuffing every standard computation into the paper
-     is how the editorial length budget dies and the paper's flavor with it.
-     Leave the text as written, RECORD the finding honestly (ledger + your
-     deliver report, verbatim), and hand the fill-or-not decision to the
-     OPERATOR — whether a standard-computation gap is worth pages is a human
-     call, not yours and not the verifier's.
-   - **A real gap that needs MANY facts — KEEP CURATING, KEEP WRITING.** If
+**On `must-fix` (verdict `wrong`) — the verify → revise loop (you drive it, reading
+the ledger, not your memory).** `repair_hints` carries the verifier's located
+`must-fix` findings (which theorem/paragraph, what is broken). The verifier has
+already done the ignorable-vs-real classification; you do **not** re-litigate it —
+you ACT on each must-fix. For each:
+
+−1. **A must-fix means there is a genuine gap to CLOSE — not a fact to drop in.**
+   Do not think of it as "find the backing fact and paste it." A must-fix is the
+   paper itself being incomplete at that point: it may be one fact rendered
+   unclearly, or a whole sub-development that was never written up, or a step that
+   is actually wrong. Your job is to make the paper complete THERE — by writing the
+   missing argument from **verified facts** (curate + render, §0–§2 below), or, when
+   no fact establishes it, by sending it back to the swarm to be proved. **You never
+   author the mathematics yourself** (the fact graph is the only source; see
+   `paper-never-author-math`). What you never do is smooth a must-fix over with a
+   summarizing phrase — that is precisely what the verifier rejected.
+
+   **A must-fix that needs MANY facts — KEEP CURATING, KEEP WRITING.** If
      filling a gap would take dozens or hundreds of facts, that is NOT a
      reason to stop or defer. It means the gap is itself a development that
      gets the SAME treatment as the paper: **extract its support layer and
@@ -816,10 +820,10 @@ theorem/paragraph, what is broken). For each finding:
      duplicated disclosures). Recover the space by LOCATED dedup edits you
      identify yourself (never a global compress order — the reviser cannot
      execute one; see the editorial bar), then write the gap. You do NOT
-     defer a gap on your own authority: the companion-paper /
+     defer a must-fix on your own authority: the companion-paper /
      conditional-statement / override forks exist, but they are decisions
      only the OPERATOR can initiate; your default is always: as long as a
-     gap stands, you write.
+     must-fix stands, you write.
      **THE SPIN-OFF FORK — raise it, don't decide it.** If the paper you have
      is otherwise a sound, well-structured ~30-page article, but your honest
      estimate says this ONE detail cannot be filled within a few pages even
@@ -885,27 +889,27 @@ theorem/paragraph, what is broken). For each finding:
      point burns budget and damages the paper; asking is the professional
      move, not a failure.
    Deliver honestly either way: report the verifier's verdict as it stands,
-   with your triage attached (which findings you filled, which you classified
-   standard-and-deferred) — never present a triaged-away finding as "passed".
+   with the verifier's `ignorable` list attached (which `must-fix` you filled,
+   which `ignorable` findings remain) — never present a `must-fix` you smoothed
+   over as "passed".
 
-   **THE TERMINAL STATE — "passes modulo trivial computations".** On a paper
+   **THE TERMINAL STATE — "passes modulo ignorable computations".** On a paper
    written from verified facts, expect the FIRST verify to yield mostly
-   standard-type findings plus AT MOST one or two REAL structural gaps. Fill
-   only those (each a small curated supplement — a support layer and a few K
-   of expert-compressed writing), re-verify once, and you should be at a
-   residual of ONLY standard-type/trivial findings. **That residual IS the
-   successful end of the loop**: stop, report the verdict as it stands with
-   the trivial-residual list, and hand the fill-or-not calls to the operator.
-   Do NOT keep filling standard-type items to chase a clean binary verdict —
-   that chase is precisely how a 40-page paper bloats into a monograph while
-   the verifier's re-sampling keeps moving the target. **No goal overrides
-   the triage** (the mirror of the length-freeze rule). If you find yourself
-   in a fourth-plus revise round still filling, STOP and re-triage: you are
-   over-filling.
+   `ignorable` findings plus AT MOST one or two `must-fix` structural gaps. Fill
+   only the `must-fix` ones (each a small curated supplement — a support layer and
+   a few K of expert-compressed writing), re-verify once, and you should reach
+   zero `must-fix` with only an `ignorable` residual. **Zero `must-fix` IS the
+   successful end of the loop** (the tool reports `correct` / `deliver_ok`): stop,
+   report the verdict with the `ignorable` list, and hand the fill-or-not calls to
+   the operator. Do NOT expand `ignorable` items to make the paper longer — the
+   verifier already judged a competent reader fills them, and chasing them is how a
+   paper bloats into a monograph. If you find yourself in a fourth-plus revise
+   round still filling, STOP: you are over-filling `ignorable` content the
+   verifier never asked you to write.
 
-   **THE QUALITY BACKSTOP — fewer gaps is not the goal; a better paper is.**
+   **THE QUALITY BACKSTOP — fewer findings is not the goal; a better paper is.**
    Keep the TOTAL number of writing rounds small (the healthy trajectory:
-   one curated write + small located fixes + at most one real-gap
+   one curated write + small located fixes + at most one real must-fix
    supplement). Across rounds, judge the PAPER, not just the findings count:
    if findings are going down but the paper is getting worse — narrative
    giving way to fact-stacking, structure fragmenting, length creeping — the
@@ -1007,9 +1011,11 @@ yours:
    `agents/skills/write-paper/roles/PAPER_MATH_VERIFIER_PROMPT.md` (and
    `roles/AGENTS.md`), append the confirmed `REFERENCE_LEDGER.md` and the part
    document, and run a fresh `bin/codex exec --sandbox read-only` per part; read
-   the final verdict JSON from its output. Every part must return `correct`. A
-   `wrong` in the part for R_k → the revise loop above for those findings, then
-   re-verify that part and every part that took R_k's statement as established.
+   the final findings JSON from its output. A part is clear iff it has **zero
+   `must-fix` findings** (an `ignorable`-only residual still clears — record and
+   surface it). A part carrying any `must-fix` → the revise loop above for those
+   findings, then re-verify that part and every part that took its statement as
+   established.
 4. **Clearing the gate:** the ledger still holds the `too_large` row and only the
    tool writes verdicts — so surface the per-part record (each part's scope,
    verdict, log) to the **operator**, and only on their explicit confirmation set
