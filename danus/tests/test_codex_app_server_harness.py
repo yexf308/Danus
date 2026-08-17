@@ -2108,6 +2108,121 @@ def test_round_audit_bounds_adversarial_metadata_and_total_projection_bytes():
     assert rows[-1]["count"] > 0
 
 
+def test_round_audit_enriches_sparse_fact_submit_notification_from_terminal():
+    from danus.execution import loop as worker_loop
+
+    class AuditClient:
+        def token_usage(self, _thread_id: str, _turn_id: str):
+            return None
+
+        def model_reroutes(self, _thread_id: str, _turn_id: str):
+            return {"observed": False, "events": [], "omitted": {}}
+
+        def notifications(self):
+            return [
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "item": {
+                            "type": "mcpToolCall",
+                            "id": "notification-only",
+                            "server": "danus",
+                            "tool": "gm_search",
+                            "status": "completed",
+                        },
+                    },
+                },
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "item": {
+                            "type": "mcpToolCall",
+                            "id": "submit-promoted",
+                            "server": "danus",
+                            "tool": "fact_submit",
+                            "status": "completed",
+                        },
+                    },
+                },
+            ]
+
+        def notification_omissions(self):
+            return {"count": 0, "bytes": 0, "sha256": hashlib.sha256().hexdigest()}
+
+    payload = worker_loop._build_app_server_audit(
+        AuditClient(),
+        thread_id="thread-1",
+        turn_id="turn-1",
+        terminal={
+            "status": "completed",
+            "durationMs": 1,
+            "items": [
+                {
+                    "type": "mcpToolCall",
+                    "id": "submit-promoted",
+                    "server": "danus",
+                    "tool": "fact_submit",
+                    "status": "completed",
+                    "result": {
+                        "structuredContent": {
+                            "accepted": True,
+                            "promoted": True,
+                            "submission_status": "promoted",
+                            "verification_verdict": "correct",
+                            "fact_id": "0123456789abcdef",
+                            "raw_secret": "RAW_TOOL_RESULT_CANARY",
+                        },
+                        "content": "RAW_TOOL_RESULT_CANARY",
+                    },
+                },
+                {
+                    "type": "mcpToolCall",
+                    "id": "terminal-only",
+                    "server": "danus",
+                    "tool": "gm_get",
+                    "status": "completed",
+                },
+            ],
+        },
+        requested_model="offline-model",
+        requested_effort="low",
+        actual_model="offline-model",
+        thread_reasoning_effort="low",
+    )
+    rows = [json.loads(line) for line in payload.splitlines()]
+    item_rows = [row for row in rows if row.get("event") == "item_completed"]
+    assert [row["item"]["id"] for row in item_rows] == [
+        "notification-only",
+        "submit-promoted",
+        "terminal-only",
+    ]
+    promoted_rows = [
+        row for row in item_rows if row["item"]["id"] == "submit-promoted"
+    ]
+    assert len(promoted_rows) == 1
+    assert promoted_rows[0]["item"] == {
+        "type": "mcpToolCall",
+        "id": "submit-promoted",
+        "server": "danus",
+        "tool": "fact_submit",
+        "status": "completed",
+        "fact_submit_result": {
+            "accepted": True,
+            "promoted": True,
+            "submission_status": "promoted",
+            "verification_verdict": "correct",
+            "fact_id": "0123456789abcdef",
+        },
+    }
+    assert "RAW_TOOL_RESULT_CANARY" not in payload
+    assert len(payload.encode("utf-8")) <= worker_loop.MAX_ROUND_AUDIT_BYTES
+    assert worker_loop._last_promoted_fact_id(payload) == "0123456789abcdef"
+
+
 def test_round_audit_distinguishes_verifier_acceptance_from_fact_promotion():
     from danus.execution import loop as worker_loop
 

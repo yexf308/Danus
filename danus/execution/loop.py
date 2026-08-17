@@ -1232,8 +1232,9 @@ def _build_app_server_audit(
             return projected
         return item
 
-    projected_ids: set[str] = set()
-    for note in client.notifications():
+    notifications = client.notifications()
+    sparse_fact_submit_ids: set[str] = set()
+    for note in notifications:
         if note.get("method") != "item/completed":
             continue
         params = note.get("params", {})
@@ -1243,11 +1244,71 @@ def _build_app_server_audit(
             or params.get("turnId") != turn_id
         ):
             continue
-        projected = project_item(params.get("item", {}))
+        raw_item = params.get("item")
+        if (
+            isinstance(raw_item, dict)
+            and raw_item.get("type") == "mcpToolCall"
+            and raw_item.get("server") == "danus"
+            and raw_item.get("tool") == "fact_submit"
+            and isinstance(raw_item.get("id"), str)
+            and _fact_submit_summary(raw_item) is None
+        ):
+            sparse_fact_submit_ids.add(raw_item["id"])
+
+    terminal_items = (
+        terminal["items"]
+        if terminal is not None and isinstance(terminal.get("items"), list)
+        else []
+    )
+    terminal_fact_submit_results: dict[str, dict] = {}
+    for raw_item in terminal_items:
+        if not isinstance(raw_item, dict) or raw_item.get("type") != "mcpToolCall":
+            continue
+        item_id = raw_item.get("id")
+        summary = _fact_submit_summary(raw_item)
+        if (
+            isinstance(item_id, str)
+            and item_id in sparse_fact_submit_ids
+            and isinstance(summary, dict)
+        ):
+            # Terminal order breaks any malformed same-id tie deterministically.
+            # Retain only the allowlisted semantic projection, never raw results.
+            terminal_fact_submit_results.setdefault(item_id, summary)
+
+    projected_ids: set[str] = set()
+    for note in notifications:
+        if note.get("method") != "item/completed":
+            continue
+        params = note.get("params", {})
+        if (
+            not isinstance(params, dict)
+            or params.get("threadId") != thread_id
+            or params.get("turnId") != turn_id
+        ):
+            continue
+        raw_item = params.get("item", {})
+        projected = project_item(raw_item)
         if projected is None:
             continue
-        if isinstance(projected.get("id"), str):
-            projected_ids.add(projected["id"])
+        item_id = projected.get("id")
+        if isinstance(item_id, str):
+            projected_ids.add(item_id)
+            if (
+                "fact_submit_result" not in projected
+                and projected.get("type") == "mcpToolCall"
+                and projected.get("server") == "danus"
+                and projected.get("tool") == "fact_submit"
+            ):
+                raw_item_id = (
+                    raw_item.get("id") if isinstance(raw_item, dict) else None
+                )
+                terminal_summary = (
+                    terminal_fact_submit_results.get(raw_item_id)
+                    if isinstance(raw_item_id, str)
+                    else None
+                )
+                if terminal_summary is not None:
+                    projected["fact_submit_result"] = terminal_summary
         # Bound individual projections; raw command/model streams are never
         # persisted here. Agent messages remain research output and may quote
         # owner guidance, so the log is not a confidentiality boundary.
@@ -1258,15 +1319,14 @@ def _build_app_server_audit(
 
     # Crash recovery may obtain a terminal turn from thread/read without replayed
     # item notifications. Retain the same bounded projection from that turn.
-    if terminal is not None and isinstance(terminal.get("items"), list):
-        for raw_item in terminal["items"]:
-            projected = project_item(raw_item)
-            if projected is None or projected.get("id") in projected_ids:
-                continue
-            append_record(
-                {"event": "item_completed", "item": projected},
-                item_projection=True,
-            )
+    for raw_item in terminal_items:
+        projected = project_item(raw_item)
+        if projected is None or projected.get("id") in projected_ids:
+            continue
+        append_record(
+            {"event": "item_completed", "item": projected},
+            item_projection=True,
+        )
 
     omissions = client.notification_omissions()
     if omissions["count"]:
