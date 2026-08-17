@@ -27,22 +27,47 @@ along the way.
 
 See `ARCHITECTURE.md` for the layered design and the map of every module.
 
-## Two orchestrator options
+## What's new in this Codex fork
 
-The workers and the verifier always run on **codex**. The **main agent (the
-orchestrator)** can run on either runtime — pick one:
+This fork's `main` branch is the **Codex-native Danus line**. Workers and the
+verifier already ran on Codex; now the main agent does too, so the core system
+requires no Claude Code installation. Optional paid strategy transports remain
+explicit opt-ins and default to `off`.
 
-- **Claude Code — recommended (the [`main` branch](https://github.com/frenzymath/Danus/tree/main)).**
-  Best results with **Fable (`claude-fable-5`)** as the orchestrator model. Requires
-  the Claude Code CLI in addition to your codex backend.
-- **codex — for convenience (this branch, tag `v0.1.0-codex`).** The orchestrator
-  runs on codex too, so you install **nothing beyond codex** — no Claude Code. Same
-  engine, workers, and verifier; only the main-agent runtime differs (`AGENTS.md` +
-  `.codex/config.toml` + `.agents/skills/` in place of `CLAUDE.md` + `.mcp.json` +
-  `.claude/skills/`).
+- **Codex-native orchestration.** `AGENTS.md`, `.codex/config.toml`, and
+  `.agents/skills/` provide the main-agent contract, MCP wiring, initialization,
+  and rendering workflows. Worker project configuration is isolated from the
+  main-agent workspace so one runtime cannot silently shadow another.
+- **Reasoning-first coordination.** New projects pin one deep root and one
+  independent critic while dormant observers consume no paid turns. Every new
+  terminal coordination slot gets a fresh app-server thread; only recovery of
+  that exact slot resumes it.
+- **Exact paid-task binding.** Each paid assignment is staged before dispatch and
+  bound to its generation, worker, byte length, and SHA-256 digest. A later host
+  edit cannot retarget an admitted turn, and owner-gated generation changes
+  require a complete frozen task set.
+- **Guarded advisor escalation.** A root obstruction must receive independent
+  critic confirmation before Danus can expose an owner recommendation. Every
+  ChatGPT Pro browser question then requires fresh owner authorization, exact
+  receipt binding, explicit review, and an audited resume decision.
+- **Safer control and observability.** `say`, current-turn-only `encourage`,
+  `messages`, and `interrupt-turn` have distinct authority. Status preserves
+  paid-intent lifecycle, fact promotions, project discovery, and content-free
+  reasoning, tool, wait, memory, compaction, and token telemetry. Missing data is
+  reported as unavailable rather than zero.
+- **Stricter strategy transports.** OpenAI-compatible Responses gateways support
+  `max` effort, canonical message input, configurable `background` and `store`,
+  and caller-controlled omission of refused parameters. Failures return a
+  structured envelope with billing basis instead of a traceback.
+- **Classified whole-paper verification.** The paper verifier separates
+  `must-fix` gaps from `ignorable` steps that an undergraduate can fill unaided.
+  Deliverability requires zero `must-fix` findings; ignorable findings remain
+  visible without forcing transcription-heavy expansion.
 
-Fable-via-Claude-Code is the recommended orchestrator; **this** fully-codex line
-exists so a codex-only setup works out of the box.
+The upstream project also publishes a
+[Claude Code orchestrator line](https://github.com/frenzymath/Danus/tree/main).
+Both lines use the same Codex worker, verifier, fact-graph, and rendering engine;
+the main-agent runtime and its configuration files are the intentional difference.
 
 ## How it works
 
