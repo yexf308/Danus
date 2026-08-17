@@ -28,6 +28,7 @@ from danus.coordination import (
     DEFAULT_COORDINATION,
     CoordinationStore,
     candidate_receipt_id,
+    coordination_payload,
 )
 from danus.core import (
     FactGraph,
@@ -106,6 +107,26 @@ def _active_reasoning_store(
     for worker in names:
         admissions.append(_admit_and_activate(store, worker))
     return store, admissions
+
+
+def _active_explorer_store(project: Path) -> tuple[CoordinationStore, object]:
+    project.mkdir()
+    workers = ["max", "max2", "high", "high2", "high3", "high4", "high5"]
+    metadata = {
+        "name": project.name,
+        "model": "model",
+        "roles": "max:2,high:5",
+        "workers": workers,
+        "coordination": coordination_payload(active_explorers=2),
+    }
+    (project / "project.json").write_text(json.dumps(metadata), encoding="utf-8")
+    store = CoordinationStore(project, metadata)
+    for worker in store.project_status()["task_staging"]["required_workers"]:
+        store.stage_task_assignment(
+            str(worker),
+            f"# Gateway explorer task\n\nExact assignment for {worker}.\n",
+        )
+    return store, _admit_and_activate(store, "high")
 
 
 def _bound_coordination_prompt(admission) -> str:
@@ -776,6 +797,74 @@ def test_reasoning_candidate_is_active_before_verify_and_terminalizes_correct(
         if item["candidate_id"] == result["candidate_receipt_id"]
     )
     assert terminal["state"] == "terminal"
+
+
+def test_explorer_gateway_publishes_findings_and_candidate_without_review_authority(
+    tmp_path: Path,
+):
+    project = tmp_path / "explorer-gateway"
+    store, explorer = _active_explorer_store(project)
+    with _env(
+        DANUS_PROJECT_DIR=str(project),
+        DANUS_AGENTS_ROOT=None,
+        DANUS_AUTHOR="high",
+        DANUS_ROLE="worker",
+    ):
+        finding = server.gm_add(
+            "obstacle",
+            claim="An explorer reports an ordinary alternate-route obstruction",
+        )
+        with pytest.raises(RuntimeError, match="explorer publications cannot confirm"):
+            server.gm_add(
+                "obstacle",
+                claim="An explorer cannot confirm a root obstruction",
+                links={"confirms_entry_id": "a" * 16},
+            )
+
+    stored = GlobalMemory(project).read("obstacle")
+    assert [entry["id"] for entry in stored] == [finding["id"]]
+    assert stored[0]["links"]["coordination"] == {
+        "slot_id": explorer.slot_id,
+        "generation": 1,
+        "lane": "explorer1",
+    }
+    assert store.project_status()["review"] is None
+    assert store.project_status()["recommendation"] is None
+
+    observed = {}
+
+    def verify(statement, proof, fact_context=None, glossary_introduces=None):
+        candidate = store.project_status()["candidate"]
+        assert candidate is not None
+        assert candidate["lane"] == "explorer1"
+        assert store.admit("max") is None
+        observed.update(candidate)
+        return _verify_response(fact_context, candidate_proof=proof)
+
+    original_verify = server._verify
+    server._verify = verify
+    try:
+        with _env(
+            DANUS_PROJECT_DIR=str(project),
+            DANUS_AGENTS_ROOT=None,
+            DANUS_AUTHOR="high",
+            DANUS_ROLE="worker",
+            DANUS_VERIFY_URL="http://mock",
+            DANUS_PROBLEM_ID="P",
+        ):
+            result = server.fact_submit(
+                statement="An explorer verifier-gated supporting lemma",
+                proof="A complete proof of the supporting lemma.",
+                source_id=finding["id"],
+            )
+    finally:
+        server._verify = original_verify
+
+    assert result["accepted"] is True
+    assert result["candidate_outcome"] == "correct"
+    assert observed["lane"] == "explorer1"
+    assert store.project_status()["candidate"] is None
+    assert store.admit("max") is not None
 
 
 @pytest.mark.parametrize(

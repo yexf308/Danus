@@ -17,6 +17,7 @@ from danus.coordination import (
     candidate_outcome_releases,
     candidate_receipt_id,
     coordination_config,
+    coordination_payload,
 )
 from danus.coordination.store import PREPARED_DEADLINE_OUTCOME
 
@@ -171,6 +172,295 @@ def _stage_next_generation(store: CoordinationStore) -> dict[str, object]:
                 f"# Generation {target} assignment for {worker}\n",
             )
     return store.staged_task_assignments()
+
+
+def _explorer_project(
+    tmp_path: Path,
+    *,
+    active_explorers: int,
+    stage_tasks: bool = True,
+) -> tuple[Path, dict[str, object], CoordinationStore]:
+    project = tmp_path / f"explorers-{active_explorers}"
+    project.mkdir()
+    workers = ["max", "max2", "high", "high2", "high3", "high4", "high5"]
+    metadata: dict[str, object] = {
+        "name": project.name,
+        "model": "model",
+        "roles": "max:2,high:5",
+        "workers": workers,
+        "coordination": coordination_payload(
+            active_explorers=active_explorers,
+        ),
+    }
+    (project / "project.json").write_text(json.dumps(metadata), encoding="utf-8")
+    store = CoordinationStore(project, metadata)
+    if stage_tasks:
+        for worker in store.project_status()["task_staging"]["required_workers"]:
+            store.stage_task_assignment(
+                str(worker),
+                f"# Generation 1 assignment for {worker}\n",
+            )
+    return project, metadata, store
+
+
+def _activate_admission(store: CoordinationStore, worker: str):
+    admission = store.admit(worker)
+    assert admission is not None
+    store.pin_prompt(admission.slot_id, _bound_prompt(admission))
+    return store.activate(admission.slot_id)
+
+
+@pytest.mark.parametrize(
+    ("active_explorers", "max_paid_workers", "explorer_workers"),
+    [
+        (0, 2, []),
+        (1, 3, ["high"]),
+        (2, 4, ["high", "high2"]),
+    ],
+)
+def test_balanced_explorer_counts_preserve_default_and_stable_lane_identity(
+    tmp_path: Path,
+    active_explorers: int,
+    max_paid_workers: int,
+    explorer_workers: list[str],
+) -> None:
+    project, _metadata, store = _explorer_project(
+        tmp_path,
+        active_explorers=active_explorers,
+        stage_tasks=False,
+    )
+    status = store.project_status()
+    assert status["root_worker"] == "max"
+    assert status["critic_worker"] == "max2"
+    assert status["explorer_workers"] == explorer_workers
+    assert status["task_staging"]["required_workers"] == [
+        "max",
+        "max2",
+        *explorer_workers,
+    ]
+    assert coordination_config(store.metadata).max_paid_workers == max_paid_workers
+    with sqlite3.connect(store.path) as connection:
+        schema_version = connection.execute(
+            "SELECT schema_version FROM project_state WHERE singleton=1"
+        ).fetchone()[0]
+        round_slots_sql = connection.execute(
+            "SELECT sql FROM sqlite_schema WHERE type='table' AND name='round_slots'"
+        ).fetchone()[0]
+    assert schema_version == (7 if active_explorers == 0 else 8)
+    assert ("explorer1" in round_slots_sql) is (active_explorers > 0)
+    assert ("explorer2" in round_slots_sql) is (active_explorers > 0)
+    assert project.exists()
+
+
+def test_four_lane_concurrent_admission_directives_and_status(tmp_path: Path) -> None:
+    _project_dir, metadata, store = _explorer_project(
+        tmp_path,
+        active_explorers=2,
+    )
+    workers = list(metadata["workers"])
+    with ThreadPoolExecutor(max_workers=len(workers)) as executor:
+        results = list(executor.map(store.admit, workers))
+
+    admitted = [result for result in results if result is not None]
+    assert {(result.worker, result.lane) for result in admitted} == {
+        ("max", "root"),
+        ("max2", "critic"),
+        ("high", "explorer1"),
+        ("high2", "explorer2"),
+    }
+    explorer_directives = {
+        result.lane: result.directive
+        for result in admitted
+        if result.lane.startswith("explorer")
+    }
+    assert set(explorer_directives) == {"explorer1", "explorer2"}
+    for directive in explorer_directives.values():
+        assert "alternate route, supporting lemma, or counterexample" in directive
+        assert "no obstacle-confirmation" in directive
+        assert "advisor-recommendation" in directive
+        assert "never use links.confirms_entry_id" in directive
+
+    status = store.project_status()
+    assert status["reserved_admission"] == 4
+    assert status["waiting_admission"] == 3
+    assert status["explorer_workers"] == ["high", "high2"]
+    assert {
+        worker: store.project_status(worker)["lane"] for worker in workers
+    } == {
+        "max": "root",
+        "max2": "critic",
+        "high": "explorer1",
+        "high2": "explorer2",
+        "high3": "observer",
+        "high4": "observer",
+        "high5": "observer",
+    }
+
+
+def test_four_lane_terminal_barrier_and_task_carry_forward(tmp_path: Path) -> None:
+    _project_dir, _metadata, store = _explorer_project(
+        tmp_path,
+        active_explorers=2,
+    )
+    admissions = [
+        _activate_admission(store, worker)
+        for worker in ("max", "max2", "high", "high2")
+    ]
+    for admission in admissions[:-1]:
+        assert store.complete(admission.slot_id, outcome="terminal_rc_0")[
+            "generation"
+        ] == 1
+    assert store.project_status()["generation"] == 1
+
+    advanced = store.complete(admissions[-1].slot_id, outcome="terminal_rc_0")
+    assert advanced["generation"] == 2
+    staging = store.staged_task_assignments()
+    assert staging["required_workers"] == ["max", "max2", "high", "high2"]
+    assert staging["ready"] is True
+    assert len(staging["assignments"]) == 4
+    assert all(item["frozen"] is False for item in staging["assignments"])
+
+
+def test_explorers_are_excluded_from_obstacle_review_and_owner_gate_authority(
+    tmp_path: Path,
+) -> None:
+    _project_dir, _metadata, store = _explorer_project(
+        tmp_path,
+        active_explorers=2,
+    )
+    admissions = {
+        worker: _activate_admission(store, worker)
+        for worker in ("max", "max2", "high", "high2")
+    }
+    evidence = store.record_root_evidence(
+        "max",
+        "obstacle",
+        entry_id="root_obstacle",
+        slot_id=admissions["max"].slot_id,
+    )
+    with pytest.raises(CoordinationError, match="only critic"):
+        store.confirm_root_evidence(
+            "high",
+            "root_obstacle",
+            entry_id="explorer_confirmation",
+            slot_id=admissions["high"].slot_id,
+        )
+    with pytest.raises(CoordinationError, match="explorer publications cannot confirm"):
+        store.validate_memory_publication(
+            "high",
+            slot_id=admissions["high"].slot_id,
+            kind="obstacle",
+            confirms_entry_id="root_obstacle",
+        )
+
+    for admission in admissions.values():
+        store.complete(admission.slot_id, outcome="terminal_rc_0")
+    assert store.project_status()["phase"] == CRITIC_REVIEW_PHASE
+    assert store.admit("max") is None
+    assert store.admit("high") is None
+    assert store.admit("high2") is None
+    review = _activate_admission(store, "max2")
+    assert review.lane == "critic"
+    assert review.designated_root_entry_id == evidence["entry_id"]
+
+    confirmation = store.confirm_root_evidence(
+        "max2",
+        evidence["entry_id"],
+        entry_id="critic_confirmation",
+        slot_id=review.slot_id,
+    )
+    store.complete(review.slot_id, outcome="terminal_rc_0")
+    recommendation_id = str(confirmation["recommendation_id"])
+    assert store.project_status()["phase"] == "owner_action_required"
+    for worker in ("max", "max2", "high", "high2"):
+        assert store.admit(worker) is None
+
+    for worker in ("max", "max2", "high"):
+        store.stage_task_assignment(worker, f"# Generation 2 task for {worker}\n")
+    with pytest.raises(CoordinationError, match="incomplete: high2"):
+        store.resolve_recommendation(
+            recommendation_id,
+            resolution="continue_without_advisor",
+            owner_acknowledgement=recommendation_id,
+        )
+    store.stage_task_assignment("high2", "# Generation 2 task for high2\n")
+    assert store.project_status()["task_staging"]["ready"] is True
+    store.resolve_recommendation(
+        recommendation_id,
+        resolution="continue_without_advisor",
+        owner_acknowledgement=recommendation_id,
+    )
+    assert store.project_status()["generation"] == 2
+
+
+def test_explorer_candidate_freezes_every_paid_lane(tmp_path: Path) -> None:
+    _project_dir, _metadata, store = _explorer_project(
+        tmp_path,
+        active_explorers=2,
+    )
+    explorer = _activate_admission(store, "high")
+    receipt = candidate_receipt_id(
+        slot_id=explorer.slot_id,
+        candidate_fact_id="a" * 16,
+        candidate_fact_identity="c" * 64,
+        source_id=None,
+        context_digest="b" * 64,
+    )
+    candidate = store.register_candidate(
+        "high",
+        receipt,
+        slot_id=explorer.slot_id,
+        candidate_fact_id="a" * 16,
+        candidate_fact_identity="c" * 64,
+        source_id=None,
+        context_digest="b" * 64,
+    )
+    assert candidate["lane"] == "explorer1"
+    for worker in ("max", "max2", "high2"):
+        assert store.admit(worker) is None
+    store.complete(explorer.slot_id, outcome="terminal_rc_0")
+    assert store.project_status()["generation"] == 1
+    store.terminalize_candidate(
+        "high",
+        receipt,
+        slot_id=explorer.slot_id,
+        outcome="correct",
+    )
+    assert store.admit("max") is not None
+
+
+def test_schema_v7_two_lane_database_reopens_without_version_bump(
+    tmp_path: Path,
+) -> None:
+    project, metadata = _project(
+        tmp_path,
+        roles="xhigh:2",
+        workers=["xhigh", "xhigh2"],
+    )
+    store = CoordinationStore(project, metadata)
+    with sqlite3.connect(store.path) as connection:
+        before = connection.execute(
+            "SELECT schema_version FROM project_state WHERE singleton=1"
+        ).fetchone()[0]
+        before_schema = connection.execute(
+            "SELECT name, sql FROM sqlite_schema WHERE type IN ('table','index') "
+            "ORDER BY name"
+        ).fetchall()
+    assert before == 7
+
+    reopened = CoordinationStore.open_existing(project, metadata)
+    assert reopened is not None
+    assert reopened.project_status()["explorer_workers"] == []
+    with sqlite3.connect(store.path) as connection:
+        after = connection.execute(
+            "SELECT schema_version FROM project_state WHERE singleton=1"
+        ).fetchone()[0]
+        after_schema = connection.execute(
+            "SELECT name, sql FROM sqlite_schema WHERE type IN ('table','index') "
+            "ORDER BY name"
+        ).fetchall()
+    assert after == 7
+    assert after_schema == before_schema
 
 
 def test_new_store_starts_task_empty_and_admission_fails_closed(

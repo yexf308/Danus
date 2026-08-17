@@ -19,6 +19,8 @@ import tomllib
 from contextlib import contextmanager
 from pathlib import Path
 
+import pytest
+
 from danus.coordination import DEFAULT_COORDINATION, CoordinationStore
 from danus.execution import layout as L
 from danus.execution import loop, scaffold
@@ -203,6 +205,65 @@ def test_do_new_reasoning_first_default_pins_max_paid_lanes_and_high_observers(
         for worker in ("max", "max2"):
             role = L.WorkerLayout(L.worker_dir("reasoning-default", worker)).role.read_text()
             assert "REASONING_EFFORT=max" in role
+
+
+@pytest.mark.parametrize(
+    ("active_explorers", "expected_explorers", "expected_max_paid"),
+    [
+        (0, [], 2),
+        (1, ["high"], 3),
+        (2, ["high", "high2"], 4),
+    ],
+)
+def test_do_new_threads_balanced_active_explorers_without_redundant_metadata(
+    tmp: Path,
+    active_explorers: int,
+    expected_explorers: list[str],
+    expected_max_paid: int,
+):
+    with _project_env(tmp):
+        name = f"balanced-{active_explorers}"
+        result = scaffold.do_new(name, active_explorers=active_explorers)
+        project = L.project_dir(name)
+        metadata = json.loads((project / "project.json").read_text())
+        assert set(metadata["coordination"]) == {
+            "mode",
+            "max_paid_workers",
+            "phase_timeout_seconds",
+        }
+        assert metadata["coordination"]["max_paid_workers"] == expected_max_paid
+        assert "active_explorers" not in metadata
+        store = CoordinationStore.open_existing(project, metadata)
+        assert store is not None
+        status = store.project_status()
+        assert status["root_worker"] == "max"
+        assert status["critic_worker"] == "max2"
+        assert status["explorer_workers"] == expected_explorers
+        assert result["coordination"] == metadata["coordination"]
+
+
+def test_do_new_rejects_insufficient_explorer_roster_before_creation(tmp: Path):
+    with _project_env(tmp):
+        project = L.project_dir("too-small")
+        with pytest.raises(SystemExit, match="fewer workers"):
+            scaffold.do_new(
+                "too-small",
+                roles="max:2,high:1",
+                active_explorers=2,
+            )
+        assert not project.exists()
+
+
+def test_do_new_legacy_rejects_nonzero_active_explorers_before_creation(tmp: Path):
+    with _project_env(tmp):
+        project = L.project_dir("legacy-explorer")
+        with pytest.raises(SystemExit, match="legacy coordination"):
+            scaffold.do_new(
+                "legacy-explorer",
+                coordination="legacy",
+                active_explorers=1,
+            )
+        assert not project.exists()
 
 
 def test_do_new_refuses_existing(tmp: Path):

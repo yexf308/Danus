@@ -30,12 +30,16 @@ verifier) decides; and a result only *exists* once that authority has accepted i
 - **The codex workers.** A roster of autonomous proof workers. In the default
   reasoning-first mode the roster is `max:2,high:5`: durable admission pins the
   two `max` workers as root and independent critic, while the five `high` loops
-  stay dormant. Dormant loops do not start Codex and are not automatically
-  rotated, promoted, or used as failover. Explicit roles may override the
-  roster; legacy retains its `high:3,xhigh:4` default. Each new terminal
-  coordination slot starts a fresh app-server thread; only crash recovery of
-  that same pinned slot resumes. Each paid turn has a 2700-second cap, which
-  does not promise whole-phase completion. Each admitted slot receives a
+  stay dormant. An explicit one or two stable explorer lanes can activate the
+  next `high` workers for independent alternate routes, supporting lemmas, or
+  counterexamples. They can publish ordinary findings and verifier-gated
+  candidates but cannot confirm obstacles or exercise review/advisor/owner-gate
+  authority. Dormant loops do not start Codex and are not automatically rotated,
+  promoted, or used as failover. Explicit roles may override the roster; legacy
+  rejects active explorers and retains its `high:3,xhigh:4` default. Each new
+  terminal coordination slot starts a fresh app-server thread; only crash
+  recovery of that same pinned slot resumes. Each paid turn has a 2700-second
+  cap, which does not promise whole-phase completion. Each admitted slot receives a
   hash-attested snapshot of that generation's durable paid-lane task; the
   `TASK.md` visible in its model workspace is a projection of that snapshot,
   not mutable host authority. Each admitted worker reads its bounded directive
@@ -118,8 +122,8 @@ new state:
    opt-in. *(the `consult` skill)*
 3. **Record & dispatch** — store an actual API/CLI reply under the consult
    contract, or explicitly review/adopt an authorized browser report. When off,
-   dispatch directly from the elaboration. Assign the fixed root/critic lanes
-   (`danus assign`). Paid-lane assignment is a durable generation staging
+   dispatch directly from the elaboration. Assign every configured protected
+   lane (`danus assign`). Paid-lane assignment is a durable generation staging
    operation; during an owner gate, all next-generation lanes must be ready
    before the exact resolution freezes them. An ordinary no-owner generation
    advance carries the preceding frozen tasks forward exactly.

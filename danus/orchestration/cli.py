@@ -2,6 +2,8 @@
 
     danus list   [--json]
     danus new    <project> [--roles ROLE_SPEC] [--model M]
+                 [--coordination reasoning-first|legacy]
+                 [--active-explorers 0|1|2]
     danus assign <project>/<worker> (--task "…" | --file P | --stdin)
     danus say    <project>/<worker> (--text "…" | --file P | --stdin)
     danus encourage <project>/<worker> [--text "…" | --file P | --stdin]
@@ -494,10 +496,12 @@ def do_assign(target: str, task: str) -> Dict:
                 raise SystemExit(
                     "active candidate freezes retask until its paid outcome is known"
                 )
-            paid_workers = {
-                coordination_status.get("root_worker"),
-                coordination_status.get("critic_worker"),
-            }
+            task_staging = coordination_status.get("task_staging")
+            paid_workers = set(
+                task_staging.get("required_workers", [])
+                if isinstance(task_staging, dict)
+                else []
+            )
             if worker in paid_workers:
                 # The database is authoritative for paid work.  Stage it first;
                 # TASK.md below is only an operator-facing projection and may
@@ -1391,6 +1395,7 @@ def worker_status(wl: L.WorkerLayout) -> Dict:
         "resolution": None,
         "candidate": None,
         "task_staging": None,
+        "explorer_workers": [],
     }
     try:
         metadata = load_project_metadata(wl.project_dir)
@@ -1593,6 +1598,7 @@ def worker_status(wl: L.WorkerLayout) -> Dict:
         "resolution": coordination_view.get("resolution"),
         "candidate": coordination_view.get("candidate"),
         "task_staging": coordination_view.get("task_staging"),
+        "explorer_workers": coordination_view.get("explorer_workers", []),
         "coordination_mode": coordination_view.get("mode"),
         "coordination_error": coordination_error,
     }
@@ -1641,6 +1647,7 @@ def do_list() -> List[Dict]:
             "phase": None,
             "root_worker": None,
             "critic_worker": None,
+            "explorer_workers": [],
             "paid_active": None,
             "phase_deadline_at": None,
             "phase_deadline_exceeded": False,
@@ -1679,7 +1686,15 @@ def do_list() -> List[Dict]:
                 "lane": {
                     "root": coordination_view.get("root_worker"),
                     "critic": coordination_view.get("critic_worker"),
+                    **{
+                        f"explorer{index}": worker
+                        for index, worker in enumerate(
+                            coordination_view.get("explorer_workers") or [],
+                            start=1,
+                        )
+                    },
                 },
+                "explorer_workers": coordination_view.get("explorer_workers", []),
                 "generation": coordination_view.get("generation"),
                 "phase": coordination_view.get("phase"),
                 "phase_deadline_at": coordination_view.get("phase_deadline_at"),
@@ -1855,6 +1870,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--coordination",
         choices=("legacy", "reasoning-first"),
         default="reasoning-first",
+    )
+    n.add_argument(
+        "--active-explorers",
+        type=int,
+        choices=(0, 1, 2),
+        default=0,
+        help=(
+            "additional protected reasoning-first explorer lanes (default: 0; "
+            "legacy accepts only 0)"
+        ),
     )
 
     a = sub.add_parser("assign", help="write a worker's per-round TASK.md")
@@ -2043,6 +2068,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             roles=args.roles,
             model=args.model,
             coordination=args.coordination,
+            active_explorers=args.active_explorers,
         )
         print(
             f"created {args.project} with {len(r['workers'])} workers: "

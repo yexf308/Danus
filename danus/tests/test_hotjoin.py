@@ -107,6 +107,38 @@ def _started_intent(
     )
 
 
+@pytest.mark.parametrize("lane", ["explorer1", "explorer2"])
+def test_paid_intent_accepts_stable_explorer_coordination_lanes(
+    tmp_path: Path,
+    lane: str,
+) -> None:
+    project, _worker = _project(tmp_path)
+    store = HotJoinStore(project)
+    store.set_thread_id("max", f"thread-{lane}")
+    intent = store.round_intent(
+        "max",
+        f"thread-{lane}",
+        prompt_sha256="a" * 64,
+        requested_model="offline-model",
+        requested_effort="high",
+        coordination_slot_id=f"slot_{lane}",
+        coordination_generation=1,
+        coordination_lane=lane,
+    )
+    assert intent["coordination_lane"] == lane
+    with pytest.raises(ValueError, match="must be supplied exactly"):
+        store.round_intent(
+            "max",
+            f"thread-{lane}",
+            prompt_sha256="b" * 64,
+            requested_model="offline-model",
+            requested_effort="high",
+            coordination_slot_id="slot_observer",
+            coordination_generation=1,
+            coordination_lane="observer",
+        )
+
+
 def test_store_is_idempotent_append_only_and_rejects_content_conflict(tmp_path: Path):
     project, _worker = _project(tmp_path)
     store = HotJoinStore(project)

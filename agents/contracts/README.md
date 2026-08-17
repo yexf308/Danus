@@ -26,10 +26,14 @@ Consistent across all three tiers:
 - **Global memory** (incl. `master_guidance`) is shared awareness/strategy, never
   a correctness source — a proof builds only on `fact_id`s.
 - **The shared stores change only through the sanctioned MCP tools**, never by hand.
-- **Reasoning-first paid work is one fixed root plus one fixed critic.** Dormant
-  observers consume no paid turns and are not an automatic rotation/failover
-  pool; 2700 seconds caps one paid turn, not the whole phase. Paid assignments
-  are generation/slot-bound snapshots, not mutable host `TASK.md` authority.
+- **Reasoning-first authority remains one fixed root plus one fixed critic.** New
+  projects have no active explorers by default. An explicit one or two stable
+  explorer lanes may reason, publish ordinary findings, and submit verifier-gated
+  candidates, but cannot confirm obstacles, create reviews or recommendations,
+  or resolve owner gates. Dormant observers consume no paid turns and are not an
+  automatic rotation/failover pool; 2700 seconds caps one paid turn, not the
+  whole phase. Paid assignments are generation/slot-bound snapshots, not mutable
+  host `TASK.md` authority.
 - **Known glossary conflicts fail before paid verification.** Promotion repeats
   the check under the graph lock because the read-only preflight cannot authorize
   a concurrent write.

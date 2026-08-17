@@ -173,6 +173,40 @@ def test_list(tmp: Path):
         assert rows["P"]["candidate"] is None
 
 
+def test_explorer_assignment_and_status_distinguish_paid_lanes_from_observers(
+    tmp: Path,
+):
+    with _project_env(tmp):
+        cli.do_new("P", active_explorers=2)
+        first = cli.do_assign("P/high", "independent alternate route")
+        second = cli.do_assign("P/high2", "supporting lemma route")
+        observer = cli.do_assign("P/high3", "dormant projection")
+
+        assert first["generation_staged"] is True
+        assert second["generation_staged"] is True
+        assert "assignment_scope" not in first
+        assert "assignment_scope" not in second
+        assert observer["generation_staged"] is False
+        assert observer["assignment_scope"] == "dormant_observer_projection"
+
+        status = {row["worker"]: row for row in cli.do_status("P")}
+        assert status["max"]["lane"] == "root"
+        assert status["max2"]["lane"] == "critic"
+        assert status["high"]["lane"] == "explorer1"
+        assert status["high2"]["lane"] == "explorer2"
+        assert status["high3"]["lane"] == "observer"
+        assert status["high"]["explorer_workers"] == ["high", "high2"]
+
+        listed = {row["project"]: row for row in cli.do_list()}["P"]
+        assert listed["explorer_workers"] == ["high", "high2"]
+        assert listed["lane"] == {
+            "root": "max",
+            "critic": "max2",
+            "explorer1": "high",
+            "explorer2": "high2",
+        }
+
+
 def test_status_and_list_expose_active_candidate_overlay(tmp: Path):
     with _project_env(tmp):
         cli.do_new("P", roles="high:1")

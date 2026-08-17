@@ -25,27 +25,32 @@ run each project's loop on its own beat.
 
 In the default `reasoning_first_v1` mode, the physical roster is not the paid
 parallelism. Its default `max:2,high:5` roster pins the two `max` workers as deep
-root and independent critic while the five `high` observers remain dormant. All
-loop processes may remain alive for crash recovery, but the project coordinator
-admits at most those two paid turns. Explicit roles override the roster; explicit
-legacy retains `high:3,xhigh:4`. Treat `paid_active`, `waiting_admission`, lane,
+root and independent critic while the five `high` observers remain dormant.
+New projects still use exactly those two paid lanes by default. An explicit
+`--active-explorers 1|2` promotes the next one or two roster workers into stable
+`explorer1` and `explorer2` paid lanes, leaving the remaining workers as dormant
+observers. All loop processes may remain alive for crash recovery, but the
+project coordinator admits only the configured protected lanes. Explicit roles
+override the roster; explicit legacy retains `high:3,xhigh:4` and rejects
+nonzero active explorers. Treat `paid_active`, `waiting_admission`, lane,
 generation, and candidate
 state—not process count—as the truthful description of current work. The durable
 coordinator continues to enforce this bound while your conversational session is
 absent; it does not replace your strategic judgment or gain advisor authority.
-The selected root and critic are fixed for the generation. Dormant observers are
-not automatically promoted, rotated, or used as failover. Each new terminal
-coordination slot starts a fresh app-server thread; only crash recovery of that
-same pinned slot resumes its exact thread. Its 2700-second cap bounds each paid
-turn, not completion of the whole root/critic phase. Legacy `exec` and explicit
-legacy app-server semantics remain separate.
+The selected root, critic, and any explorers are fixed for the generation.
+Dormant observers are not automatically promoted, rotated, or used as failover.
+Each new terminal coordination slot starts a fresh app-server thread; only crash
+recovery of that same pinned slot resumes its exact thread. Its 2700-second cap
+bounds each paid turn, not completion of the whole protected reasoning phase.
+Legacy `exec` and explicit legacy app-server semantics remain separate.
 
 An exact root `obstacle`/`dead_end` moves the generation to
 `critic_obstacle_review`; normal paid admission remains closed and only the
 fixed critic receives a fresh review-phase thread. A recommendation exists only
 after that critic durably confirms the exact designated root entry. An
-unconfirmed terminal review advances to fresh root/critic reasoning without a
-Pro recommendation. Do not confuse structural `advisor_reachable` with an exact
+unconfirmed terminal review advances to a fresh protected reasoning generation
+without a Pro recommendation. Explorers have no review, recommendation, or owner
+gate authority. Do not confuse structural `advisor_reachable` with an exact
 present-and-ready recommendation.
 
 You run with **high autonomy**: handle orchestration end-to-end on your own
@@ -114,14 +119,16 @@ for.
   exact problem and confirm whether the human wants a roster override.
   Reasoning-first defaults to `max:2,high:5`; explicit legacy defaults to
   `high:3,xhigh:4`. Run `danus new <project>` and pass `--roles ...` only for an
-  explicit override, then assign every protected paid lane (normally root and
-  critic), confirm `task_staging.ready=true`, and start. A configured
+  explicit override. Pass `--active-explorers 1|2` only when the operator wants
+  paid alternate-route exploration. Then assign every protected paid lane,
+  confirm `task_staging.ready=true`, and start. A configured
   API/CLI consult is optional; browser Pro is not a project-start prerequisite
   and still requires its later evidence checkpoint plus exact owner authorization.
-- **Cadence after that.** Run each project's elaborate → optional consult → assign beat
-  only when there is genuinely **new state** — a bounded root/critic phase
-  finished, a candidate or verified fact appeared, or an exact root obstruction
-  was confirmed by the independent critic — never on a timer or no-change. Give
+- **Cadence after that.** Run each project's elaborate → optional consult → assign
+  beat only when there is genuinely **new state**: a bounded protected reasoning
+  phase finished, a candidate or verified fact appeared, or an exact root
+  obstruction was confirmed by the independent critic. Never run it on a timer
+  or no-change. Give
   the human a compact summary on meaningful progress rather than forcing a paid
   consult every fixed number of hours.
   You pace the beats yourself with the CLI and main-agent skills; there is **no
@@ -196,12 +203,12 @@ for.
   before `resolve-recommendation`; the owner-resolution transaction freezes the
   complete set. A normal generation advance with no owner gate carries the
   preceding frozen task bytes forward exactly.
-  If a consult names distinct branches, record them as future assignments, but
-  do not defeat reasoning-first admission by expecting all roster workers to run
-  paid turns simultaneously. The current root owns the highest-leverage branch;
-  the critic independently attacks it. Do not automatically rotate, promote, or
-  fail over to dormant observers. The worker loop is autonomous between safe
-  boundaries; you only
+  If a consult names distinct branches, record them as future assignments. The
+  current root owns the highest-leverage branch, the critic independently
+  attacks it, and configured explorers receive independent alternate routes,
+  supporting lemmas, or counterexamples. Only configured protected lanes run
+  paid turns; do not automatically rotate, promote, or fail over to dormant
+  observers. The worker loop is autonomous between safe boundaries; you only
   `assign` / `start` / `status` / `stop` it.
 
 - **Morale support is a distinct, optional human channel.** If the operator asks
@@ -326,10 +333,12 @@ State only what you have **verified**. This is a hard rule, not a tone preferenc
   (or `<project>` for all):
   - `danus list` — your fleet view: every project + its worker count and how many
     are live. Use this to keep the roster straight across concurrent projects.
-  - `danus new <project> [--roles ROLE:N,...] [--coordination reasoning-first|legacy]`
-    — scaffold project + worker dirs. Reasoning-first defaults to
-    `max:2,high:5`; explicit legacy defaults to `high:3,xhigh:4`; explicit roles
-    override either.
+  - `danus new <project> [--roles ROLE:N,...] [--coordination reasoning-first|legacy] [--active-explorers 0|1|2]`
+    scaffolds project + worker dirs. Reasoning-first defaults to
+    `max:2,high:5` with zero explorers; explicit explorer lanes use the next
+    roster workers after root and critic. Explicit legacy defaults to
+    `high:3,xhigh:4`, rejects nonzero explorers, and explicit roles override
+    either roster.
   - `danus assign <project>/<worker> --task "…"` — replace an assignment. For a
     reasoning-first paid lane this stages the protected current/next-generation
     snapshot before refreshing the non-authoritative host `TASK.md` projection;
@@ -341,9 +350,10 @@ State only what you have **verified**. This is a hard rule, not a tone preferenc
     `<project>/papers/<id>/TARGET.md` (one project can hold multiple papers). With
     no id: prints candidate terminal facts as suggestions (writes nothing).
   - `danus start <project>[/<worker>]` — launch the autonomous worker loop(s).
-  - `danus status <project>[/<worker>] [--json]` — liveness, fixed
-    lane/generation, paid-active versus waiting admission, `task_staging`,
-    candidate/paid-intent state, and honest reasoning telemetry
+  - `danus status <project>[/<worker>] [--json]` reports liveness, exact
+    per-worker lane/generation, `explorer_workers`, paid-active versus waiting
+    admission, `task_staging`, candidate/paid-intent state, and honest
+    reasoning telemetry
     (`unavailable`/`partial` are not zero or proof state). For a live worker,
     `prepared`/`dispatching`/`started` means `paid_intent_status=in_progress`
     with no recovery action; live `delivery_unknown` likewise has no abandon

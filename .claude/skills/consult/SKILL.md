@@ -114,9 +114,11 @@ new.
    consult — **never `fact_revoke` it** (revoke cascades on *facts* only).
 
 4. **Dispatch from it** (see the main-agent contract's command surface). In
-   `reasoning_first_v1`, assign the fixed current root and independent critic;
-   record additional branches as ideas without automatically rotating, promoting,
-   or failing over to dormant observers.
+   `reasoning_first_v1`, assign every configured protected worker: the fixed
+   current root and independent critic, plus any stable explorer lanes. Explorer
+   assignments must be independent alternate routes, supporting lemmas, or
+   counterexamples and grant no obstacle-confirmation or advisor authority. Do
+   not automatically rotate, promote, or fail over to dormant observers.
 
 5. **Keep the human informed** at the right severity (the elaboration + the
    consulted direction is what you summarize up, in the operator's language per
@@ -254,8 +256,8 @@ terminal `receipt_sha256`.
 ## The `off` path (default)
 
 When `DANUS_CONSULT_TRANSPORT=off` (the default), the consult short-circuits and
-the main agent reasons from the current elaboration. Assign the fixed root/critic
-directly from that synthesis; do not fabricate a model reply or
+the main agent reasons from the current elaboration. Assign every configured
+protected lane directly from that synthesis; do not fabricate a model reply or
 `master_guidance`, and do not create fake token/cost telemetry. Event-driven
 dispatch and human updates remain unchanged.
 

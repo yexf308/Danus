@@ -21,7 +21,7 @@ there is no default project.
 | verb | form | what it does |
 |---|---|---|
 | `list` | `danus list [--json]` | all projects + physical liveness and reasoning-first paid/waiting counts |
-| `new` | `danus new <project> [--roles ROLES] [--model M] [--coordination reasoning-first\|legacy]` | scaffold a project + worker dirs; reasoning-first defaults to two `max` root/critic workers plus five dormant `high` observers, while explicit legacy defaults to `high:3,xhigh:4` |
+| `new` | `danus new <project> [--roles ROLES] [--model M] [--coordination reasoning-first\|legacy] [--active-explorers 0\|1\|2]` | scaffold a project + worker dirs; reasoning-first defaults to two `max` root/critic workers and zero active explorers, while `N` promotes the next `N` roster workers into stable explorer lanes; legacy rejects nonzero explorers and defaults to `high:3,xhigh:4` |
 | `assign` | `danus assign <project>/<worker> (--task "…" \| --file P \| --stdin)` | replace an assignment; for a reasoning-first paid lane, stage the exact task bytes for the current generation (or the gated next generation) before refreshing the host `TASK.md` projection |
 | `say` | `danus say <project>/<worker> (--text "…" \| --file P \| --stdin) [--client-id ID] [--fallback queue\|fail]` | durably hot-join owner guidance into the exact active app-server turn; fallback defaults to `queue` |
 | `encourage` | `danus encourage <project>/<worker> [--text "…" \| --file P \| --stdin] [--client-id ID]` | send non-authoritative morale support to the canonical currently started paid turn only; omitted text uses the built-in encouragement, and delivery never queues for a later turn |
@@ -35,10 +35,16 @@ there is no default project.
 | `rotate-thread` | `danus rotate-thread <project>/<worker> --expected-thread-id ID --reason TEXT` | explicitly accept terminal conversation-context loss after bounded resume failure; fail closed for a live/busy worker, share `start`'s `.pid.lock`, and preserve research stores |
 | `finalize` | `danus finalize <project> [--paper <paper_id>] [<fact_id> …]` | record the approved target theorem(s) in the paper's `TARGET.md` (what write-paper reads; default paper → `<project>/TARGET.md`, a non-default `--paper` → `<project>/papers/<paper_id>/TARGET.md`). **With no id:** print candidate terminal facts as suggestions (writes nothing) |
 | `start` | `danus start <project>[/<worker>]` | launch the autonomous worker loop(s); a live loop is not necessarily a paid model turn |
-| `status` | `danus status <project>[/<worker>] [--json]` | liveness, round, lane/generation, paid-active vs waiting admission, task staging, candidate/paid-intent state, and last-turn telemetry |
+| `status` | `danus status <project>[/<worker>] [--json]` | liveness, round, exact per-worker lane/generation, `explorer_workers`, paid-active vs waiting admission, task staging, candidate/paid-intent state, and last-turn telemetry |
 | `stop` | `danus stop <project>[/<worker>] [--force]` | graceful (finish the round, exit at the boundary) or `--force` (durably request the worker to interrupt its active turn/direct child and exit) |
 
 Notes:
+- `--active-explorers N` is represented only as
+  `coordination.max_paid_workers=2+N`; there is no duplicate explorer metadata.
+  A nonzero request fails before project creation unless the roster can fill
+  root, critic, and every requested explorer lane. Explorers may publish ordinary
+  findings and verifier-gated candidates but have no obstacle-review, advisor,
+  or owner-gate authority.
 - In reasoning-first mode, the paid task source of truth is the coordinator's
   generation/slot snapshot, identified by its SHA-256 and byte count. The host
   and model-workspace `TASK.md` files are projections of that binding, not an

@@ -16,7 +16,7 @@ For the main agent's operating contract, see `AGENTS.md`
 ```
 operator → ① orchestration (main agent + danus CLI)   — conducts, never does math
               ② strategy   (elaboration → consult → master_guidance)
-              ③ execution  (durable admission: ≤1 root + ≤1 independent critic paid turn;
+              ③ execution  (durable admission: fixed root + critic, optionally 1-2 explorers;
                             generation/slot-bound tasks; dormant roster loops wait without codex)
    gm_* │         │ fact_submit
         ▼         ▼
@@ -107,16 +107,19 @@ Danus/
    rebuilds the final expansion snapshot before writing under the graph mutation
    lock.
 6. Autonomy and resumability. Workers run detached; durable memory preserves
-   verified work across crashes. In `reasoning_first_v1`, one root and one critic
-   are fixed for the generation; dormant observers are not automatically rotated
-   or promoted. Every new terminal coordination slot receives a fresh app-server
-   thread, while crash recovery of that same slot resumes only its exact pinned
-   thread. Its paid task is copied from the exact durable generation snapshot,
-   hash-bound into the slot/prompt, and projected into the model workspace;
-   mutable host `TASK.md` is not paid authority. Owner resolution requires and
-   freezes complete next-generation task staging, while a no-owner advance
-   carries the prior frozen set forward exactly. The 2700-second bound caps each
-   paid turn, not the whole phase.
+   verified work across crashes. In `reasoning_first_v1`, one root, one critic,
+   and any explicitly configured explorer lanes are fixed for the generation;
+   dormant observers are not automatically rotated or promoted. Explorers have
+   ordinary research and verifier-gated candidate authority, but no obstacle
+   confirmation, review, advisor recommendation, or owner-gate authority. Every
+   new terminal coordination slot receives a fresh app-server thread, while
+   crash recovery of that same slot resumes only its exact pinned thread. Its
+   paid task is copied from the exact durable generation snapshot, hash-bound
+   into the slot/prompt, and projected into the model workspace; mutable host
+   `TASK.md` is not paid authority. Owner resolution requires and freezes
+   complete next-generation task staging for every paid lane, while a no-owner
+   advance carries the prior frozen set forward exactly. The 2700-second bound
+   caps each paid turn, not the whole phase.
 7. Strategy consult is optional. It defaults to `off`, where the main agent
    dispatches from its own current shared-state synthesis. `gpt_pro`,
    `claude_api`, and `claude_code` are explicit attended opt-ins whose actual
@@ -168,7 +171,7 @@ Danus/
 | MCP tool set + role gating | 8 tools; `roles.py` `ROLE_TOOLS` (worker/main get exact bounded `gm_get` and lazy `fact_context`; main has NO `fact_submit`; verifier read-only) | `danus.gateway` ↔ worker/main/verifier agents |
 | MCP launch | `python -m danus.gateway` + `DANUS_ROLE` env | `danus.verify` launcher · worker `.codex/config.toml` · `.codex/config.toml` (main) → `danus.gateway` |
 | verify HTTP | `GET /health` attests exact `{status,pid,instance_nonce,output_protocol_version:3,verifier_bundle_digest}`; `POST /verify {expected_verifier_instance_nonce,expected_output_protocol_version:3,expected_verifier_bundle_digest,statement,proof,glossary_introduces?,fact_context?}` → schema-v3 result plus bounded scheduler headers; every final finding carries an exact original candidate `{source,line,exact_line}` anchor, checked independently by launcher and gateway; supplied context must be complete and digest-attested; only `final/correct` with zero findings can authorize the locked write | `danus.gateway.fact_submit` ↔ `danus.verify` |
-| reasoning-first coordination | new projects persist `reasoning_first_v1` and default to `max:2,high:5`; a protected, content-bounded SQLite CAS pins the two `max` workers as root and critic (no automatic rotation/failover), leaves five `high` observers dormant without paid turns, gives each new terminal coordination slot a fresh app-server thread, resumes only same-slot crashes, caps each paid turn at 2700 seconds without promising whole-phase completion, and stores the bounded task snapshot needed to bind the slot/prompt/model-workspace `TASK.md` to an exact generation-task digest; paid `assign` stages before host projection, owner resolution requires and freezes all `N+1` paid tasks, and ordinary advance carries the previous frozen set exactly; active candidates freeze admission/retask; an exact root obstacle/dead-end moves to `critic_obstacle_review`, where only the fixed critic can confirm it and emit an `owner_action_required` Pro recommendation with browser authorization false; explicit roles override the roster and legacy keeps `high:3,xhigh:4` | `danus.coordination` ↔ worker loop · gateway · CLI status |
+| reasoning-first coordination | new projects persist `reasoning_first_v1` and default to `max:2,high:5`, `max_paid_workers=2`, and zero active explorers; `--active-explorers N` stores only `max_paid_workers=2+N` and assigns stable `explorer1`/`explorer2` lanes from the next roster workers, failing before creation if the roster is insufficient; a protected SQLite CAS admits every configured paid lane, leaves true observers dormant, binds each slot/prompt/model-workspace `TASK.md` to an exact generation-task digest, requires every paid task and terminal before normal advance, and preserves the project-wide candidate freeze; only the fixed root can create an obstacle review, only the fixed critic is admitted to `critic_obstacle_review` and can emit an `owner_action_required` recommendation, and explorers have no review/advisor/owner-gate authority; owner resolution requires and freezes all next-generation paid tasks; compatible two-lane schema-v7 stores remain v7 while explorer stores use expanded lane constraints; legacy rejects nonzero explorers and keeps `high:3,xhigh:4` | `danus.coordination` ↔ worker loop · gateway · CLI status |
 | glossary preflight and promotion | one shared-lock `glossary_conflicts` snapshot rejects known project/global conflicts before candidate admission, active-exact reuse, or verifier spend; `add_if_context_unchanged` independently rechecks under the exclusive graph mutation lock | `danus.core.FactGraph` ↔ `danus.gateway.fact_submit` |
 | exact-turn encouragement | `danus encourage <project>/<worker> [--text\|--file\|--stdin] [--client-id ID]` requires authenticated live PID plus canonical `started` intent, persists immutable expected thread/turn ids with `fallback=fail`, and never queues/starts paid work; envelope authority is morale only | orchestration CLI ↔ hot-join store/broker ↔ worker contract |
 | fact id inputs | `problem_id + sorted(predecessors) + sorted(glossary) + normalized(statement,proof)`; **external_refs EXCLUDED** | `danus.core` ↔ everyone (write-paper reads `external_refs`) |

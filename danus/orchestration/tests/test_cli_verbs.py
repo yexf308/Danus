@@ -2332,10 +2332,17 @@ def test_build_parser_all_verbs():
         a.cmd == "new" and a.project == "P" and a.roles == "high:2" and a.model == "m"
     )
     assert a.coordination == "reasoning-first"
+    assert a.active_explorers == 0
     default_new = p.parse_args(["new", "D"])
     assert default_new.roles is None and default_new.coordination == "reasoning-first"
+    assert default_new.active_explorers == 0
+    explorer_new = p.parse_args(
+        ["new", "E", "--coordination", "reasoning-first", "--active-explorers", "2"]
+    )
+    assert explorer_new.active_explorers == 2
     legacy_new = p.parse_args(["new", "L", "--coordination", "legacy"])
     assert legacy_new.roles is None and legacy_new.coordination == "legacy"
+    assert legacy_new.active_explorers == 0
     a = p.parse_args(
         [
             "resolve-candidate",
@@ -2480,6 +2487,34 @@ def test_main_new_mode_specific_default_roles(tmp: Path):
             (L.project_dir("L") / "project.json").read_text(encoding="utf-8")
         )
         assert legacy["roles"] == "high:3,xhigh:4"
+
+
+def test_main_new_threads_active_explorers_and_legacy_rejects_them(tmp: Path):
+    with _project_env(tmp), _patch_spawn():
+        rc, out = _run_main(["new", "E", "--active-explorers", "2"])
+        assert rc == 0 and "created E with 7 workers" in out
+        metadata = json.loads(
+            (L.project_dir("E") / "project.json").read_text(encoding="utf-8")
+        )
+        assert metadata["coordination"]["max_paid_workers"] == 4
+        assert "active_explorers" not in metadata
+        store = CoordinationStore.open_existing(L.project_dir("E"), metadata)
+        assert store is not None
+        status = store.project_status()
+        assert status["explorer_workers"] == ["high", "high2"]
+
+        with pytest.raises(SystemExit, match="legacy coordination"):
+            _run_main(
+                [
+                    "new",
+                    "L",
+                    "--coordination",
+                    "legacy",
+                    "--active-explorers",
+                    "1",
+                ]
+            )
+        assert not L.project_dir("L").exists()
 
 
 def test_main_new_explicit_legacy_coordination(tmp: Path):

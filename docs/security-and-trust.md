@@ -267,18 +267,19 @@ can retarget paid work after the binding. Owner recommendation resolution
 requires complete next-generation paid-lane staging and freezes it atomically;
 an advance with no owner gate carries the prior frozen set forward exactly.
 
-Reasoning telemetry is content-free and projected only from the root app-server
-thread. It is diagnostic—not proof, correctness, liveness, admission, or browser
+Reasoning telemetry is content-free and projected only from each paid app-server
+thread. It is diagnostic, not proof, correctness, liveness, admission, or browser
 authority. Missing or unsupported signals are `unavailable` or `partial`, never
 fabricated as zero. The protected audit distinguishes live-stream reroute
 observations from post-crash unknown history, and labels token usage as observed
-rather than schema-attested final. A recovered prior paid turn with unavailable reroute
-history is quarantined with automatic retry disabled; it is never silently
-accepted or duplicated.
+rather than schema-attested final. A recovered prior paid turn with unavailable
+reroute history is quarantined with automatic retry disabled; it is never
+silently accepted or duplicated.
 
 In `reasoning_first_v1`, each new terminal coordination slot normally starts a
-fresh app-server thread; only crash recovery of that same fixed root/critic slot
-resumes its exact thread. Dormant observers are not rotation/failover. The long
+fresh app-server thread; only crash recovery of that same fixed root, critic, or
+explorer slot resumes its exact thread. Dormant observers are not
+rotation/failover. The long
 history boundary below therefore applies to same-slot recovery and explicitly
 legacy app-server continuation, not to ordinary new terminal slots. Codex 0.147
 supports a bounded `thread/read(includeTurns=false)` status check, but its

@@ -72,7 +72,7 @@ DEFAULT_RPC_TIMEOUT = 30.0
 HOST_LIVENESS_POLL_SECONDS = 0.1
 _TARGET_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _COORDINATION_SLOT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")
-_COORDINATION_LANES = {"root", "critic"}
+_COORDINATION_LANES = {"root", "critic", "explorer1", "explorer2"}
 _COORDINATION_TERMINAL_DISPOSITIONS = {
     0: "completed",
     123: "protocol_failure",

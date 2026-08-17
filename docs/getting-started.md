@@ -140,9 +140,14 @@ spend ceiling, consult transport, codex backend), provisions `OPERATOR.md` +
 
 After initialize, continue with `operating-guide.md` to create and run a project.
 `danus new <project>` defaults to reasoning-first coordination and roster
-`max:2,high:5`: the two `max` workers become the only paid root/critic lanes and
-the five `high` workers remain dormant observers. Pass `--roles` for an explicit
-override. `--coordination legacy` without `--roles` retains `high:3,xhigh:4`.
+`max:2,high:5`: the two `max` workers become the paid root/critic lanes and the
+five `high` workers remain dormant observers. Add `--active-explorers 1` to make
+`high` the stable `explorer1` lane, or `--active-explorers 2` to also make
+`high2` the stable `explorer2` lane. The remaining `high` workers stay dormant.
+Pass `--roles` for an explicit roster override; an explorer request fails before
+project creation if that roster cannot fill all `2+N` paid lanes.
+`--coordination legacy` rejects nonzero active explorers and, without `--roles`,
+retains `high:3,xhigh:4`.
 
 ## Troubleshooting
 

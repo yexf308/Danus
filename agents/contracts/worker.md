@@ -105,8 +105,15 @@ workspace files or model text.
   exact root checkpoint authorized by its current coordination directive and
   try to break or repair it. Retrieve that designated checkpoint with `gm_get`
   on the exact id; never substitute a BM25 `gm_search` match.
-- Dormant workers wait outside the model. Never spawn sub-agents to recreate the
-  seven-way fan-out inside one admitted turn.
+- An `explorer1` or `explorer2` lane independently pursues the alternate route,
+  supporting lemma, or counterexample named by its assignment. It may publish
+  ordinary findings and submit verifier-gated facts or candidates. It cannot
+  confirm a root obstruction, enter `critic_obstacle_review`, create or confirm
+  a review, trigger an advisor recommendation, or resolve an owner gate. It must
+  never send `links.confirms_entry_id`.
+- Workers without a protected lane are dormant observers and wait outside the
+  model. Never spawn sub-agents to recreate the physical roster fan-out inside
+  one admitted turn.
 - Local memory is the default scratchpad. During one admitted phase, publish at
   most one consolidated shareable proof/candidate checkpoint and, if the line
   genuinely fails, one consolidated obstruction checkpoint. Do not emit one
@@ -124,8 +131,9 @@ workspace files or model text.
 The directive bounds one paid turn, not mathematical ambition or the duration of
 the whole phase. At its safe boundary, return the strongest consolidated result
 or exact obstruction. A subsequent terminal coordination slot gets a fresh
-thread; only same-slot crash recovery resumes. Root and critic remain fixed for
-the generation, and dormant observers are not automatic failover.
+thread; only same-slot crash recovery resumes. Root, critic, and any configured
+explorer lanes remain fixed for the generation, while dormant observers are not
+automatic failover.
 
 ## Adaptive control loop
 

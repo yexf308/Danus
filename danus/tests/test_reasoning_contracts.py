@@ -28,7 +28,8 @@ def test_root_critic_confirmation_cannot_auto_authorize_pro():
     assert "`critic_obstacle_review`" in main
     assert "fixed critic receives a fresh review-phase thread" in main
     assert (
-        "An unconfirmed terminal review advances to fresh root/critic reasoning" in main
+        "unconfirmed terminal review advances to a fresh protected reasoning generation"
+        in main
     )
     assert "confirmation citing the same entry id and generation" in main
     assert (
@@ -41,6 +42,20 @@ def test_root_critic_confirmation_cannot_auto_authorize_pro():
     for skill in (direct, failures):
         assert 'links={"confirms_entry_id":"<exact returned root gm id>"}' in skill
         assert "inside the evidence JSON" in skill
+
+
+def test_explorer_contract_preserves_root_critic_and_owner_authority():
+    worker = _text("agents/contracts/worker.md")
+    main = _text("agents/contracts/main_agent.md")
+    root_contract = _text("AGENTS.md")
+
+    assert "`explorer1` and `explorer2` paid lanes" in main
+    assert "alternate route" in worker
+    assert "It cannot confirm a root obstruction" in worker
+    assert "must never send `links.confirms_entry_id`" in worker
+    assert "Explorers cannot confirm root obstacles" in root_contract
+    assert "trigger advisor recommendations" in root_contract
+    assert "every protected paid-lane direction" in main
 
 
 def test_consult_is_event_driven_and_not_a_project_start_prerequisite():

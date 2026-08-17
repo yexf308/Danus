@@ -160,17 +160,21 @@ danus stop   <project> --force  # durable request: interrupt active owned work, 
 
 - Workers run detached in their own process groups, so they outlive your session and
   a graceful stop lets an in-flight paid turn finish (no lost verified work). In
-  `reasoning_first_v1`, one root and one critic are fixed for the generation;
-  dormant observers consume no paid turns and are not automatic failover. A new
-  terminal coordination slot starts a fresh app-server thread, while same-slot
-  crash recovery alone resumes its exact pinned thread. The 2700-second cap is
-  per paid turn, not a whole-phase completion guarantee. `--force`
+  `reasoning_first_v1`, one root, one critic, and any explicitly configured
+  `explorer1`/`explorer2` lanes are fixed for the generation. Dormant observers
+  consume no paid turns and are not automatic failover. Explorers can publish
+  ordinary research and verifier-gated candidates, but cannot confirm root
+  obstacles, enter the critic review, create advisor recommendations, or resolve
+  owner gates. A new terminal coordination slot starts a fresh app-server thread,
+  while same-slot crash recovery alone resumes its exact pinned thread. The
+  2700-second cap is per paid turn, not a whole-phase completion guarantee. `--force`
   never signals a numeric PID/PGID from the CLI: the authenticated worker reads
   the durable request, interrupts its app-server turn or cleans its retained
   direct-child process group, reaps it, audits the result, and exits.
-- `status --json` separates physical liveness, paid admission, candidate state,
-  and content-free reasoning diagnostics. `unavailable`/`partial` telemetry is
-  not zero, proof state, or authority to trigger an advisor.
+- `status --json` separates physical liveness, exact per-worker lane,
+  `explorer_workers`, paid admission, candidate state, and content-free reasoning
+  diagnostics. `unavailable`/`partial` telemetry is not zero, proof state, or
+  authority to trigger an advisor.
 
 ## Unattended operation (examples, not core)
 

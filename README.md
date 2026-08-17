@@ -39,9 +39,11 @@ explicit opt-ins and default to `off`.
   and rendering workflows. Worker project configuration is isolated from the
   main-agent workspace so one runtime cannot silently shadow another.
 - **Reasoning-first coordination.** New projects pin one deep root and one
-  independent critic while dormant observers consume no paid turns. Every new
-  terminal coordination slot gets a fresh app-server thread; only recovery of
-  that exact slot resumes it.
+  independent critic while dormant observers consume no paid turns. An explicit
+  one or two balanced explorer lanes can pursue independent alternate routes
+  without gaining critic or advisor authority. Every new terminal coordination
+  slot gets a fresh app-server thread; only recovery of that exact slot resumes
+  it.
 - **Exact paid-task binding.** Each paid assignment is staged before dispatch and
   bound to its generation, worker, byte length, and SHA-256 digest. A later host
   edit cannot retarget an admitted turn, and owner-gated generation changes
@@ -80,14 +82,19 @@ holds every verified result and is the system's only source of truth.
 
 New projects use `reasoning_first_v1` coordination by default. The physical
 roster defaults to `max:2,high:5`: the durable project-wide admission gate pins
-the two `max` workers as deep root and independent critic. The five `high` loops
-stay dormant in `waiting_admission`: they consume no paid round and do not start
-Codex. They are observers, not an automatic rotation or failover pool. Explicit
-`--roles` still overrides the roster. Each admitted paid turn has a 2700-second
-cap; that is not a promise that the whole root/critic phase completes in 2700
-seconds. An active verification candidate temporarily freezes new admission.
-Pass `--coordination legacy` only when the old open-loop behavior is intentionally
-required; legacy without explicit roles retains `high:3,xhigh:4`.
+the two `max` workers as deep root and independent critic. By default all five
+`high` loops stay dormant in `waiting_admission`: they consume no paid round and
+do not start Codex. `--active-explorers 1` promotes `high` to `explorer1`, while
+`--active-explorers 2` also promotes `high2` to `explorer2`; `high3` through
+`high5` remain observers. The option is represented only by
+`max_paid_workers=2+N`, and the requested roster must be large enough before any
+project files are created. Explicit `--roles` still overrides the roster. Each
+admitted paid turn has a 2700-second cap; that is not a promise that the whole
+protected phase completes in 2700 seconds. A candidate from any paid lane
+temporarily freezes project-wide admission. Pass `--coordination legacy` only
+when the old open-loop behavior is intentionally required; legacy rejects
+nonzero active explorers and otherwise retains `high:3,xhigh:4` without explicit
+roles.
 
 Each new reasoning-first terminal coordination slot starts on a fresh app-server
 thread so the active reasoning context stays bounded. Only crash recovery of
@@ -105,11 +112,14 @@ paid lane is staged; resolution freezes the set atomically. Advances that need
 no owner decision carry the preceding frozen tasks forward exactly.
 
 When the root records an exact `obstacle` or `dead_end`, the generation enters
-`critic_obstacle_review`. Normal root/critic admission stops; the same fixed
+`critic_obstacle_review`. Normal paid admission stops; the same fixed
 critic receives one fresh review-phase thread and independently confirms or
 rejects that exact root entry. Only an exact confirmation can create
 `owner_action_required` and its per-intervention recommendation. An unconfirmed
 terminal review advances to a fresh reasoning generation without Pro advice.
+Explorers may publish ordinary findings and verifier-gated facts or candidates,
+but cannot confirm obstacles, create reviews or recommendations, or resolve an
+owner gate.
 
 The single verifier remains the mathematical authority, but it is no longer a
 reject-on-busy bottleneck. Distinct submissions wait in a bounded FIFO queue,

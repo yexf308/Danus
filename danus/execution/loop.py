@@ -2456,6 +2456,7 @@ def main(worker_dir: str) -> int:
                 "recommendation": None,
                 "resolution": None,
                 "candidate": None,
+                "explorer_workers": [],
             }
         return {
             "coordination_mode": snapshot["mode"],
@@ -2474,6 +2475,7 @@ def main(worker_dir: str) -> int:
             "recommendation": snapshot["recommendation"],
             "resolution": snapshot["resolution"],
             "candidate": snapshot["candidate"],
+            "explorer_workers": snapshot.get("explorer_workers", []),
             "paid_active": snapshot["paid_active"],
             "waiting_admission": snapshot["waiting_admission"],
         }

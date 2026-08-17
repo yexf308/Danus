@@ -35,20 +35,26 @@ Tell the main agent the problem. It will:
 
 1. **Confirm any roster override** — reasoning-first defaults to
    `max:2,high:5`: two deep workers become the fixed root and independent critic,
-   and five `high` workers remain dormant observers—not seven simultaneous paid
-   turns and not an automatic rotation/failover pool. Explicit legacy defaults
-   to `high:3,xhigh:4`; an explicit `--roles` overrides either default.
+   with zero active explorers; five `high` workers remain dormant observers, not
+   seven simultaneous paid turns and not an automatic rotation/failover pool.
+   Use `--active-explorers 1|2` only for an explicit paid exploration choice;
+   these stable lanes receive independent alternate routes, supporting lemmas,
+   or counterexamples. Explicit legacy rejects active explorers and defaults to
+   `high:3,xhigh:4`; an explicit `--roles` overrides either roster.
 2. **Write `PROBLEM.md`** — your goal, verbatim, under `runtime/projects/<p>/`.
-3. **Scaffold** — `danus new <p> [--roles ROLE:N,...]` (creates the workers, the
-   empty `global_memory/` + `fact_graph/`, and a durable coordinator). The
-   coordinator admits at most one root and one independent critic. Use
-   `--coordination legacy` only as an explicit compatibility choice.
+3. **Scaffold:** run
+   `danus new <p> [--roles ROLE:N,...] [--active-explorers 0|1|2]`. It creates
+   the workers, the empty `global_memory/` + `fact_graph/`, and a durable
+   coordinator. The coordinator admits the fixed root and critic plus only the
+   requested explorer lanes. A
+   nonzero explorer request fails before creation if the roster is insufficient.
+   Use `--coordination legacy` only as an explicit compatibility choice.
 
 Each new terminal reasoning-first coordination slot starts a fresh app-server
 thread. Only crash recovery of that same pinned slot resumes its exact thread.
 The 2700-second cap applies to each paid turn, not completion of the whole
-root/critic phase. Legacy `exec` and explicit legacy app-server continuation are
-separate compatibility semantics.
+protected reasoning phase. Legacy `exec` and explicit legacy app-server
+continuation are separate compatibility semantics.
 
 A **project** is the unit of work: one problem, its own memory and fact graph. You
 can run several at once; every operation names a project.
@@ -63,10 +69,10 @@ new state:
 2. **Optionally consult** — `off` is the default; `gpt_pro`, `claude_api`, and
    `claude_code` are explicit opt-ins. *(the `consult` skill)*
 3. **Assign** — record an actual reviewed consult reply as `master_guidance`, or
-   dispatch directly from the elaboration when consult is off. Assign the fixed
-   root/critic lanes (`danus assign`); for paid lanes this first stages the exact
-   generation task in the coordinator, then refreshes the host `TASK.md`
-   projection. Dormant observers remain unpaid.
+   dispatch directly from the elaboration when consult is off. Assign every
+   configured protected lane (`danus assign`); for paid lanes this first stages
+   the exact generation task in the coordinator, then refreshes the host
+   `TASK.md` projection. Dormant observers remain unpaid.
 4. **Monitor** — watch `danus status` / the dashboard; repeat when there is new
    state.
 

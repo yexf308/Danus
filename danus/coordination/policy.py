@@ -11,6 +11,7 @@ from typing import Any, Mapping, Sequence
 LEGACY_MODE = "legacy"
 REASONING_FIRST_MODE = "reasoning_first_v1"
 DEFAULT_MAX_PAID_WORKERS = 2
+MAX_SUPPORTED_PAID_WORKERS = 4
 DEFAULT_PHASE_TIMEOUT_SECONDS = 2700
 MAX_PHASE_TIMEOUT_SECONDS = 2700
 REASONING_PHASE = "root_critic_reasoning"
@@ -67,15 +68,31 @@ class CoordinationConfig:
 class LaneRoster:
     root: str
     critic: str | None
+    explorers: tuple[str, ...]
     lanes: Mapping[str, str]
 
 
-def coordination_payload(choice: str | None = None) -> dict[str, object]:
+def coordination_payload(
+    choice: str | None = None,
+    active_explorers: int = 0,
+) -> dict[str, object]:
     """Return the exact project.json payload for one CLI coordination choice."""
 
+    if (
+        isinstance(active_explorers, bool)
+        or not isinstance(active_explorers, int)
+        or active_explorers not in {0, 1, 2}
+    ):
+        raise CoordinationConfigError("active_explorers must be 0, 1, or 2")
     if choice in {None, "reasoning-first", REASONING_FIRST_MODE}:
-        return dict(DEFAULT_COORDINATION)
+        payload = dict(DEFAULT_COORDINATION)
+        payload["max_paid_workers"] = DEFAULT_MAX_PAID_WORKERS + active_explorers
+        return payload
     if choice == LEGACY_MODE:
+        if active_explorers:
+            raise CoordinationConfigError(
+                "legacy coordination does not support active explorers"
+            )
         return {"mode": LEGACY_MODE}
     raise CoordinationConfigError(f"unsupported coordination mode: {choice!r}")
 
@@ -107,9 +124,9 @@ def coordination_config(metadata: Mapping[str, Any]) -> CoordinationConfig:
     if (
         isinstance(max_paid, bool)
         or not isinstance(max_paid, int)
-        or not 1 <= max_paid <= DEFAULT_MAX_PAID_WORKERS
+        or not 1 <= max_paid <= MAX_SUPPORTED_PAID_WORKERS
     ):
-        raise CoordinationConfigError("max_paid_workers must be 1 or 2")
+        raise CoordinationConfigError("max_paid_workers must be between 1 and 4")
     if (
         isinstance(timeout, bool)
         or not isinstance(timeout, int)
@@ -142,7 +159,7 @@ def _role_pairs(spec: str) -> list[tuple[str, str]]:
 def select_lane_roster(
     metadata: Mapping[str, Any], config: CoordinationConfig
 ) -> LaneRoster:
-    """Choose root then critic by descending effort and stable roster order."""
+    """Choose root, critic, then explorers by effort and stable roster order."""
 
     workers = metadata.get("workers")
     roles = metadata.get("roles")
@@ -165,12 +182,26 @@ def select_lane_roster(
             roster_index[worker],
         ),
     )
+    if config.max_paid_workers > 2 and len(ordered) < config.max_paid_workers:
+        raise CoordinationConfigError(
+            "reasoning-first roster has fewer workers than its configured "
+            f"{config.max_paid_workers} protected paid lanes"
+        )
     root = ordered[0]
     critic = ordered[1] if config.max_paid_workers > 1 and len(ordered) > 1 else None
+    explorer_count = max(0, min(config.max_paid_workers, len(ordered)) - 2)
+    explorers = tuple(ordered[2 : 2 + explorer_count])
     lanes = {root: "root"}
     if critic is not None:
         lanes[critic] = "critic"
-    return LaneRoster(root=root, critic=critic, lanes=lanes)
+    for index, explorer in enumerate(explorers, start=1):
+        lanes[explorer] = f"explorer{index}"
+    return LaneRoster(
+        root=root,
+        critic=critic,
+        explorers=explorers,
+        lanes=lanes,
+    )
 
 
 def roster_digest(
@@ -243,8 +274,19 @@ def coordination_directive(
             "reading or comparing root conclusions, then stress-test the root's "
             "structural claims and confirm only an exact recorded obstacle entry."
         )
+    elif lane in {"explorer1", "explorer2"}:
+        body = (
+            "Independent explorer directive: pursue an alternate route, supporting "
+            "lemma, or counterexample distinct from the root and critic assignments. "
+            "Publish ordinary findings and submit verifier-gated candidates when "
+            "warranted. You have no obstacle-confirmation, critic-review, advisor-"
+            "recommendation, or owner-gate authority; never use "
+            "links.confirms_entry_id."
+        )
     else:
-        raise CoordinationConfigError("only root and critic receive paid directives")
+        raise CoordinationConfigError(
+            "only protected reasoning-first lanes receive paid directives"
+        )
     directive = prefix + body
     if len(directive.encode("utf-8")) > MAX_DIRECTIVE_BYTES:
         raise CoordinationConfigError("coordination directive exceeds hard limit")
@@ -252,7 +294,7 @@ def coordination_directive(
 
 
 def required_lanes(roster: LaneRoster) -> Sequence[str]:
-    return ("root", "critic") if roster.critic is not None else ("root",)
+    return tuple(roster.lanes.values())
 
 
 def candidate_outcome_releases(outcome: str) -> bool:

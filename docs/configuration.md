@@ -126,7 +126,7 @@ is an independent `xhigh` default and intentionally does not inherit
 
 | variable | default | meaning |
 |---|---|---|
-| `DANUS_ROUND_HARD_TIMEOUT` | `14400` (4h) | legacy-mode per-round wall-clock cap; each reasoning-first paid turn uses its project-pinned 2700-second cap (this does not claim the whole two-lane phase finishes in 2700 seconds) |
+| `DANUS_ROUND_HARD_TIMEOUT` | `14400` (4h) | legacy-mode per-round wall-clock cap; each reasoning-first paid turn uses its project-pinned 2700-second cap (this does not claim the whole protected phase finishes in 2700 seconds) |
 | `DANUS_MAX_ROUNDS` | `0` (unlimited) | round backstop |
 | `DANUS_MAX_CONSEC_FAILURES` | `5` | bail after N consecutive failed rounds |
 | `DANUS_ROUND_BEAT` | `5` | seconds between rounds |
@@ -136,10 +136,15 @@ is an independent `xhigh` default and intentionally does not inherit
 `max_paid_workers=2` and `phase_timeout_seconds=2700` in `project.json`. A
 reasoning-first project without explicit `--roles` uses `max:2,high:5`: the two
 `max` workers are the fixed paid root/critic lanes and the five `high` workers
-are dormant observers. Explicit `--roles` is preserved. Explicit legacy without
-roles uses `high:3,xhigh:4`; a project created by an older release without a
-`coordination` field remains legacy and is never silently migrated to different
-paid-turn semantics.
+are dormant observers. `--active-explorers N`, for `N` equal to 0, 1, or 2,
+persists no extra field; it sets `max_paid_workers=2+N` and assigns the next
+roster workers stable `explorer1`/`explorer2` lanes. A nonzero request requires a
+sufficient roster before creation. Explicit `--roles` is preserved. Explicit
+legacy rejects nonzero active explorers and without roles uses
+`high:3,xhigh:4`; a project created by an older release without a `coordination`
+field remains legacy and is never silently migrated to different paid-turn
+semantics. Existing two-lane schema-v7 coordination databases reopen at v7;
+new explorer databases use the expanded schema without rewriting those stores.
 
 ## Rendering & misc
 

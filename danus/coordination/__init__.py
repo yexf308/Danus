@@ -8,9 +8,11 @@ from .policy import (
     REASONING_FIRST_MODE,
     CoordinationConfig,
     CoordinationConfigError,
+    LaneRoster,
     coordination_config,
     coordination_payload,
     candidate_outcome_releases,
+    select_lane_roster,
 )
 from .store import (
     Admission,
@@ -26,6 +28,7 @@ __all__ = [
     "CRITIC_REVIEW_PHASE",
     "CoordinationConfig",
     "CoordinationConfigError",
+    "LaneRoster",
     "CoordinationError",
     "CoordinationStore",
     "DEFAULT_COORDINATION",
@@ -33,6 +36,7 @@ __all__ = [
     "REASONING_FIRST_MODE",
     "coordination_config",
     "coordination_payload",
+    "select_lane_roster",
     "candidate_receipt_id",
     "candidate_outcome_releases",
     "recommendation_resolution_id",

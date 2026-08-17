@@ -74,7 +74,7 @@ dashboard <p>` + port-forward.
 `gpt_pro`, `claude_api`, and `claude_code` are explicit opt-ins) → record an
 actual consult reply as `master_guidance`, or dispatch directly from the
 elaboration when off → assign **every** protected paid lane (normally the
-fixed root/critic lanes) → confirm
+fixed root/critic lanes, plus any explicitly configured explorers) → confirm
 `task_staging.ready=true` → monitor. Reasoning-first paid `assign` stages an
 exact generation task before refreshing the host `TASK.md`; the admitted slot
 and model-workspace projection are hash-bound to that snapshot. During
@@ -82,9 +82,12 @@ and model-workspace projection are hash-bound to that snapshot. During
 `resolve-recommendation`; resolution freezes the set. A no-owner generation
 advance carries the prior frozen tasks forward exactly. At project start, ask the
 worker roster if the operator wants to override it; reasoning-first defaults to
-`max:2,high:5` (two paid deep lanes and five dormant observers), while explicit
-legacy defaults to `high:3,xhigh:4`. Write `PROBLEM.md`, then run
-`danus new <project>` with `--roles ...` only for an explicit override.
+`max:2,high:5` (two paid deep lanes, zero active explorers, and five dormant
+observers), while explicit legacy defaults to `high:3,xhigh:4`. Write
+`PROBLEM.md`, then run `danus new <project>` with `--roles ...` only for an
+explicit roster override and `--active-explorers 1|2` only for an explicit paid
+exploration choice. Explorer lanes must receive independent alternate routes,
+supporting lemmas, or counterexamples.
 
 **Late ChatGPT Pro intervention is event-driven and attended.** It requires the
 exact current coordinator recommendation derived from the fixed root obstruction
@@ -114,11 +117,14 @@ is always a separate owner-gated event. While inactive, only worker loops and th
 deterministic reasoning-first admission continue; no strategy model or browser
 advisor starts automatically. Run only one main agent at a time.
 
-In `reasoning_first_v1`, the selected root and critic remain fixed; dormant
-observers are not an automatic rotation/failover pool. Every new terminal
-coordination slot gets a fresh app-server thread. Only recovery of that same
-pinned slot resumes its exact thread. The 2700-second limit applies to each paid
-turn, not to completion of the whole phase.
+In `reasoning_first_v1`, the selected root, critic, and any configured explorers
+remain fixed; dormant observers are not an automatic rotation/failover pool.
+Explorer findings and verifier-gated candidates are ordinary research input.
+Explorers cannot confirm root obstacles, create or confirm reviews, trigger
+advisor recommendations, or resolve owner gates. Every new terminal coordination
+slot gets a fresh app-server thread. Only recovery of that same pinned slot
+resumes its exact thread. The 2700-second limit applies to each paid turn, not to
+completion of the whole phase.
 
 If the operator explicitly wants to send morale support to an already running
 paid turn, `danus encourage <project>/<worker> [--text "…"]` is the distinct

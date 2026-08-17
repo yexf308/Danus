@@ -37,7 +37,8 @@ from .policy import (
     select_lane_roster,
 )
 
-SCHEMA_VERSION = 7
+TWO_LANE_SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 MAX_PROJECT_METADATA_BYTES = 1_000_000
 MAX_PINNED_PROMPT_BYTES = 131_072
 MAX_TASK_BYTES = 131_072
@@ -283,7 +284,7 @@ def load_project_metadata(project_dir: Path) -> dict[str, Any]:
 
 
 class CoordinationStore:
-    """Project-wide CAS store for two paid reasoning lanes."""
+    """Project-wide CAS store for protected reasoning-first paid lanes."""
 
     def __init__(
         self,
@@ -306,6 +307,16 @@ class CoordinationStore:
             self.roster: LaneRoster = select_lane_roster(self.metadata, self.config)
         except CoordinationConfigError as exc:
             raise CoordinationError(str(exc)) from exc
+        self._database_schema_version = (
+            SCHEMA_VERSION
+            if self.config.max_paid_workers > 2
+            else TWO_LANE_SCHEMA_VERSION
+        )
+        self._lane_sql = (
+            "'root', 'critic', 'explorer1', 'explorer2'"
+            if self._database_schema_version == SCHEMA_VERSION
+            else "'root', 'critic'"
+        )
         self._roster_digest = roster_digest(self.metadata, self.config, self.roster)
         self.directory = self.project_dir / ".coordination"
         self.path = self.directory / "state.sqlite3"
@@ -444,16 +455,16 @@ class CoordinationStore:
             connection.close()
             raise
 
-    @staticmethod
     def _create_generation_tasks_table_locked(
+        self,
         connection: sqlite3.Connection,
     ) -> None:
         connection.execute(
-            """
+            f"""
             CREATE TABLE generation_tasks (
                 worker TEXT NOT NULL,
                 generation INTEGER NOT NULL CHECK (generation >= 1),
-                lane TEXT NOT NULL CHECK (lane IN ('root', 'critic')),
+                lane TEXT NOT NULL CHECK (lane IN ({self._lane_sql})),
                 task TEXT NOT NULL,
                 task_sha256 TEXT NOT NULL,
                 task_bytes INTEGER NOT NULL CHECK (
@@ -472,7 +483,7 @@ class CoordinationStore:
         connection = self._connect(allow_create=create)
         try:
             connection.executescript(
-                """
+                f"""
                 CREATE TABLE IF NOT EXISTS project_state (
                     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                     schema_version INTEGER NOT NULL,
@@ -491,7 +502,7 @@ class CoordinationStore:
                 CREATE TABLE IF NOT EXISTS round_slots (
                     slot_id TEXT PRIMARY KEY,
                     worker TEXT NOT NULL,
-                    lane TEXT NOT NULL CHECK (lane IN ('root', 'critic')),
+                    lane TEXT NOT NULL CHECK (lane IN ({self._lane_sql})),
                     generation INTEGER NOT NULL CHECK (generation >= 1),
                     phase TEXT NOT NULL,
                     state TEXT NOT NULL CHECK (
@@ -656,7 +667,7 @@ class CoordinationStore:
                     ) VALUES(1, ?, ?, ?, ?, ?, 1, ?, ?, ?, NULL, NULL, ?)
                     """,
                     (
-                        SCHEMA_VERSION,
+                        self._database_schema_version,
                         self.config.mode,
                         self._roster_digest,
                         self.roster.root,
@@ -717,7 +728,12 @@ class CoordinationStore:
                             "coordination schema migration lost its CAS"
                         )
                     schema_version = 5
-                elif schema_version not in {5, 6, SCHEMA_VERSION}:
+                elif schema_version not in {
+                    5,
+                    6,
+                    TWO_LANE_SCHEMA_VERSION,
+                    SCHEMA_VERSION,
+                }:
                     raise CoordinationError(
                         f"unsupported coordination schema version {schema_version}"
                     )
@@ -795,6 +811,10 @@ class CoordinationStore:
                         )
                     schema_version = 6
                 if schema_version == 6:
+                    if self.config.max_paid_workers > 2:
+                        raise CoordinationError(
+                            "coordination schema v6 cannot be expanded to explorer lanes"
+                        )
                     nonterminal_slots = int(
                         connection.execute(
                             """
@@ -888,13 +908,20 @@ class CoordinationStore:
                         SET schema_version=?, updated_at=?
                         WHERE singleton=1 AND schema_version=6
                         """,
-                        (SCHEMA_VERSION, now),
+                        (TWO_LANE_SCHEMA_VERSION, now),
                     ).rowcount
                     if changed != 1:
                         raise CoordinationError(
                             "coordination task-binding schema migration lost its CAS"
                         )
-                    schema_version = SCHEMA_VERSION
+                    schema_version = TWO_LANE_SCHEMA_VERSION
+                if (
+                    schema_version == TWO_LANE_SCHEMA_VERSION
+                    and self.config.max_paid_workers > 2
+                ):
+                    raise CoordinationError(
+                        "coordination schema v7 cannot represent explorer lanes"
+                    )
                 invalid_overlay = int(
                     connection.execute(
                         """
@@ -1068,7 +1095,13 @@ class CoordinationStore:
 
     def _audit_task_bindings_locked(self, connection: sqlite3.Connection) -> None:
         project = self._state(connection)
-        if int(project["schema_version"]) != SCHEMA_VERSION:
+        schema_version = int(project["schema_version"])
+        supported_versions = (
+            {SCHEMA_VERSION}
+            if self.config.max_paid_workers > 2
+            else {TWO_LANE_SCHEMA_VERSION, SCHEMA_VERSION}
+        )
+        if schema_version not in supported_versions:
             raise CoordinationError(
                 "coordination task-binding schema version is inconsistent"
             )
@@ -1148,10 +1181,7 @@ class CoordinationStore:
         return self.roster.lanes.get(worker, "observer")
 
     def _required_task_workers(self) -> tuple[tuple[str, str], ...]:
-        workers: list[tuple[str, str]] = [(self.roster.root, "root")]
-        if self.roster.critic is not None:
-            workers.append((self.roster.critic, "critic"))
-        return tuple(workers)
+        return tuple(self.roster.lanes.items())
 
     def _task_staging_projection_locked(
         self,
@@ -1257,7 +1287,7 @@ class CoordinationStore:
 
         worker = _validate_identifier(worker, "worker")
         lane = self._worker_lane(worker)
-        if lane not in {"root", "critic"}:
+        if worker not in self.roster.lanes:
             raise CoordinationError(
                 "only protected paid-lane workers have durable task assignments"
             )
@@ -1598,7 +1628,7 @@ class CoordinationStore:
                     if prior is not None:
                         requires_existing_replay = True
                         registered_entry_id = str(prior["root_entry_id"])
-            elif confirms_entry_id is not None:
+            elif lane == "critic" and confirms_entry_id is not None:
                 if kind not in {"obstacle", "dead_end"}:
                     raise CoordinationError(
                         "critic confirmation links require obstacle/dead_end evidence"
@@ -1636,6 +1666,10 @@ class CoordinationStore:
                         "active critic review already names a confirmation"
                     )
                 sensitive = True
+            elif confirms_entry_id is not None:
+                raise CoordinationError(
+                    "explorer publications cannot confirm root evidence"
+                )
             return {
                 "slot_id": str(slot["slot_id"]),
                 "generation": int(slot["generation"]),
@@ -2249,7 +2283,7 @@ class CoordinationStore:
         )
 
     def admit(self, worker: str, *, now: float | None = None) -> Admission | None:
-        """CAS-reserve one root/critic slot without creating a paid attempt."""
+        """CAS-reserve one protected paid slot without creating a paid attempt."""
 
         lane = self._worker_lane(worker)
         observed_at = time.time() if now is None else float(now)
@@ -2295,7 +2329,7 @@ class CoordinationStore:
 
             candidate_overlay = self._active_candidate(connection)
             review = self._active_review(connection)
-            lane_eligible = lane in {"root", "critic"}
+            lane_eligible = worker in self.roster.lanes
             if phase == CRITIC_REVIEW_PHASE:
                 lane_eligible = (
                     lane == "critic"
@@ -3003,6 +3037,7 @@ class CoordinationStore:
                 "phase": project["phase"],
                 "root_worker": project["root_worker"],
                 "critic_worker": project["critic_worker"],
+                "explorer_workers": list(self.roster.explorers),
                 "paid_active": paid_active,
                 "reserved_admission": reserved,
                 "waiting_admission": waiting,
@@ -3659,6 +3694,8 @@ class CoordinationStore:
             return None
         if slot["lane"] == "root":
             return entry_id, str(kind), None
+        if slot["lane"] != "critic":
+            return None
         confirms_entry_id = links.get("confirms_entry_id")
         try:
             confirms_entry_id = _validate_identifier(
@@ -3716,6 +3753,10 @@ class CoordinationStore:
                     raise CoordinationError(
                         "critic review has multiple confirmations; designation is ambiguous"
                     )
+            if slot["lane"] not in {"root", "critic"} and identities:
+                raise CoordinationError(
+                    "explorer memory cannot enter obstacle-review evidence"
+                )
 
             accepted: list[str] = []
             review_id: str | None = None
@@ -3749,7 +3790,7 @@ class CoordinationStore:
                         generation=int(slot["generation"]),
                         created_at=reconciled_at,
                     )
-                else:
+                elif slot["lane"] == "critic":
                     review = connection.execute(
                         "SELECT * FROM obstacle_reviews WHERE review_id=?",
                         (slot["review_id"],),
@@ -3789,6 +3830,10 @@ class CoordinationStore:
                         critic_entry_id=entry_id,
                         generation=int(slot["generation"]),
                         created_at=reconciled_at,
+                    )
+                else:
+                    raise CoordinationError(
+                        "explorer memory cannot enter obstacle-review evidence"
                     )
             connection.commit()
             return {

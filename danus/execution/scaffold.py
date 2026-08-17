@@ -24,9 +24,11 @@ from typing import Dict, List, Optional
 
 from danus import codex
 from danus.coordination import (
+    CoordinationConfigError,
     CoordinationStore,
     coordination_config,
     coordination_payload,
+    select_lane_roster,
 )
 
 from . import layout as L
@@ -197,6 +199,7 @@ def do_new(
     roles: Optional[str] = None,
     model: Optional[str] = None,
     coordination: str | None = None,
+    active_explorers: int = 0,
 ) -> Dict:
     """Scaffold a project dir + one worker home per role. Refuses to clobber an
     existing project dir (no silent overwrite of a live fact graph). Returns
@@ -210,7 +213,13 @@ def do_new(
         raise SystemExit(
             f"project already exists: {pdir} (pick another name or remove it)"
         )
-    coordination_data = coordination_payload(coordination)
+    try:
+        coordination_data = coordination_payload(
+            coordination,
+            active_explorers=active_explorers,
+        )
+    except CoordinationConfigError as exc:
+        raise SystemExit(str(exc)) from exc
     if roles is None:
         roles = (
             DEFAULT_LEGACY_ROLES
@@ -219,6 +228,23 @@ def do_new(
         )
     role_pairs = L.parse_roles(roles)
     model = model or _default_model()
+
+    workers = [worker for worker, _base in role_pairs]
+    meta = {
+        "name": project,
+        "model": model,
+        "roles": roles,
+        "workers": workers,
+        "coordination": coordination_data,
+    }
+    try:
+        config = coordination_config(meta)
+        if config.reasoning_first:
+            # Preserve the historical explicit one-worker validation roster when
+            # no explorer was requested. New explorer counts are exact: 2 + N.
+            select_lane_roster(meta, config)
+    except CoordinationConfigError as exc:
+        raise SystemExit(str(exc)) from exc
 
     L.workers_dir(project).mkdir(parents=True, exist_ok=True)
     (pdir / "global_memory").mkdir(exist_ok=True)
@@ -248,15 +274,9 @@ def do_new(
         )
         created.append(worker)
 
-    meta = {
-        "name": project,
-        "model": model,
-        "roles": roles,
-        "workers": created,
-        "coordination": coordination_data,
-    }
+    if created != workers:
+        raise RuntimeError("scaffolded worker roster diverged from preflight metadata")
     atomic_write(pdir / "project.json", json.dumps(meta, ensure_ascii=False, indent=2))
-    config = coordination_config(meta)
     if config.reasoning_first:
         CoordinationStore(pdir, meta)
     return {

@@ -186,13 +186,18 @@ the shared store.
 
 New projects default to `reasoning_first_v1` with roster `max:2,high:5`: the
 coordinator pins the two `max` workers as root and independent critic for a
-generation. The five dormant `high` workers wait without a paid turn and are not
-automatically rotated, promoted, or used as failover. Explicit roles override
-this roster; explicit legacy without roles retains `high:3,xhigh:4`. Each
-new terminal coordination slot receives a fresh app-server thread; only crash
-recovery of that same pinned slot resumes its exact thread. The 2700-second cap
-bounds each paid turn, not completion of the whole root/critic phase. Legacy
-`exec` and explicitly legacy app-server continuation remain separate semantics.
+generation. The five `high` workers are dormant by default. An explicit
+`--active-explorers 1|2` assigns the next roster workers stable
+`explorer1`/`explorer2` paid lanes and stores only
+`max_paid_workers=2+N`; remaining workers stay dormant. Explorers may publish
+ordinary findings and verifier-gated candidates but have no obstacle-review,
+advisor-recommendation, or owner-gate authority. Explicit roles override this
+roster; explicit legacy rejects nonzero explorers and without roles retains
+`high:3,xhigh:4`. Each new terminal coordination slot receives a fresh
+app-server thread; only crash recovery of that same pinned slot resumes its exact
+thread. The 2700-second cap bounds each paid turn, not completion of the whole
+protected phase. Legacy `exec` and explicitly legacy app-server continuation
+remain separate semantics.
 
 For a paid reasoning-first lane, `danus assign` first stores one bounded exact
 task in the protected coordination database. The host `TASK.md` is only an
@@ -214,8 +219,8 @@ verification result, or scope permission. Danus never sends encouragement
 automatically and makes no claim that it causally improves reasoning.
 
 On an event with genuinely new shared state, the main agent writes an
-`elaboration`. Strategy consult defaults to `off`, in which case it assigns the
-fixed root/critic from that synthesis without fabricating `master_guidance`.
+`elaboration`. Strategy consult defaults to `off`, in which case it assigns all
+configured protected lanes from that synthesis without fabricating `master_guidance`.
 `gpt_pro`, `claude_api`, and `claude_code` are explicit attended opt-ins. Only an
 actual reviewed reply is recorded as `master_guidance`. Workers treat it as
 strategic steering, never correctness or control authority.
@@ -529,10 +534,11 @@ is prose.
 
 ## 5. Usage logic (typical reasoning-first generation)
 
-1. **Coordinator:** stage and freeze generation-bound tasks, pin one root and one
-   independent critic, and leave observers dormant without paid turns. A new
-   terminal coordination slot gets a fresh app-server thread, and only same-slot
-   crash recovery resumes its exact task/thread binding.
+1. **Coordinator:** stage and freeze generation-bound tasks, pin one root, one
+   independent critic, and any configured explorers, and leave true observers
+   dormant without paid turns. A new terminal coordination slot gets a fresh
+   app-server thread, and only same-slot crash recovery resumes its exact
+   task/thread binding.
 2. **Main agent, on material new state:** append an `elaboration`; dispatch the
    fixed lanes directly by default (`off`) or explicitly opt into an API/CLI
    consult and record only its actual reviewed reply as `master_guidance`.
@@ -542,7 +548,11 @@ is prose.
    checkpoint, retrieve its exact 16-hex id with `gm_get` (never a BM25 substitute),
    then publish one consolidated response. Confirmation uses only
    `links.confirms_entry_id`; the gateway injects protected coordination links.
-5. **Verification:** submit a consolidated verifiable candidate through
+5. **Explorers, if configured:** pursue independent alternate routes, supporting
+   lemmas, or counterexamples. Publish ordinary findings and submit candidates
+   through the verifier, but never confirm obstacles or exercise advisor/owner
+   authority.
+6. **Verification:** submit a consolidated verifiable candidate through
    `fact_submit`; build further work only on `promoted:true` plus a non-null
    `fact_id`. On `outcome_unknown`, stop without retry and surface exact owner
    resolution.
