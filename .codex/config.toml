@@ -3,10 +3,15 @@
 # the right venv python — so DANUS_PY / DANUS_AGENTS_ROOT / DANUS_VERIFY_URL / PATH
 # are resolved at launch, not hard-coded here. tool_timeout matches the verify
 # HTTP timeout (a fact_submit can block on a minutes-long cold-start verify).
+# The main agent runs with approval policy `never`; these repository-owned,
+# role-gated servers must therefore opt their tools into noninteractive approval.
+# They are required because Danus cannot orchestrate safely without them.
 
 [mcp_servers.danus]
 command = "bin/danus-mcp"
 args = []
+default_tools_approval_mode = "approve"
+required = true
 tool_timeout_sec = 3600
 [mcp_servers.danus.env]
 DANUS_ROLE = "main"
@@ -15,6 +20,8 @@ DANUS_AUTHOR = "main_agent"
 [mcp_servers.write-paper]
 command = "bin/write-paper-mcp"
 args = []
+default_tools_approval_mode = "approve"
+required = true
 tool_timeout_sec = 3600
 [mcp_servers.write-paper.env]
 DANUS_ROLE = "main"
@@ -23,6 +30,8 @@ DANUS_AUTHOR = "main_agent"
 [mcp_servers.human-summary]
 command = "bin/human-summary-mcp"
 args = []
+default_tools_approval_mode = "approve"
+required = true
 tool_timeout_sec = 3600
 [mcp_servers.human-summary.env]
 DANUS_ROLE = "main"

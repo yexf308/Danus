@@ -43,6 +43,8 @@ def test_codex_main_agent_wires_expected_skills_and_mcp_servers():
         assert f"[mcp_servers.{server}.env]" in config
     assert config.count('DANUS_ROLE = "main"') == 3
     assert config.count('DANUS_AUTHOR = "main_agent"') == 3
+    assert config.count('default_tools_approval_mode = "approve"') == 3
+    assert config.count("required = true") == 3
 
 
 def test_unattended_codex_launcher_and_legacy_consult_default_are_safe():
