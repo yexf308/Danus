@@ -509,7 +509,7 @@ def test_worker_round_auto_completes_with_mapping_and_sanitized_audit(
         }
     )
     preflight_calls: list[tuple[str, dict[str, str]]] = []
-    argv_calls: list[tuple[str, str]] = []
+    argv_calls: list[tuple[str, str, str]] = []
 
     monkeypatch.setattr(worker_loop, "require_gateway_runtime", lambda: None)
     monkeypatch.setattr(worker_loop.codex, "resolve_bin", lambda: sys.executable)
@@ -522,8 +522,10 @@ def test_worker_round_auto_completes_with_mapping_and_sanitized_audit(
         lambda codex_bin, *, env: preflight_calls.append((codex_bin, dict(env))),
     )
 
-    def fake_argv(codex_bin: str, mcp_config: str) -> list[str]:
-        argv_calls.append((codex_bin, mcp_config))
+    def fake_argv(
+        codex_bin: str, project_root_config: str, mcp_config: str
+    ) -> list[str]:
+        argv_calls.append((codex_bin, project_root_config, mcp_config))
         return [sys.executable, str(FAKE), "--scenario", "auto-complete"]
 
     monkeypatch.setattr(worker_loop, "app_server_argv", fake_argv)

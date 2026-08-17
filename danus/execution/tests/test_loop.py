@@ -129,6 +129,112 @@ def _write_fake_codex(tmp: Path, body: str) -> Path:
     return p
 
 
+def _write_config_resolving_fake_codex(tmp: Path) -> Path:
+    """Fake the documented Codex project-config merge before dispatch.
+
+    The real regression came from a repository-root ``.codex/config.toml``
+    being merged into a nested worker launch. This stub implements only the
+    relevant root-marker and ``mcp_servers`` merge semantics, then either exits
+    successfully for ``exec`` or replaces itself with the offline app-server
+    fixture. It rejects any effective MCP inventory other than worker danus.
+    """
+    return _write_fake_codex(
+        tmp,
+        r"""
+import os
+import sys
+import tomllib
+from pathlib import Path
+
+
+config_overrides = [
+    sys.argv[index + 1]
+    for index, token in enumerate(sys.argv[:-1])
+    if token in {"--config", "-c"}
+]
+marker_config = next(
+    (
+        tomllib.loads(value)["project_root_markers"]
+        for value in config_overrides
+        if value.startswith("project_root_markers=")
+    ),
+    [".git"],
+)
+cwd = Path.cwd()
+project_root = cwd
+for candidate in (cwd, *cwd.parents):
+    if any((candidate / marker).exists() for marker in marker_config):
+        project_root = candidate
+        break
+
+layers = []
+candidate = cwd
+while True:
+    layers.append(candidate)
+    if candidate == project_root:
+        break
+    candidate = candidate.parent
+
+servers = {}
+for layer in reversed(layers):
+    config_path = layer / ".codex" / "config.toml"
+    if config_path.is_file():
+        servers.update(tomllib.loads(config_path.read_text())["mcp_servers"])
+for value in config_overrides:
+    parsed = tomllib.loads(value)
+    if "mcp_servers" in parsed:
+        servers.update(parsed["mcp_servers"])
+
+danus = servers.get("danus", {})
+role = danus.get("env", {}).get("DANUS_ROLE")
+if set(servers) != {"danus"} or role != "worker":
+    extras = sorted(set(servers) - {"danus"})
+    sys.stderr.write(
+        "required MCP servers failed to initialize: " + ", ".join(extras) + "\n"
+    )
+    raise SystemExit(91)
+
+if "app-server" in sys.argv:
+    fixture = os.environ["DANUS_TEST_APP_SERVER_FIXTURE"]
+    os.execv(
+        sys.executable,
+        [sys.executable, fixture, "--scenario", "auto-complete"],
+    )
+raise SystemExit(0)
+""",
+    )
+
+
+def _mk_nested_repo_worker(
+    tmp: Path, name: str = "high"
+) -> tuple[Path, L.WorkerLayout]:
+    repo = tmp / "repo"
+    (repo / ".git").mkdir(parents=True)
+    root_config = repo / ".codex" / "config.toml"
+    root_config.parent.mkdir()
+    root_config.write_text(
+        """\
+[mcp_servers.danus]
+command = "bin/danus-mcp"
+required = true
+[mcp_servers.danus.env]
+DANUS_ROLE = "main"
+
+[mcp_servers.write-paper]
+command = "bin/write-paper-mcp"
+required = true
+
+[mcp_servers.human-summary]
+command = "bin/human-summary-mcp"
+required = true
+""",
+        encoding="utf-8",
+    )
+    worker = L.WorkerLayout(repo / "runtime" / "projects" / "P" / "workers" / name)
+    worker.dir.mkdir(parents=True)
+    return root_config, worker
+
+
 def _running(pid: int) -> bool:
     result = subprocess.run(
         ["ps", "-o", "state=", "-p", str(pid)],
@@ -506,6 +612,18 @@ def test_worker_mcp_config_arg_is_one_complete_toml_object(tmp: Path):
     }
 
 
+def test_worker_codex_isolation_uses_verified_cwd_root_marker(tmp: Path):
+    wl = _mk_worker(tmp, "author8")
+    root_config, mcp_config = loop._prepare_worker_codex_isolation(wl, wl.dir)
+
+    assert tomllib.loads(root_config) == {
+        "project_root_markers": [loop._WORKER_CODEX_ROOT_MARKER]
+    }
+    marker = wl.dir / loop._WORKER_CODEX_ROOT_MARKER
+    assert marker.read_text(encoding="utf-8") == loop._WORKER_CODEX_ROOT_MARKER_CONTENT
+    assert tomllib.loads(mcp_config)["mcp_servers"].keys() == {"danus"}
+
+
 def test_run_round_injects_complete_mcp_without_project_config(tmp: Path):
     wl = _mk_worker(tmp, "worker9")
     assert not wl.codex_config.exists()  # regression: production cannot rely on it
@@ -546,7 +664,18 @@ def test_run_round_injects_complete_mcp_without_project_config(tmp: Path):
     assert len(mcp_overrides) == 1
     assert mcp_overrides[0][0] == "--config"
     assert "--json" in command
+    assert "--strict-config" in command
     assert not any(part.startswith("mcp_servers.danus.") for part in command)
+    root_overrides = [
+        command[index + 1]
+        for index, token in enumerate(command[:-1])
+        if token in ("--config", "-c")
+        and command[index + 1].startswith("project_root_markers=")
+    ]
+    assert len(root_overrides) == 1
+    assert tomllib.loads(root_overrides[0]) == {
+        "project_root_markers": [loop._WORKER_CODEX_ROOT_MARKER]
+    }
     parsed = tomllib.loads(mcp_overrides[0][1])["mcp_servers"]["danus"]
     assert parsed == {
         "command": sys.executable,
@@ -564,6 +693,123 @@ def test_run_round_injects_complete_mcp_without_project_config(tmp: Path):
         "required": True,
     }
     assert not wl.codex_config.exists()
+    assert (wl.dir / loop._WORKER_CODEX_ROOT_MARKER).is_file()
+
+
+def test_exec_worker_excludes_repository_main_mcp_config(tmp: Path):
+    root_config, wl = _mk_nested_repo_worker(tmp, "legacy")
+    original_root_config = root_config.read_bytes()
+    fake = _write_config_resolving_fake_codex(tmp)
+    log = wl.dir / "round-config-isolation.log"
+
+    with _env(DANUS_CODEX_BIN=str(fake)):
+        rc = loop.run_round(
+            wl,
+            {"MODEL": "offline-model", "REASONING_EFFORT": "low"},
+            "offline prompt",
+            log,
+            hard_timeout=30,
+        )
+
+    assert rc == 0
+    assert root_config.read_bytes() == original_root_config
+    assert (wl.dir / loop._WORKER_CODEX_ROOT_MARKER).is_file()
+
+
+def test_app_server_worker_excludes_repository_main_mcp_config(
+    tmp: Path, monkeypatch: pytest.MonkeyPatch
+):
+    root_config, wl = _mk_nested_repo_worker(tmp, "max")
+    original_root_config = root_config.read_bytes()
+    wl.task.write_text("offline assignment", encoding="utf-8")
+    fake = _write_config_resolving_fake_codex(tmp)
+    fixture = Path(__file__).resolve().parents[2] / "tests" / "fake_codex_app_server.py"
+    log = wl.dir / "round-app-server-config-isolation.log"
+
+    monkeypatch.setattr(loop, "require_gateway_runtime", lambda: None)
+    monkeypatch.setattr(loop, "preflight_app_server", lambda *_a, **_kw: None)
+    with _env(
+        DANUS_CODEX_BIN=str(fake),
+        DANUS_TEST_APP_SERVER_FIXTURE=str(fixture),
+    ):
+        rc = loop.run_round_app_server(
+            wl,
+            {"MODEL": "offline-model", "REASONING_EFFORT": "low"},
+            "offline prompt",
+            log,
+            hard_timeout=5,
+        )
+
+    assert rc == 0
+    assert root_config.read_bytes() == original_root_config
+    assert (wl.dir / "model_workspace" / loop._WORKER_CODEX_ROOT_MARKER).is_file()
+
+
+def test_exec_worker_config_isolation_failure_starts_zero_codex(
+    tmp: Path, monkeypatch: pytest.MonkeyPatch
+):
+    wl = _mk_worker(tmp, "legacy")
+    starts: list[list[str]] = []
+    monkeypatch.setattr(loop, "require_gateway_runtime", lambda: None)
+    monkeypatch.setattr(
+        loop,
+        "_prepare_worker_codex_isolation",
+        lambda *_a: (_ for _ in ()).throw(HotJoinError("marker unavailable")),
+    )
+    monkeypatch.setattr(
+        loop,
+        "spawn_owned_child",
+        lambda command, **_kw: starts.append(command),
+    )
+
+    rc = loop.run_round(
+        wl,
+        {"MODEL": "offline-model", "REASONING_EFFORT": "low"},
+        "must not dispatch",
+        wl.dir / "isolation-failure.log",
+        hard_timeout=1,
+    )
+
+    assert rc == 126
+    assert starts == []
+    status = json.loads(wl.status.read_text(encoding="utf-8"))
+    assert status["attempt_failure_code"] == "worker_config_isolation_unavailable"
+
+
+def test_app_server_worker_config_isolation_failure_starts_zero_codex(
+    tmp: Path, monkeypatch: pytest.MonkeyPatch
+):
+    wl = _mk_worker(tmp, "max")
+    wl.task.write_text("offline assignment", encoding="utf-8")
+    starts: list[object] = []
+    monkeypatch.setattr(loop, "require_gateway_runtime", lambda: None)
+    monkeypatch.setattr(loop.codex, "resolve_bin", lambda: "/opt/danus/codex")
+    monkeypatch.setattr(loop, "resolved_executable", lambda value: value)
+    monkeypatch.setattr(loop.codex, "subprocess_env", lambda _binary: {})
+    monkeypatch.setattr(loop, "preflight_app_server", lambda *_a, **_kw: None)
+    monkeypatch.setattr(
+        loop,
+        "_prepare_worker_codex_isolation",
+        lambda *_a: (_ for _ in ()).throw(HotJoinError("marker unavailable")),
+    )
+    monkeypatch.setattr(
+        loop,
+        "AppServerClient",
+        lambda *_a, **_kw: starts.append("app-server"),
+    )
+
+    rc = loop.run_round_app_server(
+        wl,
+        {"MODEL": "offline-model", "REASONING_EFFORT": "low"},
+        "must not dispatch",
+        wl.dir / "app-server-isolation-failure.log",
+        hard_timeout=1,
+    )
+
+    assert rc == 126
+    assert starts == []
+    status = json.loads(wl.status.read_text(encoding="utf-8"))
+    assert status["attempt_failure_code"] == "worker_config_isolation_unavailable"
 
 
 # --- run_round: hard timeout → terminate → 124 ----------------------------- #
@@ -2038,22 +2284,26 @@ def test_weakened_runtime_attestation_fails_before_turn_start(
     assert error in log.read_text(encoding="utf-8")
     assert captured_argv == loop.app_server_argv(
         "/opt/danus/codex",
+        loop._prepare_worker_codex_isolation(wl, wl.dir)[0],
         loop._worker_mcp_config_arg(wl),
     )
 
 
 def test_app_server_argv_is_one_exact_strict_config_override() -> None:
+    root_override = 'project_root_markers=[".danus-codex-worker-root"]'
     override = 'mcp_servers={danus={command="/venv/python"}}'
-    assert loop.app_server_argv("/opt/danus/codex", override) == [
+    assert loop.app_server_argv("/opt/danus/codex", root_override, override) == [
         "/opt/danus/codex",
         "app-server",
         "--stdio",
         "--strict-config",
         "--config",
+        root_override,
+        "--config",
         override,
     ]
     with pytest.raises(ValueError, match="absolute"):
-        loop.app_server_argv("codex", override)
+        loop.app_server_argv("codex", root_override, override)
 
 
 # --- runner ---------------------------------------------------------------- #
@@ -2079,7 +2329,9 @@ def main() -> None:
         test_run_round_returns_codex_rc,
         test_run_round_success_rc0,
         test_worker_mcp_config_arg_is_one_complete_toml_object,
+        test_worker_codex_isolation_uses_verified_cwd_root_marker,
         test_run_round_injects_complete_mcp_without_project_config,
+        test_exec_worker_excludes_repository_main_mcp_config,
         test_run_round_hard_timeout_terminates,
         test_run_round_missing_binary_returns_127,
         test_run_round_timeout_then_kill,

@@ -138,7 +138,13 @@ uses human-supplied mathematics in a submitted candidate, that statement/proof
 still goes through the ordinary verifier like every other candidate.
 Before any worker Codex process starts, a separate interpreter probe imports the
 gateway server and FastMCP runtime; a failed import ends the worker without a
-Codex call. Every production round also injects the entire
+Codex call. Every production round atomically creates and verifies a unique
+project-root marker in the exact model cwd, then passes it as a
+`project_root_markers` CLI override under `--strict-config`. This prevents Codex
+from walking up to and merging the repository root's main-only MCP servers. A
+failed marker write or an unsupported config key ends the worker before
+dispatch. Both the legacy `exec` and reasoning-first `app-server` transports use
+the same boundary. Each round also injects the entire
 `mcp_servers.danus={command,args,env,tool_timeout_sec,default_tools_approval_mode,required}`
 object as one CLI `--config` value, with `command` pinned to the loop's exact
 `sys.executable` and `-I -B` isolation. Therefore execution does not depend on Codex auto-loading the

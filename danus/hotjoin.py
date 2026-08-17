@@ -4417,8 +4417,10 @@ class HotJoinBroker:
         return True
 
 
-def app_server_argv(codex_bin: str, mcp_config: str) -> list[str]:
-    """Exact app-server launch: stdio, strict config, one complete MCP table."""
+def app_server_argv(
+    codex_bin: str, project_root_config: str, mcp_config: str
+) -> list[str]:
+    """Exact app-server launch with a worker root boundary and MCP table."""
     if not os.path.isabs(codex_bin):
         raise ValueError("codex binary must be absolute")
     return [
@@ -4426,6 +4428,8 @@ def app_server_argv(codex_bin: str, mcp_config: str) -> list[str]:
         "app-server",
         "--stdio",
         "--strict-config",
+        "--config",
+        project_root_config,
         "--config",
         mcp_config,
     ]

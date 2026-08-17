@@ -9,10 +9,13 @@ per-round hard timeout, or it bails); the loop then relaunches a fresh session
 that resumes from memory. Stops on the ``.stop`` flag (graceful, at a round
 boundary), the project deadline, or a round backstop.
 
-The worker gateway is passed to every ``codex exec`` as one complete inline
-``mcp_servers.danus={...}`` object. The scaffolded ``.codex/config.toml`` remains
-useful for interactive inspection, but production execution never depends on
-Codex discovering project-local configuration.
+Every worker launch creates a verified project-root marker in its exact model
+cwd and passes that marker through Codex's ``project_root_markers`` override.
+This stops project-config discovery at the worker boundary, before the repository
+root's main-agent-only MCP servers can be merged.  The worker gateway is then
+passed as one complete inline ``mcp_servers.danus={...}`` object. The scaffolded
+``.codex/config.toml`` remains useful for interactive inspection, but production
+execution never depends on Codex discovering project-local configuration.
 
 Config:
   - codex binary resolved via the shared ``danus.codex`` launcher
@@ -92,6 +95,8 @@ WORKER_STOP_REQUESTED_RC = 130
 THREAD_HISTORY_OVERSIZE_CODE = "thread_history_exceeds_transport_limit"
 MAX_EXEC_LOG_EVENT_BYTES = 8 * 1024 * 1024
 MAX_GENERATION_TASK_BYTES = 131_072
+_WORKER_CODEX_ROOT_MARKER = ".danus-codex-worker-root"
+_WORKER_CODEX_ROOT_MARKER_CONTENT = "danus-worker-config-root-v1\n"
 _COORDINATION_TERMINAL_DISPOSITIONS = {
     0: "completed",
     APP_SERVER_PROTOCOL_FAILURE_RC: "protocol_failure",
@@ -737,6 +742,38 @@ def _worker_mcp_config_arg(wl: L.WorkerLayout) -> str:
     )
 
 
+def _prepare_worker_codex_isolation(
+    wl: L.WorkerLayout, model_cwd: Path
+) -> tuple[str, str]:
+    """Create and verify the worker's Codex project-config boundary.
+
+    Codex merges every trusted ``.codex/config.toml`` from its discovered
+    project root down to the current working directory.  A worker cwd is nested
+    below the Danus repository, whose root config intentionally contains
+    main-only required MCP servers.  A complete ``mcp_servers={danus=...}``
+    override changes the worker server but does not delete sibling servers from
+    lower-precedence layers.
+
+    Pin project-root discovery to a unique marker in the exact model cwd, then
+    inject the worker's one required gateway.  The marker write uses the same
+    no-follow, atomic host path as other protected worker projections and is read
+    back before either Codex transport may start.  ``--strict-config`` at both
+    call sites makes an unsupported ``project_root_markers`` key fail closed.
+    """
+    if not model_cwd.is_absolute():
+        raise HotJoinError("worker Codex model cwd must be absolute")
+    marker = model_cwd / _WORKER_CODEX_ROOT_MARKER
+    _atomic_write_real_parent(marker, _WORKER_CODEX_ROOT_MARKER_CONTENT)
+    if _read_regular_text(marker, max_bytes=256) != _WORKER_CODEX_ROOT_MARKER_CONTENT:
+        raise HotJoinError("worker Codex project-root marker verification failed")
+    project_root_config = (
+        "project_root_markers=["
+        + json.dumps(_WORKER_CODEX_ROOT_MARKER, ensure_ascii=False)
+        + "]"
+    )
+    return project_root_config, _worker_mcp_config_arg(wl)
+
+
 # --- one round ------------------------------------------------------------- #
 
 
@@ -833,17 +870,38 @@ def run_round(
             pass
         return 126
     codex_bin = codex.resolve_bin()
+    try:
+        project_root_config, mcp_config = _prepare_worker_codex_isolation(wl, wdir)
+    except (HotJoinError, OSError, UnicodeDecodeError) as exc:
+        write_status(
+            wl,
+            attempt_phase="config_isolation",
+            attempt_dispatch_state="none",
+            attempt_failure_code="worker_config_isolation_unavailable",
+            attempt_failure=redact_external_error(exc),
+        )
+        _best_effort_worker_projection(
+            log_path,
+            "[worker_loop] worker Codex config isolation unavailable: "
+            f"{redact_external_error(exc)}\n",
+        )
+        return 126
     cmd = codex.exec_cmd(
         codex_bin,
         role["MODEL"],
         role["REASONING_EFFORT"],
         "-C",
         str(wdir),
+        # Stop project-config discovery at the exact worker/model cwd.  Without
+        # this boundary Codex also merges the repository root's main-only MCPs.
+        "--config",
+        project_root_config,
         # Inject the complete gateway object explicitly. Codex does not
         # consistently auto-load ``<worker>/.codex/config.toml`` for exec/MCP
         # discovery, so that file cannot be the production authority.
         "--config",
-        _worker_mcp_config_arg(wl),
+        mcp_config,
+        "--strict-config",
         # on an install without .git (tarball download), codex's
         # trusted-directory check refuses to run the worker round
         "--skip-git-repo-check",
@@ -1444,7 +1502,25 @@ def run_round_app_server(
             f"[worker_loop] unsafe model workspace: {redact_external_error(exc)}\n",
         )
         return 126
-    argv = app_server_argv(codex_bin, _worker_mcp_config_arg(wl))
+    try:
+        project_root_config, mcp_config = _prepare_worker_codex_isolation(
+            wl, model_workspace
+        )
+    except (HotJoinError, OSError, UnicodeDecodeError) as exc:
+        write_status(
+            wl,
+            attempt_phase="config_isolation",
+            attempt_dispatch_state="none",
+            attempt_failure_code="worker_config_isolation_unavailable",
+            attempt_failure=redact_external_error(exc),
+        )
+        _best_effort_worker_projection(
+            log_path,
+            "[worker_loop] worker Codex config isolation unavailable: "
+            f"{redact_external_error(exc)}\n",
+        )
+        return 126
+    argv = app_server_argv(codex_bin, project_root_config, mcp_config)
     try:
         paid_authority_fd = _acquire_paid_authority(wl)
     except (HotJoinError, OSError) as exc:
