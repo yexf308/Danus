@@ -10,19 +10,20 @@
 > On a fresh deployment this is the blank template — the `initialize` skill fills it.
 
 ## Operator
-- **Name / how to address:** _(ask once; fill in)_
-- **Language:** _(the language the main agent replies in; code/comments/skills stay English)_
-- **Timezone:** _(for scheduling summaries/consults)_
+- **Name / how to address:** Felix
+- **Language:** Chinese; code, comments, skills, and commits stay English
+- **Timezone:** America/New_York
 
 ## Standing preferences
-- **Notifications:** _(how/where to reach them; what severity warrants a ping)_
-- **Spend ceiling (paid consult API):** _(USD; warn before crossing)_
-- **Optional consult transport:** _(`off` by default / `gpt_pro` — paid API, BYO key / `claude_api` — Anthropic API, per-token BYO key / `claude_code` — your Claude subscription; `chatgpt_pro_browser` is available only after an exact coordinator recommendation and per-question owner authorization)_
-- **worker roster:** _(reasoning-first default `max:2,high:5` — two paid root/critic lanes plus five dormant observers; explicit legacy default `high:3,xhigh:4`; override per project with `danus new --roles`)_
+- **Notifications:** Report material progress, blockers, failures, and authorization forks in the current Codex conversation.
+- **Spend ceiling (paid consult API):** Not applicable while consult transport is `off`; ask before enabling a paid consult transport.
+- **Optional consult transport:** `off`; do not use `gpt_pro`, `claude_api`, `claude_code`, or `chatgpt_pro_browser` without separate authorization.
+- **worker roster:** Reasoning-first default `max:2,high:5`; use an explicit smaller override only for a bounded validation run authorized by Felix.
 
 ## Per-project pointers
 _(One line per live project → where its durable facts live. The project's own
 problem lives under `runtime/projects/<project>/PROBLEM.md`, not here.)_
 
 ## Notes
-_(Anything else durable the operator told you: conventions, do/don't, contacts.)_
+- Validate the Codex main-agent integration first with a minimal real E2E run.
+- After the minimal gate passes, run a separate substantive reasoning-first validation; do not treat the minimal smoke as the final real-world test.
