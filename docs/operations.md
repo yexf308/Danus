@@ -4,7 +4,7 @@ Day-to-day operation of a Danus deployment: the persistent services, health chec
 recovery after a restart, and unattended-operation helpers.
 
 > In normal operation you do not run these commands yourself — you talk to the
-> **main agent** (Claude Code), and it runs them for you. This page documents what
+> **main agent** (codex), and it runs them for you. This page documents what
 > happens underneath, and doubles as your fallback for the moments the main agent
 > is not there to act (a fresh host restart, a session that will not start,
 > debugging the stack by hand).
@@ -176,7 +176,7 @@ danus stop   <project> --force  # durable request: interrupt active owned work, 
 
 Under `examples/ops/` (parameterized; nothing in the engine depends on them):
 
-- `main-agent-tmux.sh` — run Claude Code (the main agent) detached in a tmux
+- `main-agent-tmux.sh` — run codex (the main agent) detached in a tmux
   session, so strategic beats continue while you are away. **The only unattended
   mode.**
 - `strategy-loop.sh <project>` — a legacy/example timer wrapper for API/CLI

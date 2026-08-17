@@ -121,7 +121,7 @@ compilable paper on their own** — anchors only make the output sound more like
 This skill spans **two trees, split by reader**:
 
 ```
-.claude/skills/write-paper/        # MAIN-AGENT side — Claude Code reads/runs this
+.claude/skills/write-paper/        # MAIN-AGENT side — the main agent (codex) reads/runs this
   SKILL.md                       # the orchestration contract (the main agent reads this)
   README.md                      # this file (human-facing setup)
   driver/
@@ -156,7 +156,7 @@ The split is by **who reads the file**: the main agent reads `SKILL.md` and runs
 `driver/` + `templates/`; the paper codex never reads disk — the `write-paper` MCP
 embeds the codex-facing `roles/style/boilerplate` into its prompt. So the
 codex-facing half lives under `agents/` alongside the other codex agents (`worker`,
-`verify`), not under `.claude/` (which is Claude Code's tree).
+`verify`), not under `.claude/` (the main-agent side; codex reads it via the `.agents/skills` symlink).
 
 ## Where it must live, and what it resolves at runtime
 

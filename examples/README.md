@@ -7,10 +7,10 @@
 > entry points). Each script also carries an "EXAMPLE, NOT CORE" banner so it is
 > never mistaken for the control path.
 
-Danus has exactly one unattended mode: **run Claude Code as a
-resident main agent** (`ops/main-agent-tmux.sh`). The **strategic judgment** —
-elaborate → consult GPT → record `master_guidance` → dispatch workers — lives in
-that main agent and its skills (`elaboration`, `consult`), *not* in shell.
+Danus has exactly one unattended mode: **run codex as a
+resident main agent** (`ops/main-agent-tmux.sh`). The **strategic judgment**,
+including whether to consult, lives in that main agent and its skills
+(`elaboration`, `consult`), *not* in shell.
 The two loops here (`strategy-loop.sh`, `watchdog.sh`) are only the unattended
 **cadence** and **liveness** scaffolding around that agent.
 
@@ -21,17 +21,17 @@ prose follows `OPERATOR.md`; the scripts themselves only emit English mechanics.
 ## `ops/` — unattended-operation scripts
 
 ### `main-agent-tmux.sh`
-Starts Claude Code detached in a tmux session, in the repo root, so it inherits
-`CLAUDE.md`, the skills, and `.mcp.json`. `.mcp.json` is what wires the gateway
-MCP server (`python -m danus.gateway` via `bin/danus-mcp`); this launcher does
-**not** wire MCP itself.
+Starts codex detached in a tmux session, in the repo root, so it inherits
+`AGENTS.md`, the skills (`.agents/skills`), and `.codex/config.toml`. `.codex/config.toml`
+is what wires the gateway MCP server (`python -m danus.gateway` via `bin/danus-mcp`);
+this launcher does **not** wire MCP itself.
 
 ```bash
 bash examples/ops/main-agent-tmux.sh
 tmux attach -t danus-main        # watch / interact; DANUS_MAIN_TMUX overrides the name
 ```
 
-Requires `tmux` and the `claude` CLI on PATH. The main agent is the sole control
+Requires `tmux` and the `codex` CLI on PATH. The main agent is the sole control
 path — there is no separate Node CLI or persona-seed layer.
 
 ### `strategy-loop.sh <project>`
@@ -46,8 +46,8 @@ bash examples/ops/strategy-loop.sh <project>
 touch runtime/projects/<project>/.strategy.stop   # graceful stop at the next beat
 ```
 
-- `DANUS_STRATEGY_BEAT` — seconds between consults (default `7200`, ~2h).
-- `DANUS_CONSULT_TRANSPORT` — `gpt_pro` (default), `claude_api`, `claude_code`, or `off`.
+- `DANUS_STRATEGY_BEAT` — seconds between legacy loop iterations (default `7200`, ~2h).
+- `DANUS_CONSULT_TRANSPORT` — `off` (default), `gpt_pro`, `claude_api`, or `claude_code`.
   There is no `web`/`auto` transport.
 
 The loop consults only when an `elaboration.md` is present for the project; a

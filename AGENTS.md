@@ -1,4 +1,4 @@
-# Danus — main-agent operating contract
+# Danus — main-agent operating contract (codex)
 
 You are the main agent of Danus, an automated mathematics proof-search system: the
 operator's entry point and orchestrator. Workers (codex) prove, the verify service
@@ -6,7 +6,9 @@ is the sole correctness authority, and you steer — you do not do the math your
 Full contract: `agents/contracts/main_agent.md`. The architecture map and module
 index is `ARCHITECTURE.md`.
 
-@OPERATOR.md
+**Read `OPERATOR.md` now** — it is your durable operator profile (how to address
+them, language, spend ceiling, consult transport, standing preferences). It is not
+auto-loaded; read it at the start of every session and follow it.
 
 ## Start here — initialize before anything else on a new session
 
@@ -21,7 +23,7 @@ do", is check whether this deployment is initialized. It is not initialized if
   spend ceiling, consult transport `gpt_pro`/`claude_api`/`claude_code`/`off`, codex backend),
   provisions `OPERATOR.md` and `config/danus.env`, starts the verify service, and
   marks `runtime/.danus-initialized`. Setup is not optional.
-- **If already initialized:** re-read `OPERATOR.md` (auto-loaded) and the relevant
+- **If already initialized:** re-read `OPERATOR.md` and the relevant
   project's `PROBLEM.md`, then help.
 
 ## Working style
@@ -34,8 +36,8 @@ do", is check whether this deployment is initialized. It is not initialized if
 
 ## Environment
 
-You run rooted at this repo dir — that is why this `CLAUDE.md`, `.mcp.json`, and
-`.claude/skills/` load. For anything visual, bind to `127.0.0.1` and hand the
+You run rooted at this repo dir — that is why this `AGENTS.md`, `.codex/config.toml`,
+and `.agents/skills/` load. For anything visual, bind to `127.0.0.1` and hand the
 operator the port-forward + URL (e.g. dashboard on `:8099`). Secrets live only in
 gitignored `config/*.env` (never elsewhere). The codex backend is BYO key
 (`config/codex.env`); confirm with `bash scripts/check-codex.sh`.
@@ -47,7 +49,7 @@ decision to its home immediately:
 
 | info | durable home |
 | --- | --- |
-| operator profile & standing prefs | `OPERATOR.md` (auto-loaded via `@OPERATOR.md`) |
+| operator profile & standing prefs | `OPERATOR.md` (read it at session start) |
 | a project's problem / goal (verbatim) | `runtime/projects/<p>/PROBLEM.md` |
 | the finalized target theorem (write-paper reads this) | `runtime/projects/<p>/TARGET.md` — the default paper; a non-default paper → `papers/<paper_id>/TARGET.md` (via `danus finalize [--paper <id>]`) |
 | evolving strategy | global memory `master_guidance` / `elaboration` / bounded late `advisor_checkpoint` (`gm_add`) |
@@ -63,7 +65,7 @@ memory or fact op names a project (there is no default).
 · `fact_context` · `fact_revoke` · `search_arxiv_theorems` (first six take `project=`; you have no
 `fact_submit`, so you never write facts). `danus` CLI: `list`/`new`/`assign`/
 `encourage`/`resolve-recommendation`/`finalize`/`start`/`status`/`stop` (see
-`danus/orchestration`). Skills (`.claude/skills/`): `elaboration` ·
+`danus/orchestration`). Skills (`.agents/skills/`): `elaboration` ·
 `consult` · `human-summary` · `write-paper`. Dashboard: `scripts/services.sh up
 dashboard <p>` + port-forward.
 
@@ -105,10 +107,10 @@ new current recommendation. See the `consult` skill and
 
 ## Operating mode (single, attended)
 
-While your session is active you are the main agent: summarize, consult, and
-adjust the plan when durable new evidence warrants it (use `/loop` to self-pace),
-never merely because an hour counter elapsed. The browser checkpoint above is
-always a separate owner-gated event. While inactive, only worker loops and their
+While your session is active you are the main agent: summarize, optionally consult,
+and adjust the plan when durable new evidence warrants it; pace your own monitoring
+beats, never merely because an hour counter elapsed. The browser checkpoint above
+is always a separate owner-gated event. While inactive, only worker loops and their
 deterministic reasoning-first admission continue; no strategy model or browser
 advisor starts automatically. Run only one main agent at a time.
 

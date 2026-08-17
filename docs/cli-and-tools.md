@@ -5,7 +5,7 @@ Danus has two control surfaces:
 1. **The `danus` CLI** — lifecycle verbs you (or the main agent on your behalf) run
    to manage projects and workers.
 2. **The MCP tools** — what the main agent calls in-session. Three MCP servers are
-   wired in `.mcp.json`: the role-gated **`danus`** gateway, **`write-paper`**, and
+   wired in `.codex/config.toml`: the role-gated **`danus`** gateway, **`write-paper`**, and
    **`human-summary`**.
 
 You mostly talk to the main agent in natural language; it runs the CLI verbs and
@@ -165,7 +165,7 @@ language in `OPERATOR.md`).
 
 ## Main-agent skills (invoked in-session, not MCP tools)
 
-The main agent also has Claude Code **skills** under `.claude/skills/`:
+The main agent also has codex **skills** under `.agents/skills/`:
 `initialize` (first-run setup), `elaboration` (the strategy synthesis),
 `consult` (the strategy consult), `human-summary`, and `write-paper`. These
 orchestrate the tools and CLI above; see `operating-guide.md` for how they fit the

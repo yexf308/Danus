@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # human-summary-mcp — launches the human-summary MCP service (role=main) for
-# Claude Code (.mcp.json) or any MCP client. Sources env so DANUS_AGENTS_ROOT
+# codex (.codex/config.toml) or any MCP client. Sources env so DANUS_AGENTS_ROOT
 # etc. are set, and exports DANUS_HUMAN_SUMMARY_SKILL_DIR so the assembler finds
 # the operator-editable fixed writer prompt (agents/skills/human-summary/REPORT_WRITER_PROMPT.md).
 set -euo pipefail

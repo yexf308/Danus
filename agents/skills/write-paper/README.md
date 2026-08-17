@@ -1,7 +1,7 @@
 # write-paper — codex-facing prompts & style (embedded by the `write-paper` MCP)
 
 These are the **codex-facing** fixed files for the paper roles. They are **not**
-read by the main agent (Claude Code), and **not** symlinked into a codex home the
+read by the main agent (codex), and **not** symlinked into a worker's codex home the
 way `agents/skills/worker` / `agents/skills/verify` are. Instead the **`write-paper`
 MCP service** (`danus.write_paper`, launched by `bin/write-paper-mcp`) reads them
 at call time and **embeds them verbatim into the one-shot codex prompt** — the

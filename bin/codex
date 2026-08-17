@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# codex worker-binary wrapper. The codex *binary* is @openai/codex, provisioned
-# by scripts/bootstrap.sh; its exact path is written to runtime/runtime.env as
-# DANUS_NODE / DANUS_CODEX_JS. This wrapper keeps a single codex version on the
-# workers' PATH regardless of where it landed.
+# Danus codex-binary wrapper for the main agent, workers, verifier, and renderers.
+# The codex *binary* is @openai/codex, provisioned by scripts/bootstrap.sh; its
+# exact path is written to runtime/runtime.env as DANUS_NODE / DANUS_CODEX_JS.
+# This wrapper keeps every Danus role on one codex version.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/../scripts/env.sh" >/dev/null 2>&1

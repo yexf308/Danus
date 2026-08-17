@@ -130,10 +130,10 @@ done.
 On the **api** backend the two codex lines instead read `codex backend: api provider
 configured` + `codex API live ping ok`.
 
-## 6. Connect Claude Code and initialize
+## 6. Connect codex and initialize
 
-Connect Claude Code **rooted at this repo directory** (so `CLAUDE.md`, `.mcp.json`,
-and `.claude/skills/` load). On the **first** session, the main agent runs the
+Connect codex **rooted at this repo directory** (so `AGENTS.md`, `.codex/config.toml`,
+and `.agents/skills/` load). On the **first** session, the main agent runs the
 **`initialize`** skill: it interviews you (how to address you + language, git branch,
 spend ceiling, consult transport, codex backend), provisions `OPERATOR.md` +
 `config/danus.env`, brings up verify, and writes `runtime/.danus-initialized`.

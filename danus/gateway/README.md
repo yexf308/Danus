@@ -85,7 +85,7 @@ glossary snapshot with a SHA-256 digest.
 
 ## Launched by
 
-`bin/danus-mcp` (role=main, for Claude Code via `.mcp.json`); each worker's
+`bin/danus-mcp` (role=main, for codex via `.codex/config.toml`); each worker's
 `.codex/config.toml` (role=worker); the verify launcher injects it (role=verifier) so
 the judge can call `search_arxiv_theorems`. Config (`DANUS_PROJECT_DIR`,
 `DANUS_AGENTS_ROOT`, `DANUS_VERIFY_URL`, role, author) is read at **call time**.

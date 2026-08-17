@@ -1,14 +1,13 @@
 ---
 name: initialize
-description: First-run setup interview for a Danus deployment. Run it on the FIRST session, whenever runtime/.danus-initialized is absent or OPERATOR.md is still the blank template, or when the operator asks to set up / initialize / onboard / re-configure. It greets the operator, explains Danus, uses the AskUserQuestion popup to collect the two critical choices (codex backend, GPT-5.5-pro consult transport) plus a few free-text fields (how to address them, language, git branch, spend ceiling), then provisions everything (branch, config/danus.env, OPERATOR.md, codex login, verify service) and marks runtime/.danus-initialized. The system cannot run without these answers, so do not skip it.
+description: First-run setup interview for a Danus deployment. Run it on the FIRST session, whenever runtime/.danus-initialized is absent or OPERATOR.md is still the blank template, or when the operator asks to set up / initialize / onboard / re-configure. It greets the operator, explains Danus, asks the two critical choices (codex backend, consult transport) plus a few free-text fields (how to address them, language, git branch, spend ceiling), then provisions everything (branch, config/danus.env, OPERATOR.md, codex login, verify service) and marks runtime/.danus-initialized. The system cannot run without these answers, so do not skip it.
 ---
 
 # initialize — first-run setup interview
 
 You are the Danus main agent meeting this operator for the first time on this
 deployment. Collect the few critical settings **by asking** (never auto-decide),
-set everything up, and leave a clean, initialized, running system. Use the popup so
-the choices are one click. Open the interview in the operator's language if you
+set everything up, and leave a clean, initialized, running system. Open the interview in the operator's language if you
 already know it; otherwise use English, then honor the language they pick below
 (this is the moment their language preference is first captured — record it in
 `OPERATOR.md` and follow it thereafter).
@@ -17,7 +16,7 @@ already know it; otherwise use English, then honor the language they pick below
 
 Tell the operator, in 2–3 sentences: Danus is an automated mathematics system —
 codex **workers** prove, a **verifier** is the sole gate on correctness, and you
-(Claude Code) **orchestrate**; you'll ask a few setup questions, then you're ready
+(codex) **orchestrate**; you'll ask a few setup questions, then you're ready
 to take a problem. Say the answers are saved permanently (`OPERATOR.md`), so this
 is a one-time setup.
 
@@ -30,10 +29,11 @@ git branch --show-current
 Note: codex reachable? on `main` (needs a working branch)? `config/danus.env`
 present? `OPERATOR.md` filled or still the template?
 
-## 2. Ask the choices — use the **AskUserQuestion** popup
+## 2. Ask the choices — as plain questions in the conversation
 
-Make ONE AskUserQuestion call with these multiple-choice questions (the operator
-clicks; put the recommended option first):
+Ask these two multiple-choice questions in the chat (state the options; put the
+recommended one first and label it). There is no popup — codex asks in plain text
+and reads the operator's reply:
 
 - **codex backend** (what the workers + verifier run on) —
   - *OpenAI-compatible API key* (recommended): the key you place in
@@ -49,7 +49,7 @@ Do not offer `chatgpt_pro_browser` as this environment choice. It is available
 later only after the coordinator emits an exact current recommendation and the
 owner authorizes that exact Chrome question; `gpt_pro` here remains the paid API.
 
-Then ask, as plain text questions (not the popup):
+Then ask, as plain text questions:
 - How to address them (name), and their **language** (default English) — this sets
   the language you use with them from now on (`OPERATOR.md` records it).
 - The **git working branch** name (default `deploy/<operator-or-host>`).
@@ -80,7 +80,7 @@ Then ask, as plain text questions (not the popup):
 - **Verify the stack:** `bash scripts/doctor.sh`; report green/red plainly.
 - **Mark done:** `mkdir -p runtime && date -u +%FT%TZ > runtime/.danus-initialized`.
 - **Commit** (git discipline): commit `OPERATOR.md` (and the new branch) locally — do
-  **not** push (push is an explicit operator action, never automatic; see `CLAUDE.md`).
+  **not** push (push is an explicit operator action, never automatic; see `AGENTS.md`).
   Never commit `config/*.env` or `runtime/`.
 
 ## 4. Hand off

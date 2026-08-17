@@ -1,7 +1,8 @@
 # OPERATOR.md — durable operator profile & standing preferences
 
-> Auto-loaded into every Claude Code session (`CLAUDE.md` imports it with
-> `@OPERATOR.md`). It is the main agent's **long-term memory of the operator** —
+> Read by the main agent (codex) at the start of every session — it is NOT
+> auto-loaded, so `AGENTS.md` tells the agent to read it. It is the main agent's
+> **long-term memory of the operator** —
 > the things it learns by asking and must not forget when the session ends. Keep it
 > short, factual, current; update in place (no duplicates). **No secrets here**
 > (tokens/keys go to `config/*.env`, gitignored). This file is committed.

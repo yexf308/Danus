@@ -1,7 +1,7 @@
 # Danus — Operating Guide
 
 How to run a project end to end, from the operator's seat. You do this by **talking
-to the main agent** (Claude Code) in natural language; it runs the CLI verbs and
+to the main agent** (codex) in natural language; it runs the CLI verbs and
 tools for you. Read `concepts.md` first; set up with `getting-started.md`.
 
 > This guide describes the human workflow. Command/tool details are in

@@ -9,7 +9,7 @@
 # calls the consult CLI (bin/consult) on the project's current elaboration and
 # writes the reply to a file. It deliberately does NOT record master_guidance
 # or dispatch workers: the elaborate -> consult -> record-master_guidance
-# -> dispatch chain is owned by the resident Claude-Code main agent and its
+# -> dispatch chain is owned by the resident codex main agent and its
 # `elaboration` / `consult` skills (recording is a gm_add through the
 # gateway, which keeps the global-memory kinds + role gating intact). This shell
 # only provides the unattended timing + the raw consult call around that.
@@ -22,9 +22,9 @@
 #   touch runtime/projects/<project>/.strategy.stop   # graceful stop (at next beat)
 #
 # Env:
-#   DANUS_STRATEGY_BEAT   seconds between consults (default 7200 = ~2h; the
-#                         skill's guidance is at most once every ~2h)
-#   DANUS_CONSULT_TRANSPORT   gpt_pro | claude_api | claude_code | off (default gpt_pro)
+#   DANUS_STRATEGY_BEAT   seconds between example loop iterations (default
+#                         7200 = ~2h; not production authorization to consult)
+#   DANUS_CONSULT_TRANSPORT   off | gpt_pro | claude_api | claude_code (default off)
 # =============================================================================
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -35,7 +35,7 @@ PROJDIR="$DANUS_AGENTS_ROOT/$PROJECT"
 [ -d "$PROJDIR" ] || { echo "no such project: $PROJDIR" >&2; exit 1; }
 
 BEAT="${DANUS_STRATEGY_BEAT:-7200}"
-TRANSPORT="${DANUS_CONSULT_TRANSPORT:-gpt_pro}"
+TRANSPORT="${DANUS_CONSULT_TRANSPORT:-off}"
 STOP="$PROJDIR/.strategy.stop"
 OUTDIR="$PROJDIR/strategy"; mkdir -p "$OUTDIR"
 

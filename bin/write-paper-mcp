@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # write-paper-mcp — launches the write-paper MCP service (role=main)
-# for Claude Code (.mcp.json) or any MCP client. Sources env so DANUS_AGENTS_ROOT
+# for codex (.codex/config.toml) or any MCP client. Sources env so DANUS_AGENTS_ROOT
 # etc. are set, and exports DANUS_WRITE_PAPER_SKILL_DIR so the assembler finds the
 # operator-editable fixed files (role prompts / style / boilerplate).
 set -euo pipefail

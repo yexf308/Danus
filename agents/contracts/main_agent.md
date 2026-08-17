@@ -124,8 +124,8 @@ for.
   was confirmed by the independent critic — never on a timer or no-change. Give
   the human a compact summary on meaningful progress rather than forcing a paid
   consult every fixed number of hours.
-  The CLI and the `.claude/skills` (`/loop`) pace the beats; there is **no resident
-  cron** — you keep time while your session is active.
+  You pace the beats yourself with the CLI and main-agent skills; there is **no
+  resident cron**. Keep time while your session is active.
 - **Late Pro intervention is a separate event checkpoint.** In
   `reasoning_first_v1`, require the coordinator's exact current content-free
   recommendation: one root

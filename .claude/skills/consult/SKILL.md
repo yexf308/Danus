@@ -27,7 +27,7 @@ is genuinely new state to reason over:
 
 Do **not** re-consult when nothing material has changed since the last
 `master_guidance`. A clock neither authorizes nor forbids a consult: drive the
-decision from a new strategic event (or your own `/loop`), never a blind timer.
+decision from a new strategic event, never a blind timer.
 
 **Spend discipline.** Each API consult costs money and accrues to the project's
 running total. Prefer `--effort high` (the workhorse); reserve `xhigh` for genuine

@@ -9,7 +9,7 @@
 </p>
 
 Danus orchestrates mathematical reasoning agents with fact-graph memory. A main
-agent (Claude Code) steers a swarm of autonomous codex workers that prove; a
+agent (codex) steers a swarm of autonomous codex workers that prove; a
 cold-start verifier is the sole authority on correctness. A `correct` verdict is
 necessary, and the gateway then atomically rechecks the verified context and adds
 the fact; a stale or unavailable snapshot returns a write error instead. Verified results accumulate in a content-addressed fact
@@ -143,7 +143,7 @@ danus/                 the engine (installable Python package)
   write_paper/         write-paper MCP service (fact graph → publishable LaTeX paper)
   human_summary/       human-summary MCP service (fact graph → progress-report PDF)
 agents/                codex agent contracts (main/worker/verifier) + worker & verify skills
-.claude/skills/        main-agent skills: elaboration · consult · human-summary · initialize · write-paper
+.agents/skills/         main-agent skills: elaboration · consult · human-summary · initialize · write-paper
 bin/ scripts/ config/  runtime layer (wrappers, bootstrap/services/doctor, env templates)
 docs/                  human docs: getting started · concepts · operating guide · security & trust · …
 examples/              unattended-ops examples + a toy project
@@ -163,12 +163,12 @@ cp config/codex.env.example config/codex.env      # BYO OpenAI-compatible endpoi
 bash scripts/doctor.sh
 bash scripts/services.sh up verify
 
-# 4. connect Claude Code rooted at this repo dir; on first run it runs `initialize`.
-#    --dangerously-skip-permissions lets the main agent operate autonomously (no
-#    per-action permission prompts). That is the intended mode, but it means the
-#    agent acts with your shell privileges — run Danus on an isolated, disposable
-#    host, and read docs/security-and-trust.md first.
-claude --dangerously-skip-permissions
+# 4. connect codex rooted at this repo dir; on first run it runs `initialize`.
+#    --dangerously-bypass-approvals-and-sandbox lets the main agent operate
+#    autonomously (no per-action approval prompts). That is the intended mode, but
+#    it means the agent acts with your shell privileges — run Danus on an isolated,
+#    disposable host, and read docs/security-and-trust.md first.
+codex --dangerously-bypass-approvals-and-sandbox
 ```
 
 Everything runs on your own keys (BYO). Workers and the verifier run on your
@@ -183,8 +183,8 @@ General evidence that work is blocked, dead-ended, slow, costly, or near
 exhaustion is insufficient. Preparation then stops for fresh owner
 authorization. For that owner-approved question, `bin/consult-browser` can
 durably hand off to the existing signed-in ChatGPT Pro Chrome skill. This is the explicit
-`chatgpt_pro_browser` path—not the `gpt_pro` API, and not an environment/loop
-transport. Danus never opens Chrome itself; imported page text is untrusted until
+`chatgpt_pro_browser` path—not the `gpt_pro` API, and not selectable by the
+environment or an unattended loop. Danus never opens Chrome itself; imported page text is untrusted until
 the owner/main agent reviews and adopts strategy-only guidance. See
 [`docs/browser-advisor.md`](docs/browser-advisor.md).
 Import, adoption, or `master_guidance` does not release a coordinator in

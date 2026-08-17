@@ -23,7 +23,7 @@ verifier) decides; and a result only *exists* once that authority has accepted i
   surfaces (is this the answer? push the paper outward?), and set the spending and
   operating preferences. You talk to Danus in natural language through the main
   agent.
-- **The main agent (Claude Code).** The orchestrator and your entry point. It
+- **The main agent (codex).** The orchestrator and your entry point. It
   **steers — it does not do the mathematics.** It sets up projects, runs the
   strategy loop, assigns work, monitors, and drives the report/paper skills. It
   *structurally cannot* fabricate a result (it has no `fact_submit` tool).
