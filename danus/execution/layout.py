@@ -178,20 +178,24 @@ def list_workers(project: str) -> List[str]:
 def list_projects() -> List[str]:
     """Every project under the agents root (a dir holding a ``workers/`` subdir)."""
     root = agents_root()
-    if not root.is_dir():
+    try:
+        entries = list(root.iterdir())
+    except (FileNotFoundError, NotADirectoryError):
         return []
     projects: list[str] = []
-    for entry in root.iterdir():
+    for entry in entries:
         try:
             entry_info = entry.stat(follow_symlinks=False)
-            workers_info = (entry / "workers").stat(follow_symlinks=False)
-        except FileNotFoundError:
+        except (FileNotFoundError, NotADirectoryError):
             continue
-        if (
-            stat.S_ISDIR(entry_info.st_mode)
-            and not stat.S_ISLNK(entry_info.st_mode)
-            and stat.S_ISDIR(workers_info.st_mode)
-            and not stat.S_ISLNK(workers_info.st_mode)
+        if not stat.S_ISDIR(entry_info.st_mode) or stat.S_ISLNK(entry_info.st_mode):
+            continue
+        try:
+            workers_info = (entry / "workers").stat(follow_symlinks=False)
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        if stat.S_ISDIR(workers_info.st_mode) and not stat.S_ISLNK(
+            workers_info.st_mode
         ):
             projects.append(entry.name)
     return sorted(projects)

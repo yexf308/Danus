@@ -2770,7 +2770,7 @@ def main(worker_dir: str) -> int:
                     "last_turn_effort": audit_header.get("requested_effort"),
                     "last_turn_model_rerouted": audit_header.get("model_rerouted"),
                 }
-            last_fact_id = (
+            observed_last_fact_id = (
                 _canonical_app_server_fact_id(project_dir, worker)
                 if transport == "app-server"
                 else _parse_last_fact_id(log_path, worker=wl)
@@ -2795,10 +2795,15 @@ def main(worker_dir: str) -> int:
                 "round": round_seq,
                 "last_round_at": finished_at,
                 "last_rc": rc,
-                "last_fact_id": last_fact_id,
                 "last_attempt": attempt,
                 **coordination_fields(coordination_snapshot),
             }
+            if observed_last_fact_id is not None or transport != "exec":
+                # Exec logs are per-round.  A round without a typed promoted
+                # fact_submit result must not erase the most recent validated
+                # promotion already projected into status.  Omitting the field
+                # lets write_status retain it; a newly observed promotion wins.
+                status_fields["last_fact_id"] = observed_last_fact_id
             if transport == "app-server" and attempt["dispatch_state"] in {
                 "sent",
                 "recovered",

@@ -19,6 +19,7 @@ Runs standalone (``python -m danus.execution.tests.test_loop``) and pytest.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -1752,6 +1753,105 @@ def test_main_restart_preserves_old_logs_and_advances_round_sequence(tmp: Path):
     assert status["round"] == 5
 
 
+def test_main_legacy_status_retains_promoted_fact_across_no_submit_round(tmp: Path):
+    wl = _mk_worker(tmp)
+    first_fact_id = "1111111111111111"
+    newer_fact_id = "2222222222222222"
+    payloads = [
+        json.dumps(
+            {
+                "type": "item.completed",
+                "item": {
+                    "server": "danus",
+                    "tool": "fact_submit",
+                    "result": {
+                        "structuredContent": {
+                            "accepted": True,
+                            "promoted": True,
+                            "submission_status": "promoted",
+                            "verification_verdict": "correct",
+                            "fact_id": first_fact_id,
+                        }
+                    },
+                },
+            }
+        )
+        + "\n",
+        (
+            'agent prose claims {"fact_id": "ffffffffffffffff"}\n'
+            + json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "server": "danus",
+                        "tool": "fact_context",
+                        "result": {"facts": [{"fact_id": "eeeeeeeeeeeeeeee"}]},
+                    },
+                }
+            )
+            + "\n"
+        ),
+        json.dumps(
+            {
+                "type": "item.completed",
+                "item": {
+                    "server": "danus",
+                    "tool": "fact_submit",
+                    "result": {
+                        "structuredContent": {
+                            "accepted": True,
+                            "promoted": True,
+                            "submission_status": "promoted",
+                            "verification_verdict": "correct",
+                            "fact_id": newer_fact_id,
+                        }
+                    },
+                },
+            }
+        )
+        + "\n",
+    ]
+
+    def one_round(_wl, _role, _prompt, log_path, _hard_timeout):
+        log_path.write_text(payloads.pop(0), encoding="utf-8")
+        return 0
+
+    _patch_run_round(one_round)
+    try:
+        with (
+            _restore_sigterm(),
+            _env(
+                DANUS_ROUND_BEAT="0",
+                DANUS_MAX_ROUNDS="2",
+                DANUS_MAX_CONSEC_FAILURES="0",
+            ),
+        ):
+            assert loop.main(str(wl.dir)) == 0
+
+        status = json.loads(wl.status.read_text(encoding="utf-8"))
+        assert status["round"] == 2
+        assert status["last_fact_id"] == first_fact_id
+        assert status["last_attempt"]["round"] == 2
+        assert status["last_attempt"]["dispatch_state"] == "none"
+
+        with (
+            _restore_sigterm(),
+            _env(
+                DANUS_ROUND_BEAT="0",
+                DANUS_MAX_ROUNDS="1",
+                DANUS_MAX_CONSEC_FAILURES="0",
+            ),
+        ):
+            assert loop.main(str(wl.dir)) == 0
+    finally:
+        _unpatch_run_round()
+
+    status = json.loads(wl.status.read_text(encoding="utf-8"))
+    assert status["round"] == 3
+    assert status["last_fact_id"] == newer_fact_id
+    assert payloads == []
+
+
 # --- main loop: consecutive-failure cap → error / rc 1 --------------------- #
 
 
@@ -2080,6 +2180,61 @@ def test_layout_defaults_and_empties(tmp: Path):
     with _env(DANUS_AGENTS_ROOT=str(tmp / "no_such_root")):
         assert L.list_workers("ghost") == []
         assert L.list_projects() == []
+
+
+def test_list_projects_ignores_ordinary_files(tmp: Path):
+    root = tmp / "projects"
+    (root / "real-project" / "workers").mkdir(parents=True)
+    (root / ".DS_Store").write_text("desktop metadata", encoding="utf-8")
+
+    with _env(DANUS_AGENTS_ROOT=str(root)):
+        assert L.list_projects() == ["real-project"]
+
+
+def test_list_projects_tolerates_directory_replacement_race(
+    tmp: Path, monkeypatch
+):
+    root = tmp / "projects"
+    raced_project = root / "raced-project"
+    raced_project.mkdir(parents=True)
+    raced_workers = (raced_project / "workers").resolve()
+    real_stat = Path.stat
+    raced_paths = []
+
+    def raced_stat(path: Path, *args, **kwargs):
+        if path == raced_workers:
+            raced_paths.append(path)
+            raise NotADirectoryError(
+                errno.ENOTDIR, os.strerror(errno.ENOTDIR), str(path)
+            )
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", raced_stat)
+    with _env(DANUS_AGENTS_ROOT=str(root)):
+        assert L.list_projects() == []
+    assert raced_paths == [raced_workers]
+
+
+@pytest.mark.parametrize("error_number", [errno.EACCES, errno.EIO])
+def test_list_projects_propagates_unrelated_stat_errors(
+    tmp: Path, monkeypatch, error_number: int
+):
+    root = tmp / "projects"
+    project = root / "project"
+    project.mkdir(parents=True)
+    workers = (project / "workers").resolve()
+    real_stat = Path.stat
+
+    def failing_stat(path: Path, *args, **kwargs):
+        if path == workers:
+            raise OSError(error_number, os.strerror(error_number), str(path))
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", failing_stat)
+    with _env(DANUS_AGENTS_ROOT=str(root)):
+        with pytest.raises(OSError) as exc_info:
+            L.list_projects()
+    assert exc_info.value.errno == error_number
 
 
 # --- scaffold.symlink branches --------------------------------------------- #
