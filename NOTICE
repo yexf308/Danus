@@ -1,0 +1,30 @@
+Aristarch
+Copyright 2026 Felix Ye (yexf308)
+
+This product is a derivative work of:
+
+  Danus — https://github.com/frenzymath/Danus
+  Copyright the Danus authors (frenzymath team; see CITATION.cff references)
+  Licensed under the Apache License, Version 2.0
+  Paper: arXiv:2607.06447
+
+which itself builds on:
+
+  Rethlas — https://github.com/frenzymath/Rethlas
+  Copyright the Rethlas authors (frenzymath team)
+  Licensed under the Apache License, Version 2.0
+  Paper: arXiv:2604.03789
+
+This repository preserves the full upstream commit history; the provenance of
+every line is available via `git log` and `git blame`. The internal Python
+package, CLI (`bin/danus`), and configuration names retain the upstream engine
+name `danus`.
+
+"Danus" and "Rethlas" are the names of the upstream projects and are used in
+this repository only to describe origin and compatibility. Aristarch is an
+independent derivative and is not endorsed by, affiliated with, or a product of
+the upstream team.
+
+Generation 1 of Aristarch's control plane was developed on a Rethlas host and
+is frozen at https://github.com/yexf308/Rethlas as the pinned evaluation
+baseline.

@@ -1,79 +1,134 @@
-# Danus: Orchestrating Mathematical Reasoning Agents with Fact-Graph Memory
+# Aristarch: Verification-First Control of Long-Horizon Mathematical Research Agents
 
 <p align="center">
-  <a href="https://arxiv.org/abs/2607.06447"><img src="https://img.shields.io/badge/arXiv-2607.06447-b31b1b" alt="Danus paper on arXiv"></a>
-  <a href="https://frenzymath.com/blog/danus/"><img src="https://img.shields.io/badge/Technical%20Report-frenzymath.com-1f6feb" alt="Technical report"></a>
-  <a href="https://github.com/frenzymath/Rethlas"><img src="https://img.shields.io/badge/Rethlas-GitHub-181717?logo=github" alt="Rethlas on GitHub"></a>
-  <a href="https://www.xiaohongshu.com/discovery/item/6a4da1ba00000000070201ef?source=webshare&xhsshare=pc_web&xsec_token=ABfiiMB7yyB-dW_hMzh3MW7ZRG2ddm5in_wBnBALXO6DE=&xsec_source=pc_share"><img src="https://img.shields.io/badge/rednote-%E5%B0%8F%E7%BA%A2%E4%B9%A6-FF2442?logo=xiaohongshu&logoColor=white" alt="rednote (Xiaohongshu) post"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-4c1" alt="Apache 2.0 license"></a>
+  <a href="https://arxiv.org/abs/2607.06447"><img src="https://img.shields.io/badge/upstream%20Danus-arXiv%3A2607.06447-b31b1b" alt="Upstream Danus paper"></a>
+  <a href="https://arxiv.org/abs/2604.03789"><img src="https://img.shields.io/badge/upstream%20Rethlas-arXiv%3A2604.03789-b31b1b" alt="Upstream Rethlas paper"></a>
 </p>
 
-Danus orchestrates mathematical reasoning agents with fact-graph memory. A main
-agent (codex) steers a swarm of autonomous codex workers that prove; a
-cold-start verifier is the sole authority on correctness. A `correct` verdict is
-necessary, and the gateway then atomically rechecks the verified context and adds
-the fact; a stale or unavailable snapshot returns a write error instead. Verified results accumulate in a content-addressed fact
-graph — the system's only source of truth — and a strategy loop (a strong
-reasoning model) decomposes the problem and steers the swarm. When you have the
-answer, Danus renders it into a human report or a publishable LaTeX paper.
+Aristarch orchestrates mathematical reasoning agents under one design stance:
+**no claim enters truth unmarked**. A main agent steers a swarm of autonomous
+codex workers that prove; a cold-start verifier is the sole authority on
+correctness. A `correct` verdict is necessary, and the gateway then atomically
+rechecks the verified context and adds the fact; a stale or unavailable
+snapshot returns a write error instead. Verified results accumulate in a
+content-addressed fact graph — the system's only source of truth — and a
+strategy loop (a strong reasoning model) decomposes the problem and steers the
+swarm. When you have the answer, Aristarch renders it into a human report or a
+publishable LaTeX paper.
 
-Danus builds on the worker–verifier core of our earlier system
-[Rethlas](https://github.com/frenzymath/Rethlas)
-([arXiv:2604.03789](https://arxiv.org/abs/2604.03789)). The
-[paper](https://arxiv.org/abs/2607.06447) and the
-[technical report](https://frenzymath.com/blog/danus/) tell the full story:
-the system, six research-level case studies it resolved, and what we learned
-along the way.
+Around that core, Aristarch adds the control machinery that makes long
+unattended research runs survivable and auditable: exact paid-turn binding,
+guarded advisor escalation, durable human hot-join with attested delivery,
+contamination-gated literature retrieval, and a reproducible evaluation
+protocol on research-level benchmarks.
+
+The name: an *aristarch* is a severe critic — after Aristarchus of Samothrace,
+the Alexandrian philologist who went through Homer line by line and marked
+every doubtful verse with an obelus. That is this system's verifier in one
+sentence.
 
 See `ARCHITECTURE.md` for the layered design and the map of every module.
 
-## What's new in this Codex fork
+## Provenance
 
-This fork's `main` branch is the **Codex-native Danus line**. Workers and the
-verifier already ran on Codex; now the main agent does too, so the core system
-requires no Claude Code installation. Optional paid strategy transports remain
-explicit opt-ins and default to `off`.
+Aristarch is a derivative work of **[Danus](https://github.com/frenzymath/Danus)**
+([arXiv:2607.06447](https://arxiv.org/abs/2607.06447),
+[technical report](https://frenzymath.com/blog/danus/)) by the **frenzymath**
+team — their successor to
+**[Rethlas](https://github.com/frenzymath/Rethlas)**
+([arXiv:2604.03789](https://arxiv.org/abs/2604.03789)). The worker–verifier
+core, the fact-graph design, and the published case studies are upstream's
+work; if you use Aristarch, cite their papers (see `CITATION.cff`). This
+repository preserves the full upstream commit history, so the provenance of
+every line is one `git blame` away. "Danus" and "Rethlas" appear in this
+document only to describe origin and compatibility; Aristarch is not endorsed
+by or affiliated with the upstream team.
+
+Aristarch is the fork line's contribution, in two generations:
+
+- **Generation 2 — this repository (Danus-hosted, mainline).** Everything in
+  "What Aristarch adds" below; measured against the upstream merge-base,
+  +65k lines across 153 files, roughly half of it deep modifications to the
+  engine's core packages.
+- **Generation 1 — [yexf308/Rethlas](https://github.com/yexf308/Rethlas)
+  (Rethlas-hosted, frozen).** The first iteration of the same control-plane
+  program: the durable human hot-join adapter, the guardian launcher, the
+  advisor bridge, and safe three-route parallel generation (+117k lines, 86%
+  in new files). It is kept frozen as the pinned generation-1 baseline for
+  evaluation.
+
+**Engine names are unchanged.** The Python package, the CLI (`bin/danus`),
+the env files (`config/danus.env`), and `DANUS_*` environment variables keep
+the upstream engine's name. *Aristarch* names the system; `danus` names the
+engine it runs on. A code-level rename would break every operational script
+for zero capability gain, so it is deliberately not planned.
+
+## What Aristarch adds
+
+Aristarch's `main` branch is Codex-native end to end. Workers and the verifier
+already ran on Codex upstream; here the main agent does too, so the core
+system requires no Claude Code installation. Optional paid strategy transports
+remain explicit opt-ins and default to `off`.
 
 - **Codex-native orchestration.** `AGENTS.md`, `.codex/config.toml`, and
-  `.agents/skills/` provide the main-agent contract, MCP wiring, initialization,
-  and rendering workflows. Worker project configuration is isolated from the
-  main-agent workspace so one runtime cannot silently shadow another.
+  `.agents/skills/` provide the main-agent contract, MCP wiring,
+  initialization, and rendering workflows. Worker project configuration is
+  isolated from the main-agent workspace so one runtime cannot silently
+  shadow another.
 - **Reasoning-first coordination.** New projects pin one deep root and one
-  independent critic while dormant observers consume no paid turns. An explicit
-  one or two balanced explorer lanes can pursue independent alternate routes
-  without gaining critic or advisor authority. Every new terminal coordination
-  slot gets a fresh app-server thread; only recovery of that exact slot resumes
-  it.
-- **Exact paid-task binding.** Each paid assignment is staged before dispatch and
-  bound to its generation, worker, byte length, and SHA-256 digest. A later host
-  edit cannot retarget an admitted turn, and owner-gated generation changes
-  require a complete frozen task set.
+  independent critic while dormant observers consume no paid turns. An
+  explicit one or two balanced explorer lanes can pursue independent
+  alternate routes without gaining critic or advisor authority. Every new
+  terminal coordination slot gets a fresh app-server thread; only recovery of
+  that exact slot resumes it.
+- **Exact paid-task binding.** Each paid assignment is staged before dispatch
+  and bound to its generation, worker, byte length, and SHA-256 digest. A
+  later host edit cannot retarget an admitted turn, and owner-gated
+  generation changes require a complete frozen task set.
 - **Guarded advisor escalation.** A root obstruction must receive independent
-  critic confirmation before Danus can expose an owner recommendation. Every
-  ChatGPT Pro browser question then requires fresh owner authorization, exact
-  receipt binding, explicit review, and an audited resume decision.
+  critic confirmation before Aristarch can expose an owner recommendation.
+  Every ChatGPT Pro browser question then requires fresh owner authorization,
+  exact receipt binding, explicit review, and an audited resume decision.
 - **Safer control and observability.** `say`, current-turn-only `encourage`,
   `messages`, and `interrupt-turn` have distinct authority. Status preserves
   paid-intent lifecycle, fact promotions, project discovery, and content-free
-  reasoning, tool, wait, memory, compaction, and token telemetry. Missing data is
-  reported as unavailable rather than zero.
-- **Stricter strategy transports.** OpenAI-compatible Responses gateways support
-  `max` effort, canonical message input, configurable `background` and `store`,
-  and caller-controlled omission of refused parameters. Failures return a
-  structured envelope with billing basis instead of a traceback.
+  reasoning, tool, wait, memory, compaction, and token telemetry. Missing
+  data is reported as unavailable rather than zero.
+- **Stricter strategy transports.** OpenAI-compatible Responses gateways
+  support `max` effort, canonical message input, configurable `background`
+  and `store`, and caller-controlled omission of refused parameters. Failures
+  return a structured envelope with billing basis instead of a traceback.
 - **Classified whole-paper verification.** The paper verifier separates
-  `must-fix` gaps from `ignorable` steps that an undergraduate can fill unaided.
-  Deliverability requires zero `must-fix` findings; ignorable findings remain
-  visible without forcing transcription-heavy expansion.
+  `must-fix` gaps from `ignorable` steps that an undergraduate can fill
+  unaided. Deliverability requires zero `must-fix` findings; ignorable
+  findings remain visible without forcing transcription-heavy expansion.
+- **Contamination-gated retrieval.** `danus/integrations/gated_search.py`
+  wraps all external literature search in a fail-closed gate with three
+  modes — `strict` (matlas.ai: peer-reviewed journals through 2025 plus
+  textbooks, structurally no arXiv), `dated` (month-granularity arXiv cutoff
+  with whole-month drop and over-fetch), and `off` (zero-retrieval control
+  arm) — plus per-call append-only audit ledgers, source-paper interception,
+  and response-size caps. Built for benchmark runs whose problems are sourced
+  from recent arXiv papers, where the source paper's abstract contains the
+  answer.
+- **A reproducible evaluation protocol.** A hard subset of MathArena
+  arxivmath/brokenarxiv (2026-04 through 2026-06; 61 problems at the
+  no-model-solves tier), with frozen append-only manifests, an audited
+  rejected list, and a cross-family sycophancy judge on MathArena's 0/1/2
+  scale. The dataset and its answer keys live outside every agent workspace
+  and never enter this tree. (Release pending; problem content inherits
+  CC BY-SA 4.0 from MathArena.)
 
 The upstream project also publishes a
-[Claude Code orchestrator line](https://github.com/frenzymath/Danus/tree/main).
-Both lines use the same Codex worker, verifier, fact-graph, and rendering engine;
-the main-agent runtime and its configuration files are the intentional difference.
+[Claude Code orchestrator line](https://github.com/frenzymath/Danus). Both
+lines use the same Codex worker, verifier, fact-graph, and rendering engine;
+the main-agent runtime and its configuration files are the intentional
+difference.
 
 ## How it works
 
-<p align="center"><img src="docs/assets/architecture.png" width="820" alt="Danus architecture: a main agent orchestrates a worker swarm; a stateless verifier gates every fact; global memory and the fact graph are the shared storage"></p>
+<p align="center"><img src="docs/assets/architecture.png" width="820" alt="Architecture: a main agent orchestrates a worker swarm; a stateless verifier gates every fact; global memory and the fact graph are the shared storage"></p>
 
 The design follows a strict separation of powers: the main agent performs the
 global planning and coordination, the workers carry out the detailed proof
@@ -182,14 +237,14 @@ bounds.
 ## Layout
 
 ```
-danus/                 the engine (installable Python package)
+danus/                 the engine (installable Python package; retains the upstream name)
   core/                truth layer: content-addressed fact graph + typed memory + schema
   gateway/             role-gated MCP server — the only door to the truth stores
   verify/              cold-start mathematical authority behind the write-gate
   execution/           worker swarm: the autonomous per-worker round loop + scaffolding
   orchestration/       lifecycle plus durable human hot-join (`say`/`encourage`/`messages`)
   strategy/            consult gateway + owner-only durable browser-advisor handoff
-  integrations/        arXiv theorem search
+  integrations/        literature retrieval, including the contamination gate (gated_search)
   observability/       read-only dashboard
   authoring/           shared one-shot isolated-codex driver for the two renderers below
   write_paper/         write-paper MCP service (fact graph → publishable LaTeX paper)
@@ -218,8 +273,8 @@ bash scripts/services.sh up verify
 # 4. connect codex rooted at this repo dir; on first run it runs `initialize`.
 #    --dangerously-bypass-approvals-and-sandbox lets the main agent operate
 #    autonomously (no per-action approval prompts). That is the intended mode, but
-#    it means the agent acts with your shell privileges — run Danus on an isolated,
-#    disposable host, and read docs/security-and-trust.md first.
+#    it means the agent acts with your shell privileges — run Aristarch on an
+#    isolated, disposable host, and read docs/security-and-trust.md first.
 codex --dangerously-bypass-approvals-and-sandbox
 ```
 
@@ -236,7 +291,8 @@ exhaustion is insufficient. Preparation then stops for fresh owner
 authorization. For that owner-approved question, `bin/consult-browser` can
 durably hand off to the existing signed-in ChatGPT Pro Chrome skill. This is the explicit
 `chatgpt_pro_browser` path—not the `gpt_pro` API, and not selectable by the
-environment or an unattended loop. Danus never opens Chrome itself; imported page text is untrusted until
+environment or an unattended loop. Aristarch never opens Chrome itself; imported
+page text is untrusted until
 the owner/main agent reviews and adopts strategy-only guidance. See
 [`docs/browser-advisor.md`](docs/browser-advisor.md).
 Import, adoption, or `master_guidance` does not release a coordinator in
@@ -244,7 +300,7 @@ Import, adoption, or `master_guidance` does not release a coordinator in
 `danus resolve-recommendation` of the exact recommendation, with explicit
 exact-id and paid-resume acknowledgements. Adopted guidance must link the
 recommendation; continuing without guidance fails while its browser request is
-active, delivery-ambiguous, or completed but not imported. Repeated Danus
+active, delivery-ambiguous, or completed but not imported. Repeated advisor
 interventions may continue the same verified local conversation: the context id
 stays stable, but each uses a new coordinator recommendation, current-evidence
 prompt/request, fresh owner authorization, and one-shot dispatch; the broker
@@ -278,11 +334,11 @@ authoritatively live worker and its one canonical `started` intent, binds the
 exact thread and turn, and fails if that turn changes. It cannot start a paid
 turn or queue for the next one. The envelope marks the note as non-authoritative
 morale support—not a task, coordination directive, mathematical evidence, fact,
-or verification. Danus does not send these notes automatically and does not
+or verification. Aristarch does not send these notes automatically and does not
 claim a causal effect on reasoning quality.
 
 If Codex reports that a persisted thread was deleted or is no longer
-resumable, Danus fails closed instead of silently starting a second paid
+resumable, Aristarch fails closed instead of silently starting a second paid
 conversation. Inspect the exact id with `bin/danus status <project>/<worker>
 --json`, then explicitly clear only that mapping with `bin/danus reset-thread
 <project>/<worker> --expected-thread-id <id>`. The reset is CAS-fenced,
@@ -294,9 +350,9 @@ remains a separate incident decision; reset never retries or abandons it.
 
 For a different failure mode, same-slot crash recovery—or an explicitly legacy
 app-server project—can make 0.147's
-mandatory full-history `thread/resume` response exceed Danus's 8 MiB JSONL
-ceiling. Danus first checks `thread/read(includeTurns=false)` to attest that the
-thread is inactive, then attempts the configured continuation round. If the
+mandatory full-history `thread/resume` response exceed the 8 MiB JSONL
+ceiling. Aristarch first checks `thread/read(includeTurns=false)` to attest that
+the thread is inactive, then attempts the configured continuation round. If the
 resume itself is too large, the next attempt fails before `turn/start`; status
 keeps the prior paid timeout under `last_paid_turn` and the resume failure under
 `last_attempt`. No retry or context drop is automatic. After inspecting
@@ -317,7 +373,7 @@ including the spawn-to-PID-registration window. Rotation only clears the thread
 mapping; the second command is a separate owner decision that creates the
 replacement conversation.
 If an oversized resume coincides with a `dispatching`, `started`, or
-`delivery_unknown` paid intent, Danus preserves that ambiguous intent and
+`delivery_unknown` paid intent, Aristarch preserves that ambiguous intent and
 publishes no rotation argv. If the remote outcome cannot be reconciled, the
 owner can terminalize only the exact incident while the worker is fail-stopped:
 
@@ -376,8 +432,8 @@ The protected round audit records requested/attested model data, observed token
 usage, and exact-turn `model/rerouted` events. Token totals are explicitly marked
 as observed rather than schema-attested final. If an adapter restart recovers a
 pre-existing paid turn, historical reroute notifications cannot be replayed;
-Danus preserves the turn result but quarantines it and disables automatic retry
-instead of claiming that the requested model was proven.
+Aristarch preserves the turn result but quarantines it and disables automatic
+retry instead of claiming that the requested model was proven.
 Known app-server protocol, configuration, authentication, delivery, and failed
 terminal outcomes are also fail-stop conditions; the outer loop does not turn
 them into repeated paid attempts.

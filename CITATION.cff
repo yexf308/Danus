@@ -1,36 +1,57 @@
 cff-version: 1.2.0
-message: "If you use Danus, please cite the paper below."
-title: "Danus"
-repository-code: "https://github.com/frenzymath/Danus"
+message: >-
+  If you use Aristarch, please cite this repository AND the upstream Danus and
+  Rethlas papers listed under references — the worker-verifier core and the
+  fact-graph design are upstream's work.
+title: "Aristarch"
+repository-code: "https://github.com/yexf308/Aristarch"
 license: Apache-2.0
-preferred-citation:
-  type: generic
-  title: "Danus: Orchestrating Mathematical Reasoning Agents with Fact-Graph Memory"
-  year: 2026
-  url: "https://arxiv.org/abs/2607.06447"
-  identifiers:
-    - type: other
-      value: "arXiv:2607.06447"
-  authors:
-    - family-names: Liu
-      given-names: Jihao
-    - family-names: Gao
-      given-names: Guoxiong
-    - family-names: Sun
-      given-names: Zeming
-    - family-names: Wu
-      given-names: Bin
-    - family-names: Liu
-      given-names: Shurui
-    - family-names: Jiang
-      given-names: Jiedong
-    - family-names: Ju
-      given-names: Haocheng
-    - family-names: Chen
-      given-names: Leheng
-    - family-names: Cheng
-      given-names: Ronnie
-    - family-names: Zhang
-      given-names: Xiping
-    - family-names: Dong
-      given-names: Bin
+authors:
+  # TODO(owner): confirm the author list before tagging a release.
+  # Fork commits also carry: Bin Wu, hengyu0510 (Danus side); Haocheng Ju,
+  # Shurui Liu, connectedtheorems (Rethlas side). Several of these are ALSO
+  # upstream Danus authors — listing them here without asking implies they
+  # endorse the rebrand. Ask first.
+  - family-names: Ye
+    given-names: Felix
+    alias: yexf308
+references:
+  - type: generic
+    title: "Danus: Orchestrating Mathematical Reasoning Agents with Fact-Graph Memory"
+    year: 2026
+    url: "https://arxiv.org/abs/2607.06447"
+    identifiers:
+      - type: other
+        value: "arXiv:2607.06447"
+    authors:
+      - family-names: Liu
+        given-names: Jihao
+      - family-names: Gao
+        given-names: Guoxiong
+      - family-names: Sun
+        given-names: Zeming
+      - family-names: Wu
+        given-names: Bin
+      - family-names: Liu
+        given-names: Shurui
+      - family-names: Jiang
+        given-names: Jiedong
+      - family-names: Ju
+        given-names: Haocheng
+      - family-names: Chen
+        given-names: Leheng
+      - family-names: Cheng
+        given-names: Ronnie
+      - family-names: Zhang
+        given-names: Xiping
+      - family-names: Dong
+        given-names: Bin
+  - type: generic
+    # TODO(owner): fill the exact Rethlas paper title and author list from
+    # arXiv:2604.03789 — do not guess them.
+    title: "Rethlas (see arXiv:2604.03789 for the exact title and authors)"
+    year: 2026
+    url: "https://arxiv.org/abs/2604.03789"
+    identifiers:
+      - type: other
+        value: "arXiv:2604.03789"
