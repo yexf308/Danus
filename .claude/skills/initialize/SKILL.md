@@ -70,7 +70,9 @@ Then ask, as plain text questions:
   make sure the operator's key + endpoint are filled there (`CODEX_*` / `OPENAI_*`).
   Never put secrets anywhere but `config/*.env`.
 - **OPERATOR.md:** fill name / language / consult transport / spend ceiling /
-  default worker roster, in place (no duplicates).
+  default worker roster, in place (no duplicates). `OPERATOR.template.md` is the
+  canonical blank shape for a copied or repaired deployment; never put personal
+  values into that template.
 - **codex:** backend=api → `bash scripts/check-codex.sh` (confirm reachable);
   backend=chatgpt → **you** run `bash scripts/setup-codex.sh login` and give the
   operator the printed URL + device code (they only open it and authorize).

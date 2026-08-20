@@ -1,6 +1,7 @@
 """Static regression tests for the repo-root Codex main-agent adapter."""
 
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -31,20 +32,27 @@ def test_codex_entry_contract_replaces_claude_only_entrypoints():
         assert obsolete not in consult
 
 
-def test_public_operator_profile_is_blank_and_uninitialized_cli_fails_closed(
+def test_blank_operator_template_and_uninitialized_cli_fail_closed(
     tmp_path: Path,
 ):
-    operator = _text("OPERATOR.md")
+    operator = _text("OPERATOR.template.md")
     initialize = _text(".claude/skills/initialize/SKILL.md")
     assert "Name / how to address:** _(ask once; fill in)_" in operator
     assert "Felix" not in operator
     assert "filled `OPERATOR.md` belongs only to this deployment branch" in initialize
 
+    release = tmp_path / "release"
+    (release / "bin").mkdir(parents=True)
+    (release / "scripts").mkdir()
+    shutil.copy2(ROOT / "bin" / "danus", release / "bin" / "danus")
+    shutil.copy2(ROOT / "scripts" / "env.sh", release / "scripts" / "env.sh")
+    (release / "OPERATOR.md").write_text(operator, encoding="utf-8")
+
     env = os.environ.copy()
     env["DANUS_RUNTIME"] = str(tmp_path / "fresh-runtime")
     result = subprocess.run(
-        [str(ROOT / "bin" / "danus"), "start", "copied-project"],
-        cwd=ROOT,
+        [str(release / "bin" / "danus"), "start", "copied-project"],
+        cwd=release,
         env=env,
         text=True,
         stdout=subprocess.PIPE,
@@ -59,8 +67,8 @@ def test_public_operator_profile_is_blank_and_uninitialized_cli_fails_closed(
     runtime.mkdir()
     (runtime / ".danus-initialized").write_text("legacy timestamp\n", encoding="utf-8")
     blank_profile = subprocess.run(
-        [str(ROOT / "bin" / "danus"), "start", "copied-project"],
-        cwd=ROOT,
+        [str(release / "bin" / "danus"), "start", "copied-project"],
+        cwd=release,
         env=env,
         text=True,
         stdout=subprocess.PIPE,
