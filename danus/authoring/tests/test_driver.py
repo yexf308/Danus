@@ -123,6 +123,28 @@ def test_networked_preflight_failure_starts_no_codex(monkeypatch):
     assert calls == []
 
 
+def test_gated_networked_authoring_has_no_builtin_web_or_unsandboxed_exec(
+    monkeypatch,
+):
+    captured = {}
+    monkeypatch.setattr(driver, "require_gateway_runtime", lambda: None)
+    monkeypatch.setattr(driver.codex, "resolve_bin", lambda: "/opt/danus/codex")
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["env"] = kwargs["env"]
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(driver.subprocess, "run", fake_run)
+    with env(DANUS_RETRIEVAL_MODE="strict"):
+        driver.run_codex("audit references", networked=True)
+    cmd = captured["cmd"]
+    assert "tools.web_search=false" in cmd
+    assert "--dangerously-bypass-approvals-and-sandbox" not in cmd
+    assert cmd[cmd.index("--sandbox") + 1] == "read-only"
+    assert captured["env"]["DANUS_RETRIEVAL_MODE"] == "strict"
+
+
 def test_offline_authoring_does_not_require_gateway(monkeypatch):
     _ensure_fake_executable()
 
@@ -177,6 +199,17 @@ def test_subprocess_env_bare_name_does_not_inject_cwd():
     before = os.environ.get("PATH", "")
     senv = codex.subprocess_env("codex")
     assert senv["PATH"] == before, "a bare name must leave PATH unchanged"
+
+
+def test_networked_subprocess_env_drops_unrelated_secrets(monkeypatch):
+    monkeypatch.setenv("UNRELATED_SECRET_CANARY", "must-not-cross")
+    monkeypatch.setenv("DANUS_CODEX_API_KEY", "required-provider-key")
+    monkeypatch.setenv("DANUS_RETRIEVAL_MODE", "strict")
+    senv = driver._networked_subprocess_env("codex")
+    assert "UNRELATED_SECRET_CANARY" not in senv
+    assert senv["DANUS_CODEX_API_KEY"] == "required-provider-key"
+    assert senv["DANUS_RETRIEVAL_MODE"] == "strict"
+    assert senv["DANUS_CODEX_SANITIZED_ENV"] == "1"
 
 
 def main() -> None:

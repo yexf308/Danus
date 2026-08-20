@@ -27,6 +27,7 @@ This module is the deterministic, offline-testable half:
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 from dataclasses import dataclass
@@ -74,6 +75,7 @@ class LedgerRow:
     unit_id: str
     label: str = ""
     source_fact: str = ""
+    document_sha256: str = ""
     status: str = "pending"
     last_verdict: str = ""
     repair_hints: str = ""
@@ -104,6 +106,8 @@ def read_ledger(path: Path) -> Dict[str, LedgerRow]:
             cur.label = val
         elif key == "source_fact":
             cur.source_fact = val
+        elif key == "document_sha256":
+            cur.document_sha256 = val
         elif key == "status":
             cur.status = val
         elif key == "last_verdict":
@@ -130,6 +134,7 @@ def write_ledger(path: Path, rows: List[LedgerRow]) -> None:
         parts.append(f"\n## {r.unit_id}")
         parts.append(f"- label: {r.label}")
         parts.append(f"- source_fact: {r.source_fact}")
+        parts.append(f"- document_sha256: {r.document_sha256}")
         parts.append(f"- status: {r.status}")
         parts.append(f"- last_verdict: {r.last_verdict}")
         parts.append(f"- repair_hints: {r.repair_hints}")
@@ -165,6 +170,19 @@ def deliver_ok(path: Path) -> Tuple[bool, List[str]]:
     for r in rows.values():
         if r.status not in ("correct", "trusted", "overridden"):
             blockers.append(f"{r.unit_id} [{r.label}] ({r.status})")
+            continue
+        if r.unit_id == "whole-paper":
+            document = path.with_name("main.tex")
+            if not re.fullmatch(r"[0-9a-f]{64}", r.document_sha256):
+                blockers.append(
+                    "whole-paper [whole-paper] (missing verified document digest)"
+                )
+            elif not document.is_file():
+                blockers.append("whole-paper [whole-paper] (main.tex missing)")
+            elif hashlib.sha256(document.read_bytes()).hexdigest() != r.document_sha256:
+                blockers.append(
+                    "whole-paper [whole-paper] (main.tex changed after verification)"
+                )
     return (not blockers), blockers
 
 

@@ -1244,6 +1244,7 @@ class CoordinationStore:
 
         connection = self._connect()
         try:
+            connection.execute("BEGIN IMMEDIATE")
             project = self._state(connection)
             current = int(project["generation"])
             target = (
@@ -3882,12 +3883,17 @@ class CoordinationStore:
                 """,
                 (worker, stream, cursor, target_generation, observed_at),
             )
+            connection.commit()
             return {
                 "worker": worker,
                 "stream": stream,
                 "cursor": cursor,
                 "generation": target_generation,
             }
+        except BaseException:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
         finally:
             connection.close()
 
@@ -4236,6 +4242,7 @@ class CoordinationStore:
         observed_at = time.time() if now is None else float(now)
         connection = self._connect()
         try:
+            connection.execute("BEGIN IMMEDIATE")
             project = self._state(connection)
             current_generation = int(project["generation"])
             target_generation = current_generation if generation is None else generation
@@ -4273,6 +4280,7 @@ class CoordinationStore:
                 or row["lane"] != lane
             ):
                 raise CoordinationError("candidate id conflicts with prior state")
+            connection.commit()
             return {
                 "candidate_id": candidate_id,
                 "candidate_fact_id": None,
@@ -4282,6 +4290,10 @@ class CoordinationStore:
                 "lane": lane,
                 "state": row["state"],
             }
+        except BaseException:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
         finally:
             connection.close()
 

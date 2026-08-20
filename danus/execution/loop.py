@@ -37,6 +37,7 @@ from __future__ import annotations
 import json
 import hashlib
 import fcntl
+import math
 import os
 import re
 import signal
@@ -532,12 +533,17 @@ def _read_status_snapshot(wl: L.WorkerLayout) -> dict:
 
 def _deadline_passed(project_dir: Path) -> bool:
     f = project_dir / L.DEADLINE_FILE
-    if not f.exists():
-        return False
     try:
-        return time.time() >= float(f.read_text().strip())
-    except (ValueError, OSError):
+        raw = _read_regular_text(f, max_bytes=128).strip()
+    except FileNotFoundError:
         return False
+    except (HotJoinError, OSError, UnicodeDecodeError):
+        return True
+    try:
+        deadline = float(raw)
+    except ValueError:
+        return True
+    return not math.isfinite(deadline) or deadline < 0 or time.time() >= deadline
 
 
 def _fact_submit_summary(item: dict) -> Optional[dict]:
@@ -886,6 +892,12 @@ def run_round(
             f"{redact_external_error(exc)}\n",
         )
         return 126
+    retrieval_mode = os.environ.get("DANUS_RETRIEVAL_MODE", "open").strip().lower()
+    gated_retrieval = retrieval_mode != "open"
+    execution_boundary = (
+        (["--config", "tools.web_search=false"] if gated_retrieval else [])
+        + ["--sandbox", "workspace-write"]
+    )
     cmd = codex.exec_cmd(
         codex_bin,
         role["MODEL"],
@@ -905,7 +917,7 @@ def run_round(
         # on an install without .git (tarball download), codex's
         # trusted-directory check refuses to run the worker round
         "--skip-git-repo-check",
-        "--dangerously-bypass-approvals-and-sandbox",
+        *execution_boundary,
         # Status attribution consumes only typed completed fact_submit events;
         # free-form terminal text, fact context, and diffs are never scraped.
         "--json",
@@ -2417,7 +2429,10 @@ def main(worker_dir: str) -> int:
             if coordination.reasoning_first
             else None
         )
-        role = _read_role(wl, protected=transport == "app-server")
+        # Both transports consume the owner-generated project roster.  The
+        # worker-local .role file is a display projection, never paid-model or
+        # effort authority.
+        role = _read_role(wl, protected=True)
     except (CoordinationError, HotJoinError, OSError, ValueError) as exc:
         print(f"worker role/coordination unavailable: {exc}", file=sys.stderr)
         return 126

@@ -181,6 +181,23 @@ def test_tool_all_correct_reports_passed():
         assert out["units_total"] == 1 and out["correct"] == 1
 
 
+def test_deliver_gate_rejects_main_tex_changed_after_correct_verdict():
+    with temp_project(with_ledger=True) as pdir, env(
+        DANUS_PROJECT_DIR=str(pdir), DANUS_WRITE_PAPER_RUN_LOG="0"
+    ):
+        tex_path = pdir / "paper" / "main.tex"
+        tex_path.write_text(_MULTI_TEX, encoding="utf-8")
+        with _fake_drive(verdict="correct"):
+            out = server.paper_verify_math()
+        assert out["deliver_ok"] is True
+        tex_path.write_text(_MULTI_TEX + "\n% post-verification edit\n", encoding="utf-8")
+        ok, blockers = pmv.deliver_ok(Path(out["ledger_path"]))
+        assert ok is False
+        assert blockers == [
+            "whole-paper [whole-paper] (main.tex changed after verification)"
+        ]
+
+
 def test_tool_wrong_whole_doc_blocks_with_hints():
     with temp_project(with_ledger=True) as pdir, \
             env(DANUS_PROJECT_DIR=str(pdir), DANUS_WRITE_PAPER_RUN_LOG="0"):

@@ -65,6 +65,7 @@ from danus.core import (
 )
 from danus.integrations import search as _arxiv_search
 from danus.redaction import redact_external_error
+from danus.verification_prompt import verification_prompt_bytes
 from danus.core.schema import (
     GLOBAL_KINDS,
     clean_consult_provenance,
@@ -224,6 +225,21 @@ def _verify(
         timeout = 3600
     if timeout <= 0:
         timeout = 3600
+
+    prompt_bytes = verification_prompt_bytes(
+        run_id="x" * 64,
+        statement=statement,
+        proof=proof,
+        fact_context=fact_context,
+        glossary_introduces=glossary_introduces,
+    )
+    max_prompt_bytes = _verify_max_prompt_bytes()
+    if prompt_bytes > max_prompt_bytes:
+        raise ValueError(
+            "serialized verification prompt exceeds "
+            f"DANUS_VERIFY_MAX_PROMPT_BYTES ({prompt_bytes} bytes > "
+            f"{max_prompt_bytes}); reduce the candidate or hydrated context"
+        )
 
     # Fail closed before constructing or sending the paid POST.  The exact
     # instance nonce prevents a restart between this GET and the POST from
@@ -483,6 +499,19 @@ def _verify_context_max_chars() -> int:
         raise ValueError(
             "DANUS_VERIFY_CONTEXT_MAX_CHARS must be a non-negative integer"
         )
+    return value
+
+
+def _verify_max_prompt_bytes() -> int:
+    raw = os.environ.get("DANUS_VERIFY_MAX_PROMPT_BYTES", "1000000")
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"DANUS_VERIFY_MAX_PROMPT_BYTES must be a positive integer, got {raw!r}"
+        ) from exc
+    if value <= 0:
+        raise ValueError("DANUS_VERIFY_MAX_PROMPT_BYTES must be a positive integer")
     return value
 
 
@@ -2321,7 +2350,9 @@ def search_arxiv_theorems(query: str, num_results: int = 10) -> Dict[str, Any]:
     a *complete mathematical statement* when possible. Returns ranked results,
     each with ``title``, the full ``theorem`` text, ``arxiv_id``, and the in-paper
     ``theorem_id``. External HTTP, no auth; on outage returns an ``error`` and
-    empty ``results`` (retry / fall back to built-in web search)."""
+    empty ``results``. Do not bypass a configured retrieval gate with another
+    search channel; continue without external material or ask the owner to fix
+    the declared retrieval policy."""
     return _arxiv_search(query, num_results=num_results)
 
 

@@ -114,6 +114,8 @@ _CONTROL_SIGNALS = {
 _LOCK_REGISTRY_GUARD = threading.Lock()
 _PROCESS_LOCKS: dict[str, threading.RLock] = {}
 _PROJECT_FENCE_SUFFIX = ".browser-output.lock"
+_DISPATCH_ANCHOR_SUFFIX = ".advisor-dispatch-once.json"
+_MAX_DISPATCH_ANCHOR_BYTES = 4096
 _MAX_DURABLE_SCAN_NODES = 100_000
 _MAX_DURABLE_SCAN_DEPTH = 64
 _MAX_GLOBAL_MEMORY_LINE_BYTES = 16 * 1024 * 1024
@@ -222,6 +224,131 @@ def _project_fence_path(project_dir: Path | str) -> Path:
 
     _, project_identity = _canonical_project_identity(project_dir)
     return _canonical_control_root() / _project_fence_name(project_identity)
+
+
+def _dispatch_anchor_path(project_dir: Path | str, request_id: str) -> Path:
+    _, project_identity = _canonical_project_identity(project_dir)
+    project_key = _project_fence_name(project_identity).removesuffix(
+        _PROJECT_FENCE_SUFFIX
+    )
+    request_key = hashlib.sha256(request_id.encode("utf-8")).hexdigest()
+    return _canonical_control_root() / (
+        f"{project_key}.{request_key}{_DISPATCH_ANCHOR_SUFFIX}"
+    )
+
+
+def _dispatch_anchor_raw(
+    row: dict[str, Any], *, pre_click_token_sha256: str
+) -> bytes:
+    payload = {
+        "schema_version": 1,
+        "request_id": row["request_id"],
+        "binding_sha256": row["binding_sha256"],
+        "prompt_sha256": row["prompt_sha256"],
+        "authorization_scope_sha256": row["authorization_scope_sha256"],
+        "authorized_ns": row["authorized_ns"],
+        "pre_click_token_sha256": pre_click_token_sha256,
+    }
+    raw = (
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+    if len(raw) > _MAX_DISPATCH_ANCHOR_BYTES:
+        raise BrowserAdvisorError("advisor dispatch anchor exceeds its byte bound")
+    return raw
+
+
+def _read_dispatch_anchor(path: Path) -> Optional[bytes]:
+    root_fd = os.open(
+        _canonical_control_root(),
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0),
+    )
+    descriptor = -1
+    try:
+        try:
+            descriptor = os.open(
+                path.name,
+                os.O_RDONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=root_fd,
+            )
+        except FileNotFoundError:
+            return None
+        metadata = os.fstat(descriptor)
+        visible = os.stat(path.name, dir_fd=root_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_size > _MAX_DISPATCH_ANCHOR_BYTES
+            or (metadata.st_dev, metadata.st_ino)
+            != (visible.st_dev, visible.st_ino)
+        ):
+            raise BrowserAdvisorError("advisor dispatch anchor is unsafe")
+        remaining = int(metadata.st_size)
+        chunks: list[bytes] = []
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 4096))
+            if not chunk:
+                raise BrowserAdvisorError("advisor dispatch anchor changed while read")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise BrowserAdvisorError("advisor dispatch anchor grew while read")
+        return b"".join(chunks)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        os.close(root_fd)
+
+
+def _write_dispatch_anchor_once(path: Path, raw: bytes) -> str:
+    root_fd = os.open(
+        _canonical_control_root(),
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0),
+    )
+    descriptor = -1
+    try:
+        try:
+            descriptor = os.open(
+                path.name,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+                0o600,
+                dir_fd=root_fd,
+            )
+        except FileExistsError as exc:
+            raise BrowserAdvisorStateError(
+                "advisor dispatch anchor already exists; Send cannot be reauthorized"
+            ) from exc
+        offset = 0
+        while offset < len(raw):
+            offset += os.write(descriptor, raw[offset:])
+        os.fchmod(descriptor, 0o600)
+        os.fsync(descriptor)
+        os.fsync(root_fd)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        os.close(root_fd)
+    return hashlib.sha256(raw).hexdigest()
 
 
 @contextmanager
@@ -865,6 +992,8 @@ class BrowserAdvisorBroker:
         self._lock = _process_lock(self.path)
         self._validate_database_path(allow_missing=True)
         self._initialize()
+        with _project_memory_fence(self.project_dir):
+            self._initialize_dispatch_anchors()
 
     def _validate_database_path(
         self, *, allow_missing: bool
@@ -942,6 +1071,7 @@ class BrowserAdvisorBroker:
                     authorization_scope_sha256 TEXT,
                     authorized_ns INTEGER,
                     pre_click_token_sha256 TEXT,
+                    dispatch_anchor_sha256 TEXT,
                     ui_mode TEXT,
                     conversation_url_sha256 TEXT,
                     reply_sha256 TEXT,
@@ -986,6 +1116,7 @@ class BrowserAdvisorBroker:
                 ("terminal_evidence_sha256", "TEXT"),
                 ("terminal_acknowledgement", "INTEGER"),
                 ("terminal_prior_state", "TEXT"),
+                ("dispatch_anchor_sha256", "TEXT"),
                 ("recommendation_id", "TEXT"),
                 ("checkpoint_id", "TEXT"),
                 ("checkpoint_sha256", "TEXT"),
@@ -1057,8 +1188,59 @@ class BrowserAdvisorBroker:
                     )
                     db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
                     db.execute("VACUUM")
-            db.execute("PRAGMA user_version=5")
+            db.execute("PRAGMA user_version=6")
         os.chmod(self.path, 0o600)
+
+    def _initialize_dispatch_anchors(self) -> None:
+        """Anchor every legacy row that had already crossed pre-click CAS."""
+
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            rows = [
+                self._row(row)
+                for row in db.execute(
+                    "SELECT * FROM advisor_requests ORDER BY request_id"
+                ).fetchall()
+            ]
+            for row in rows:
+                path = _dispatch_anchor_path(self.project_dir, row["request_id"])
+                token_sha256 = row.get("pre_click_token_sha256")
+                existing = _read_dispatch_anchor(path)
+                if token_sha256 is None:
+                    if existing is not None:
+                        raise BrowserAdvisorConflict(
+                            "dispatch anchor exists without a committed pre-click token"
+                        )
+                    if row.get("dispatch_anchor_sha256") is not None:
+                        raise BrowserAdvisorConflict(
+                            "dispatch anchor digest exists without a pre-click token"
+                        )
+                    continue
+                token_sha256 = _validate_hash(
+                    token_sha256, label="pre-click token hash"
+                )
+                raw = _dispatch_anchor_raw(
+                    row, pre_click_token_sha256=token_sha256
+                )
+                if existing is None:
+                    anchor_sha256 = _write_dispatch_anchor_once(path, raw)
+                elif existing == raw:
+                    anchor_sha256 = hashlib.sha256(existing).hexdigest()
+                else:
+                    raise BrowserAdvisorConflict(
+                        "legacy dispatch anchor differs from its durable request"
+                    )
+                stored = row.get("dispatch_anchor_sha256")
+                if stored is not None and stored != anchor_sha256:
+                    raise BrowserAdvisorConflict(
+                        "dispatch anchor digest differs from the durable request"
+                    )
+                if stored is None:
+                    db.execute(
+                        "UPDATE advisor_requests SET dispatch_anchor_sha256=? "
+                        "WHERE request_id=? AND dispatch_anchor_sha256 IS NULL",
+                        (anchor_sha256, row["request_id"]),
+                    )
 
     @staticmethod
     def _row(row: sqlite3.Row) -> dict[str, Any]:
@@ -1163,6 +1345,7 @@ class BrowserAdvisorBroker:
             raise BrowserAdvisorError("unknown browser-advisor request")
         result = self._row(row)
         self._assert_v5_request_integrity(result)
+        self._assert_dispatch_anchor(result)
         return result
 
     def _assert_v5_request_integrity(self, row: dict[str, Any]) -> None:
@@ -1220,6 +1403,52 @@ class BrowserAdvisorBroker:
         if row.get("binding_sha256") != expected_binding:
             raise BrowserAdvisorConflict(
                 "checkpoint-bound request binding integrity check failed"
+            )
+
+    def _assert_dispatch_anchor(self, row: dict[str, Any]) -> None:
+        """Fail closed unless external one-click evidence matches the row."""
+
+        path = _dispatch_anchor_path(self.project_dir, str(row["request_id"]))
+        existing = _read_dispatch_anchor(path)
+        token_sha256 = row.get("pre_click_token_sha256")
+        stored_anchor_sha256 = row.get("dispatch_anchor_sha256")
+        state = str(row["state"])
+        no_dispatch_states = {"prepared", "authorized", "abandoned"}
+        failed_before_dispatch = (
+            state == "failed_not_submitted"
+            and row.get("terminal_prior_state") == "authorized"
+        )
+        should_have_dispatch = state not in no_dispatch_states and not failed_before_dispatch
+
+        if token_sha256 is None:
+            if should_have_dispatch:
+                raise BrowserAdvisorConflict(
+                    "advisor state has no externally anchored pre-click token"
+                )
+            if existing is not None or stored_anchor_sha256 is not None:
+                raise BrowserAdvisorConflict(
+                    "advisor dispatch anchor exists without a pre-click token"
+                )
+            return
+
+        token_sha256 = _validate_hash(token_sha256, label="pre-click token hash")
+        if not should_have_dispatch:
+            raise BrowserAdvisorConflict(
+                "advisor pre-click token cannot be projected back to a pre-dispatch state"
+            )
+        if existing is None:
+            raise BrowserAdvisorConflict("advisor dispatch anchor is missing")
+        expected = _dispatch_anchor_raw(
+            row, pre_click_token_sha256=token_sha256
+        )
+        observed_sha256 = hashlib.sha256(existing).hexdigest()
+        if (
+            existing != expected
+            or stored_anchor_sha256 != observed_sha256
+            or _SHA256_RE.fullmatch(str(stored_anchor_sha256)) is None
+        ):
+            raise BrowserAdvisorConflict(
+                "advisor dispatch anchor differs from the durable request"
             )
 
     @contextmanager
@@ -2036,11 +2265,29 @@ class BrowserAdvisorBroker:
                     )
                 now = time.time_ns()
                 pre_click_token = str(uuid.uuid4())
+                pre_click_token_sha256 = _sha256_text(pre_click_token)
+                anchor_path = _dispatch_anchor_path(
+                    self.project_dir, request_id
+                )
+                anchor_raw = _dispatch_anchor_raw(
+                    row, pre_click_token_sha256=pre_click_token_sha256
+                )
+                # Persist the no-clobber external anchor before committing the
+                # mutable SQLite projection. A crash in between can strand the
+                # request safely, but can never authorize a second Send.
+                dispatch_anchor_sha256 = _write_dispatch_anchor_once(
+                    anchor_path, anchor_raw
+                )
                 db.execute(
                     "UPDATE advisor_requests SET state='dispatching',"
-                    "pre_click_token_sha256=?,updated_ns=? "
+                    "pre_click_token_sha256=?,dispatch_anchor_sha256=?,updated_ns=? "
                     "WHERE request_id=? AND state='authorized'",
-                    (_sha256_text(pre_click_token), now, request_id),
+                    (
+                        pre_click_token_sha256,
+                        dispatch_anchor_sha256,
+                        now,
+                        request_id,
+                    ),
                 )
                 self._event(
                     db,

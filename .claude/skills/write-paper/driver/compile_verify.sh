@@ -78,7 +78,7 @@ if [ "$ENGINE" = "tectonic" ]; then
   exit 0
 fi
 
-run() { ( cd "$BUILD" && "$ENGINE" -interaction=nonstopmode -halt-on-error "$STEM.tex" >/dev/null 2>&1 ); }
+run() { ( cd "$BUILD" && "$ENGINE" -no-shell-escape -interaction=nonstopmode -halt-on-error "$STEM.tex" >/dev/null 2>&1 ); }
 # first pass may legitimately report undefined refs; the second resolves them
 run; RC=$?
 run; RC=$?

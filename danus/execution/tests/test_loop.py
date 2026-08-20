@@ -82,6 +82,17 @@ def _mk_worker(tmp: Path, name: str = "high") -> L.WorkerLayout:
     """A minimal worker home under tmp: <tmp>/proj/workers/<name>."""
     wl = L.WorkerLayout(tmp / "proj" / "workers" / name)
     wl.dir.mkdir(parents=True)
+    (wl.project_dir / "project.json").write_text(
+        json.dumps(
+            {
+                "name": wl.project,
+                "model": "gpt-5.6-sol",
+                "roles": "high:1",
+                "workers": [name],
+            }
+        ),
+        encoding="utf-8",
+    )
     return wl
 
 
@@ -2299,7 +2310,8 @@ def test_legacy_project_without_coordination_runs_real_exec_loop_without_store(
     argv = json.loads(marker.read_text(encoding="utf-8"))
     assert argv[0] == "exec"
     assert "--json" in argv
-    assert "--dangerously-bypass-approvals-and-sandbox" in argv
+    assert "--dangerously-bypass-approvals-and-sandbox" not in argv
+    assert argv[argv.index("--sandbox") + 1] == "workspace-write"
     assert not (wl.project_dir / ".coordination").exists()
     status = json.loads(wl.status.read_text(encoding="utf-8"))
     assert status["coordination_mode"] == "legacy"
@@ -2459,6 +2471,16 @@ def test_app_server_argv_is_one_exact_strict_config_override() -> None:
     ]
     with pytest.raises(ValueError, match="absolute"):
         loop.app_server_argv("codex", root_override, override)
+
+
+def test_app_server_argv_disables_builtin_web_in_gated_mode() -> None:
+    root_override = 'project_root_markers=[".danus-codex-worker-root"]'
+    override = 'mcp_servers={danus={command="/venv/python"}}'
+    with _env(DANUS_RETRIEVAL_MODE="strict"):
+        argv = loop.app_server_argv(
+            "/opt/danus/codex", root_override, override
+        )
+    assert argv[-2:] == ["--config", "tools.web_search=false"]
 
 
 # --- runner ---------------------------------------------------------------- #

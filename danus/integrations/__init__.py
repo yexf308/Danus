@@ -1,12 +1,12 @@
 """danus.integrations — external services the engine grounds proofs against.
 
-Currently: arXiv theorem search via ``matlas``. Kept as a thin, swappable
-adapter — ``search`` is the stable surface a future worker can back with another
-provider without touching the gateway.
+The stable ``search`` surface is contamination-gated. Production defaults to
+the legacy open arXiv index; evaluation runs can select strict Matlas, a dated
+arXiv cutoff, or no retrieval without changing the gateway.
 """
 
 from __future__ import annotations
 
-from .matlas import RESULT_FIELDS, search
+from .gated_search import RESULT_FIELDS, search
 
 __all__ = ["search", "RESULT_FIELDS"]

@@ -1440,6 +1440,26 @@ def test_verify_preserves_bounded_fastapi_string_detail(
     assert response_body.closed is True
 
 
+def test_verify_prompt_byte_budget_fails_before_health_or_paid_post(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def must_not_open(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        raise AssertionError("prompt preflight must precede network access")
+
+    monkeypatch.setattr(server.urllib.request, "urlopen", must_not_open)
+    with _env(
+        DANUS_VERIFY_URL="http://127.0.0.1:8092/verify",
+        DANUS_VERIFY_MAX_PROMPT_BYTES="100",
+    ):
+        with pytest.raises(ValueError, match="serialized verification prompt"):
+            server._verify("statement", "proof")
+    assert calls == 0
+
+
 def test_verify_omits_non_string_or_oversized_http_error_body(
     monkeypatch: pytest.MonkeyPatch,
 ):

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import tomllib
 from pathlib import Path
 
 from danus import codex
@@ -172,6 +173,14 @@ def test_exec_cmd_shape_quoted_effort_and_verbatim_tail():
 def test_exec_cmd_empty_tail():
     cmd = codex.exec_cmd("codex", "m", "e")
     assert cmd == ["codex", "exec", "--model", "m", "--config", 'model_reasoning_effort="e"']
+
+
+def test_exec_cmd_escapes_effort_as_one_toml_string():
+    malicious = 'xhigh"\nsandbox_mode="danger-full-access'
+    cmd = codex.exec_cmd("codex", "m", malicious)
+    config = cmd[cmd.index("--config") + 1]
+    assert tomllib.loads(config) == {"model_reasoning_effort": malicious}
+    assert "\n" not in config
 
 
 def main() -> None:

@@ -23,6 +23,7 @@ effort override cannot silently weaken or change the verifier.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 from pathlib import Path
@@ -120,6 +121,9 @@ def exec_cmd(codex_bin: str, model: str, effort: str, *tail: str) -> List[str]:
     return [
         codex_bin, "exec",
         "--model", model,
-        "--config", f'model_reasoning_effort="{effort}"',
+        # JSON string syntax is valid TOML string syntax and escapes quotes,
+        # backslashes, and control characters.  Never interpolate a role-file
+        # value directly into a second config assignment.
+        "--config", "model_reasoning_effort=" + json.dumps(str(effort)),
         *tail,
     ]

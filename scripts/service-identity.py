@@ -1369,12 +1369,16 @@ def _guardian(
         os.set_inheritable(host_live_read, True)
         os.set_inheritable(host_status_write, True)
         child_env = os.environ.copy()
+        child_env.pop("PYTHONPATH", None)
+        child_env.pop("PYTHONHOME", None)
         child_env["DANUS_VERIFY_INSTANCE_NONCE"] = instance_nonce
         child_env["DANUS_SERVICE_INSTANCE_NONCE"] = instance_nonce
         child_env["DANUS_SERVICE_AUTHORITY_PATH"] = str(lock_path)
         host = subprocess.Popen(
             [
                 sys.executable,
+                "-I",
+                "-B",
                 str(Path(__file__).resolve()),
                 "service-host",
                 str(host_live_read),
@@ -1759,12 +1763,21 @@ def project_dir(root: Path, name: str) -> Path:
 def verifier_contract(root: Path) -> dict[str, Any]:
     if not root.is_absolute():
         raise GuardianError("repository root must be absolute")
-    sys.path.insert(0, str(root))
     try:
+        import danus
         from danus.core import VERIFICATION_OUTPUT_PROTOCOL_VERSION
         from danus.verify.launcher import VERIFIER_BUNDLE_DIGEST
     except Exception as exc:
         raise GuardianError(f"cannot load verifier contract: {exc}") from exc
+    try:
+        loaded_root = Path(danus.__file__).resolve(strict=True).parents[1]
+        expected_root = root.resolve(strict=True)
+    except (OSError, RuntimeError, IndexError) as exc:
+        raise GuardianError("cannot bind verifier contract to this release") from exc
+    if loaded_root != expected_root:
+        raise GuardianError(
+            "installed danus package does not match the requested release root"
+        )
     return {
         "protocol": VERIFICATION_OUTPUT_PROTOCOL_VERSION,
         "digest": VERIFIER_BUNDLE_DIGEST,

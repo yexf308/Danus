@@ -28,6 +28,7 @@ Config resolution (env read at CALL time):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -112,9 +113,9 @@ def _drive(prompt: str, effort: Optional[str] = None) -> Dict[str, Any]:
 
 def _drive_networked(prompt: str) -> Dict[str, Any]:
     """Like ``_drive`` but over the NETWORKED codex path (``driver.run_codex(
-    networked=True)``): ``--dangerously-bypass-approvals-and-sandbox`` + the danus
-    gateway injected at ``DANUS_ROLE=verifier`` (read-only ``search_arxiv_theorems``,
-    minimum privilege) + codex's built-in ``web_search``. Used ONLY by
+    networked=True)``): the danus gateway is injected at ``DANUS_ROLE=verifier``
+    (read-only gated ``search_arxiv_theorems``, minimum privilege). Open mode also
+    enables built-in web; gated modes retain a read-only, no-web boundary. Used ONLY by
     ``reference_verify`` — the sole tool that needs live arXiv/web access. Same honesty
     classifier (a nonzero exit / empty stdout / timeout / gateway-preflight
     failure is never ``ok``); also attaches ``stderr_full`` + ``cmd`` for the run
@@ -1130,10 +1131,9 @@ def reference_verify(project: Optional[str] = None,
     Assembles the verifier prompt (``roles/AGENTS.md`` +
     ``roles/REFERENCE_VERIFIER_PROMPT.md`` + ``main.tex`` + ``REFERENCE_LEDGER.md``
     + the auditor's ``findings`` — and **no fact graph / style / structure**), then
-    drives a codex over the **networked** path (``--dangerously-bypass-approvals-
-    and-sandbox`` + the danus gateway at ``DANUS_ROLE=verifier`` exposing only
-    ``search_arxiv_theorems`` + codex's built-in ``web_search``; empty cwd, so codex
-    still cannot touch the project tree). It parses the per-entry verdict objects,
+    drives a codex over the **networked** path (the danus gateway at
+    ``DANUS_ROLE=verifier`` exposes gated ``search_arxiv_theorems``; built-in web
+    is available only in open mode; the cwd is empty). It parses the per-entry verdict objects,
     and on an honest ``ok`` run updates ``REFERENCE_LEDGER.md`` **in place** — each
     verified/corrected row's ``verified-by`` becomes ``verifier`` (+ ``source_url``
     + authoritative metadata), other verdicts set ``verified-by: unverified
@@ -1705,7 +1705,9 @@ def paper_verify_math(project: Optional[str] = None,
             envelope=out, paper_id=paper_id)
         return out
 
-    tex = tex_path.read_text(encoding="utf-8")
+    tex_raw = tex_path.read_bytes()
+    tex = tex_raw.decode("utf-8", errors="strict")
+    document_sha256 = hashlib.sha256(tex_raw).hexdigest()
     prev = pmv.read_ledger(ledger_path)
     cap = pmv.whole_doc_budget()
 
@@ -1722,6 +1724,7 @@ def paper_verify_math(project: Optional[str] = None,
     if len(prompt) > cap:
         row = pmv.LedgerRow(
             unit_id="whole-paper", label="whole-paper", source_fact="",
+            document_sha256=document_sha256,
             status="oversized", last_verdict="not-sent",
             repair_hints=(f"verifier prompt is {len(prompt)} chars (~{len(prompt)//4} "
                           f"tokens), over the single whole-doc budget {cap} — decompose "
@@ -1768,6 +1771,7 @@ def paper_verify_math(project: Optional[str] = None,
         last = str(verdict)
     row = pmv.LedgerRow(
         unit_id="whole-paper", label="whole-paper", source_fact="",
+        document_sha256=document_sha256,
         status=status_row, last_verdict=last, repair_hints=str(hints),
         ignorable=ign_text,
         attempts=pmv.merge_attempts(prev, "whole-paper"), last_checked_utc=pmv.utc())

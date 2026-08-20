@@ -41,6 +41,7 @@ Config (env, read at CALL time — never import time; resolved via the shared
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -51,6 +52,49 @@ from danus.gateway_runtime import require_gateway_runtime
 DEFAULT_MODEL = codex.DEFAULT_MODEL
 DEFAULT_EFFORT = codex.DEFAULT_EFFORT
 DEFAULT_TIMEOUT = 7200
+
+_NETWORKED_ENV_ALLOWLIST = frozenset(
+    {
+        "PATH",
+        "HOME",
+        "TMPDIR",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "CODEX_HOME",
+        "DANUS_CODEX_API_KEY",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "no_proxy",
+        "DANUS_RETRIEVAL_MODE",
+        "DANUS_EVAL_CUTOFF",
+        "DANUS_EVAL_SOURCE_ID",
+        "DANUS_EVAL_RUN_ID",
+        "DANUS_RETRIEVAL_AUDIT",
+        "DANUS_RETRIEVAL_OVERFETCH",
+        "DANUS_RETRIEVAL_MAX_BYTES",
+        "DANUS_ARXIV_INDEX_URL",
+        "DANUS_MATLAS_URL",
+    }
+)
+
+
+def _networked_subprocess_env(codex_bin: str) -> dict[str, str]:
+    inherited = codex.subprocess_env(codex_bin)
+    environment = {
+        key: value
+        for key, value in inherited.items()
+        if key in _NETWORKED_ENV_ALLOWLIST
+    }
+    # The repository wrapper must not reload every config/*.env secret after
+    # this allowlist has deliberately removed unrelated credentials.
+    environment["DANUS_CODEX_SANITIZED_ENV"] = "1"
+    return environment
 
 
 def _gateway_config_arg(gateway_role: str) -> str:
@@ -107,24 +151,33 @@ def run_codex(
       empty cwd and a fully-embedded prompt, so it reads nothing and reaches
       nothing. This is what the writer / auditor / reviser use.
 
-    - **Networked (``networked=True``)** — the reference-verifier path: replace
-      the read-only sandbox with ``--dangerously-bypass-approvals-and-sandbox``
-      (net-capable), inject the
+    - **Networked (``networked=True``)** — the reference-verifier path: inject the
       danus gateway via ``-c`` at ``DANUS_ROLE=<gateway_role>`` (default
       ``verifier`` — exposes ONLY ``search_arxiv_theorems``, minimum privilege; no
-      new gateway role is created), and enable codex's built-in ``web_search``
-      tool. The empty cwd is kept, so the only writes/reads are through the
-      gateway's read-only tool + web search — codex still cannot touch the project
-      tree; the caller (``server.reference_verify``) is the sole writer of the ledger.
+      new gateway role is created). Production `open` mode enables built-in web
+      under the network-capable compatibility path. `strict`, `dated`, and `off`
+      modes instead disable built-in web and retain the read-only sandbox, making
+      the gateway the only retrieval route. The empty cwd is kept; the caller
+      (``server.reference_verify``) is the sole writer of the ledger.
     """
     if networked:
         require_gateway_runtime()
     codex_bin = codex.resolve_bin()
     if networked:
+        gated_retrieval = (
+            os.environ.get("DANUS_RETRIEVAL_MODE", "open").strip().lower()
+            != "open"
+        )
         tail = (
-            "-c", _gateway_config_arg(gateway_role),
-            "--config", "tools.web_search=true",
-            "--dangerously-bypass-approvals-and-sandbox",
+            "-c",
+            _gateway_config_arg(gateway_role),
+            "--config",
+            "tools.web_search=" + ("false" if gated_retrieval else "true"),
+            *(
+                ("--sandbox", "read-only")
+                if gated_retrieval
+                else ("--dangerously-bypass-approvals-and-sandbox",)
+            ),
             "--skip-git-repo-check",
             "-",  # read the prompt from stdin
         )
@@ -140,7 +193,11 @@ def run_codex(
             cmd,
             input=prompt,
             cwd=empty_cwd,
-            env=codex.subprocess_env(codex_bin),
+            env=(
+                _networked_subprocess_env(codex_bin)
+                if networked
+                else codex.subprocess_env(codex_bin)
+            ),
             capture_output=True,
             text=True,
             timeout=timeout if timeout and timeout > 0 else None,

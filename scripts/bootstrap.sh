@@ -51,7 +51,7 @@ export PATH="$NODE_DIR/bin:$PATH"
 VENV="$RT/venv"
 export PIP_DISABLE_PIP_VERSION_CHECK=1
 DEPS='from danus._mcp import FastMCP; import fastapi,uvicorn,pydantic,openai,anthropic'
-if "$VENV/bin/python" -c "$DEPS" 2>/dev/null; then
+if "$VENV/bin/python" -I -B -c "$DEPS" 2>/dev/null; then
   log "venv present + healthy"
 else
   [ -e "$VENV" ] && { log "venv missing/broken (dangling base interpreter?) — rebuilding"; rm -rf "$VENV"; }
@@ -64,7 +64,7 @@ else
     "mcp>=1.0.0" "fastapi>=0.110.0" "uvicorn>=0.30.0" "pydantic>=2.0" "openai>=2.40" \
     "anthropic>=0.92" \
     || { log "FATAL: pip install failed"; exit 1; }
-  "$VENV/bin/python" -c "$DEPS" || { log "FATAL: venv still missing deps after install"; exit 1; }
+  "$VENV/bin/python" -I -B -c "$DEPS" || { log "FATAL: venv still missing deps after install"; exit 1; }
 fi
 
 # --- 2b) the danus package itself (editable install) ------------------------
@@ -73,13 +73,13 @@ fi
 # package must live on the venv's sys.path — cwd-on-sys.path only helps at the
 # repo root. Editable, so a `git pull` needs no re-install. Validate from a
 # neutral cwd: at the repo root a missing install is masked (cwd is sys.path[0]).
-if (cd / && "$VENV/bin/python" -c 'import danus' 2>/dev/null); then
+if (cd / && "$VENV/bin/python" -I -B -c 'import danus' 2>/dev/null); then
   log "danus package present in venv"
 else
   log "installing the danus package (editable) into the venv"
   $NICE "$VENV/bin/pip" install --quiet --no-cache-dir -e "$DANUS_ROOT" \
     || { log "FATAL: pip install -e failed (the danus package)"; exit 1; }
-  (cd / && "$VENV/bin/python" -c 'import danus') \
+  (cd / && "$VENV/bin/python" -I -B -c 'import danus') \
     || { log "FATAL: danus still not importable after editable install"; exit 1; }
 fi
 

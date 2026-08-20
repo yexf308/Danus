@@ -6,7 +6,7 @@ tools a role can even see*, not by prompt convention.
 
 ```
 danus/gateway/
-  server.py            the 7 MCP tools + the fact_submit write-gate; build_app(role)
+  server.py            the 8 MCP tools + the fact_submit write-gate; build_app(role)
   roles.py             ROLE_TOOLS — the role→tools table (the security surface)
   __main__.py          `python -m danus.gateway` → build_app().run() (role from DANUS_ROLE)
   tests/test_gateway.py
@@ -16,8 +16,8 @@ danus/gateway/
 
 | role | tools |
 |---|---|
-| worker | `gm_add gm_search fact_submit fact_search fact_context search_arxiv_theorems` |
-| main | `gm_add gm_search fact_search fact_context fact_revoke search_arxiv_theorems` (**no `fact_submit`**) |
+| worker | `gm_add gm_get gm_search fact_submit fact_search fact_context search_arxiv_theorems` |
+| main | `gm_add gm_get gm_search fact_search fact_context fact_revoke search_arxiv_theorems` (**no `fact_submit`**) |
 | verifier | `search_arxiv_theorems` only (read-only) |
 
 Ungated tools are **physically absent** from the surface. Unknown, mis-typed, or
@@ -92,7 +92,7 @@ the judge can call `search_arxiv_theorems`. Config (`DANUS_PROJECT_DIR`,
 
 ## Pinned interfaces (ARCHITECTURE §4 — change both ends together)
 
-The 7-tool set + role table; `python -m danus.gateway` launch; the verify HTTP seam.
+The 8-tool set + role table; `python -m danus.gateway` launch; the verify HTTP seam.
 
 ## Tests
 

@@ -98,7 +98,9 @@ is an independent `xhigh` default and intentionally does not inherit
 | `DANUS_VERIFY_MAX_EXPANSION_ROUNDS` | `2` | maximum adaptive proof-hydration rounds after statement-only round zero |
 | `DANUS_VERIFY_MAX_EXPANDED_PROOFS` | `8` | maximum cumulative strict-ancestor whole proof records |
 | `DANUS_VERIFY_MAX_EXPANDED_PROOF_CHARS` | `200000` | maximum canonical JSON characters across expanded proof records; never sliced |
-| `DANUS_VERIFY_MAX_PROMPT_BYTES` | `200000` | maximum final UTF-8 verifier prompt (candidate + escaped context + envelope); overflow returns 413 before Codex starts |
+| `DANUS_VERIFY_MAX_PROMPT_BYTES` | `1000000` | maximum exact final UTF-8 verifier prompt (candidate + escaped context + envelope); gateway preflights the shared serializer before HTTP and launcher rechecks before Codex |
+| `DANUS_VERIFY_TIMEOUT` | `3600` | gateway HTTP timeout for one verifier request |
+| `CODEX_TIMEOUT_SECONDS` | `0` in the library, `900` via `start-verify.sh` | verifier Codex child timeout; `0` means no library-level timeout |
 | `DANUS_VERIFY_MAX_REQUEST_BYTES` | `1000000` | maximum `/verify` request-body bytes, enforced before JSON model parsing |
 | `DANUS_VERIFY_BODY_TIMEOUT_SECONDS` | `10` | total request-body upload deadline before HTTP 408 |
 | `DANUS_VERIFY_MAX_BODY_UPLOADS` | `32` | bounded request-body upload/parser slots, independent of paid verification |
@@ -109,7 +111,25 @@ is an independent `xhigh` default and intentionally does not inherit
 | `DANUS_VERIFY_CACHE_MAX_ENTRIES` | `64` | per-process validated-success LRU entries |
 | `DANUS_VERIFY_CACHE_MAX_BYTES` | `16777216` | total canonical result bytes in the verifier cache |
 | `DANUS_VERIFY_CACHE_TTL_SECONDS` | `3600` | monotonic TTL for validated-success cache entries |
+| `DANUS_FACTGRAPH_LOCK_TIMEOUT_SECONDS` | `10` | bounded wait for the external project truth-graph lock; timeout fails closed |
 | `VERIFY_HOST` | `127.0.0.1` | verify bind host (keep loopback — see security doc) |
+
+## Literature retrieval
+
+| variable | default | meaning |
+|---|---|---|
+| `DANUS_RETRIEVAL_MODE` | `open` in production, `off` when an eval cutoff is present | `open`, `strict`, `dated`, or `off` |
+| `DANUS_ARXIV_INDEX_URL` | `https://leansearch.net/thm/search` | legacy arXiv theorem index used by `open` and `dated` |
+| `DANUS_MATLAS_URL` | `https://matlas.ai/api/search` | official journal/book Matlas endpoint used by `strict` |
+| `DANUS_EVAL_CUTOFF` | unset | `YYMM`, `YYYY-MM`, or `YYYYMM`; marks a gated evaluation run |
+| `DANUS_EVAL_SOURCE_ID` | unset | comma/space-separated source arXiv ids that must be dropped |
+| `DANUS_RETRIEVAL_AUDIT` | unset | owner-side append-only JSONL audit path |
+| `DANUS_RETRIEVAL_MAX_BYTES` | `8388608` | external response-body cap before JSON parsing |
+
+The generic `MATLAS_URL` variable is intentionally ignored. It previously
+named the arXiv index in Danus but names the official Matlas endpoint in
+Rethlas, so sharing it across the two deployments silently selected the wrong
+corpus.
 
 ## Runtime data locations (gitignored, under `runtime/`)
 

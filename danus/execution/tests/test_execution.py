@@ -541,8 +541,13 @@ def test_deadline_passed(tmp: Path):
     assert loop._deadline_passed(pdir) is False  # no deadline file
     (pdir / L.DEADLINE_FILE).write_text("1")  # epoch 1 = long past
     assert loop._deadline_passed(pdir) is True
-    (pdir / L.DEADLINE_FILE).write_text("garbage")  # bad = not passed
-    assert loop._deadline_passed(pdir) is False
+    (pdir / L.DEADLINE_FILE).write_text("garbage")  # malformed = fail-closed stop
+    assert loop._deadline_passed(pdir) is True
+    (pdir / L.DEADLINE_FILE).unlink()
+    outside = tmp / "outside-deadline"
+    outside.write_text(str(10**20), encoding="utf-8")
+    (pdir / L.DEADLINE_FILE).symlink_to(outside)
+    assert loop._deadline_passed(pdir) is True
 
 
 def test_write_status_atomic_and_stamps(tmp: Path):

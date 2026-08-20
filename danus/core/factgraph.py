@@ -18,7 +18,10 @@ import json
 import os
 import re
 import shutil
+import stat
 import tempfile
+import threading
+import time
 import uuid
 from collections import deque
 from contextlib import contextmanager
@@ -49,6 +52,182 @@ _LINE_BREAK_RE = re.compile(r"[\n\r\v\f\x1c-\x1e\x85\u2028\u2029]")
 FACT_CONTEXT_SCHEMA_VERSION = 1
 VERIFICATION_CONTEXT_SCHEMA_VERSION = 3
 VERIFICATION_CONTEXT_PROJECTION = "full-statement-closure-adaptive-proofs-v1"
+
+_FACTGRAPH_LOCK_DIRNAME = ".danus-factgraph-locks"
+_FACTGRAPH_LOCAL_LOCKS_GUARD = threading.Lock()
+_FACTGRAPH_LOCAL_LOCKS: Dict[str, threading.RLock] = {}
+
+
+def _factgraph_lock_timeout_seconds() -> float:
+    raw = os.environ.get("DANUS_FACTGRAPH_LOCK_TIMEOUT_SECONDS", "10")
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(
+            "DANUS_FACTGRAPH_LOCK_TIMEOUT_SECONDS must be numeric"
+        ) from exc
+    if not 0 < value <= 300:
+        raise ValueError(
+            "DANUS_FACTGRAPH_LOCK_TIMEOUT_SECONDS must be in (0, 300]"
+        )
+    return value
+
+
+def _factgraph_local_lock(path: Path) -> threading.RLock:
+    key = os.fspath(path)
+    with _FACTGRAPH_LOCAL_LOCKS_GUARD:
+        return _FACTGRAPH_LOCAL_LOCKS.setdefault(key, threading.RLock())
+
+
+def _safe_directory_identity(path: Path, *, label: str) -> tuple[os.stat_result, tuple[int, int]]:
+    before = path.lstat()
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
+        raise ValueError(f"{label} must be a real directory")
+    descriptor = os.open(
+        path,
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0),
+    )
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+        ):
+            raise ValueError(f"{label} changed during secure open")
+        return opened, (int(opened.st_dev), int(opened.st_ino))
+    finally:
+        os.close(descriptor)
+
+
+@contextmanager
+def _stable_factgraph_lock(project_root: Path, operation: int) -> Iterator[None]:
+    """Take one guarded, external, bounded lock for a project truth graph."""
+
+    project = Path(os.path.abspath(os.fspath(project_root)))
+    project_info, project_identity = _safe_directory_identity(
+        project, label="fact graph project root"
+    )
+    control_root = project.parent / _FACTGRAPH_LOCK_DIRNAME
+    try:
+        os.mkdir(control_root, mode=0o700)
+    except FileExistsError:
+        pass
+    control_info = control_root.lstat()
+    if (
+        stat.S_ISLNK(control_info.st_mode)
+        or not stat.S_ISDIR(control_info.st_mode)
+        or control_info.st_uid != os.geteuid()
+        or stat.S_IMODE(control_info.st_mode) != 0o700
+    ):
+        raise ValueError(
+            "fact graph lock root must be a private owner-controlled directory"
+        )
+    try:
+        control_root.resolve(strict=True).relative_to(project.resolve(strict=True))
+    except ValueError:
+        pass
+    else:
+        raise ValueError("fact graph lock root must be outside the project tree")
+
+    root_fd = os.open(
+        control_root,
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0),
+    )
+    descriptor = -1
+    locked = False
+    seed = json.dumps(
+        [os.fspath(project.resolve(strict=True)), *project_identity],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    lock_name = hashlib.sha256(seed).hexdigest() + ".lock"
+    lock_path = control_root / lock_name
+    local_lock = _factgraph_local_lock(lock_path)
+    try:
+        root_opened = os.fstat(root_fd)
+        if (
+            not stat.S_ISDIR(root_opened.st_mode)
+            or root_opened.st_uid != os.geteuid()
+            or stat.S_IMODE(root_opened.st_mode) != 0o700
+            or (root_opened.st_dev, root_opened.st_ino)
+            != (control_info.st_dev, control_info.st_ino)
+        ):
+            raise ValueError("fact graph lock root changed during secure open")
+        flags = os.O_RDWR | os.O_CREAT
+        flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        with local_lock:
+            try:
+                descriptor = os.open(lock_name, flags, 0o600, dir_fd=root_fd)
+            except OSError as exc:
+                raise ValueError("fact graph lock cannot be opened safely") from exc
+            opened = os.fstat(descriptor)
+            visible = os.stat(lock_name, dir_fd=root_fd, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_nlink != 1
+                or opened.st_uid != os.geteuid()
+                or stat.S_IMODE(opened.st_mode) != 0o600
+                or not stat.S_ISREG(visible.st_mode)
+                or (opened.st_dev, opened.st_ino)
+                != (visible.st_dev, visible.st_ino)
+            ):
+                raise ValueError(
+                    "fact graph lock must be a private unaliased regular file"
+                )
+            deadline = time.monotonic() + _factgraph_lock_timeout_seconds()
+            while True:
+                try:
+                    fcntl.flock(descriptor, operation | fcntl.LOCK_NB)
+                    locked = True
+                    break
+                except BlockingIOError as exc:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError(
+                            f"timed out waiting for fact graph lock {lock_path}"
+                        ) from exc
+                    time.sleep(min(0.05, remaining))
+            visible = os.stat(lock_name, dir_fd=root_fd, follow_symlinks=False)
+            project_after = project.lstat()
+            root_after = control_root.lstat()
+            if (
+                opened.st_nlink != 1
+                or (opened.st_dev, opened.st_ino)
+                != (visible.st_dev, visible.st_ino)
+                or (project_after.st_dev, project_after.st_ino) != project_identity
+                or (root_after.st_dev, root_after.st_ino)
+                != (root_opened.st_dev, root_opened.st_ino)
+            ):
+                raise ValueError("fact graph lock changed during acquisition")
+            try:
+                yield
+            finally:
+                current = os.fstat(descriptor)
+                visible = os.stat(lock_name, dir_fd=root_fd, follow_symlinks=False)
+                project_after = project.lstat()
+                root_after = control_root.lstat()
+                if (
+                    current.st_nlink != 1
+                    or (current.st_dev, current.st_ino)
+                    != (visible.st_dev, visible.st_ino)
+                    or (project_after.st_dev, project_after.st_ino)
+                    != project_identity
+                    or (root_after.st_dev, root_after.st_ino)
+                    != (root_opened.st_dev, root_opened.st_ino)
+                ):
+                    raise ValueError("fact graph lock changed while held")
+    finally:
+        if descriptor >= 0:
+            if locked:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+        os.close(root_fd)
 
 
 class FactPromotionOutcomeUnknown(RuntimeError):
@@ -672,13 +851,8 @@ class FactGraph:
     def _graph_lock(self, operation: int) -> Iterator[None]:
         """Take the stable cross-process lock shared by readers and writers."""
         self._mkdir_durable(self.dir)
-        lock_path = self.dir / ".mutation.lock"
-        with lock_path.open("a+", encoding="utf-8") as lock_handle:
-            fcntl.flock(lock_handle.fileno(), operation)
-            try:
-                yield
-            finally:
-                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+        with _stable_factgraph_lock(self.dir.parent, operation):
+            yield
 
     @contextmanager
     def _mutation_lock(self) -> Iterator[None]:

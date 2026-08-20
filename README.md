@@ -112,6 +112,11 @@ remain explicit opt-ins and default to `off`.
   and response-size caps. Built for benchmark runs whose problems are sourced
   from recent arXiv papers, where the source paper's abstract contains the
   answer.
+- **Review-driven trust-boundary hardening.** Trusted service children now run
+  under isolated Python; FactGraph mutations use a guarded project-external,
+  bounded lock; browser Send has a project-external no-clobber anchor; gateway
+  and verifier share one exact prompt-byte preflight; and whole-paper verdicts
+  are bound to the delivered `main.tex` digest.
 - **A reproducible evaluation protocol.** A hard subset of MathArena
   arxivmath/brokenarxiv (2026-04 through 2026-06; 61 problems at the
   no-model-solves tier), with frozen append-only manifests, an audited

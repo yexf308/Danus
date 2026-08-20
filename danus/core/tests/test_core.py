@@ -11,6 +11,9 @@ Runs standalone (``python -m danus.core.tests.test_core``) and under pytest.
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -2987,6 +2990,58 @@ def test_factgraph_mutation_lock_serializes_add_and_revoke():
         assert not add_thread.is_alive() and not revoke_thread.is_alive()
         assert set(result["revoked"]) == {predecessor, result["child"]}
         assert FactGraph(root).list() == []
+
+
+def test_factgraph_lock_is_external_symlink_safe_and_bounded():
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d) / "guarded-graph"
+        fg = FactGraph(root)
+        assert fg.list() == []
+        control = root.parent / ".danus-factgraph-locks"
+        locks = list(control.glob("*.lock"))
+        assert len(locks) == 1
+        lock_path = locks[0]
+        assert not (root / "fact_graph" / ".mutation.lock").exists()
+
+        holder = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import fcntl,sys,time; "
+                    "f=open(sys.argv[1],'r+'); "
+                    "fcntl.flock(f.fileno(),fcntl.LOCK_EX); "
+                    "print('ready',flush=True); time.sleep(5)"
+                ),
+                str(lock_path),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            assert holder.stdout is not None and holder.stdout.readline().strip() == "ready"
+            prior = os.environ.get("DANUS_FACTGRAPH_LOCK_TIMEOUT_SECONDS")
+            os.environ["DANUS_FACTGRAPH_LOCK_TIMEOUT_SECONDS"] = "0.02"
+            try:
+                with pytest.raises(TimeoutError, match="fact graph lock"):
+                    fg.list()
+            finally:
+                if prior is None:
+                    os.environ.pop("DANUS_FACTGRAPH_LOCK_TIMEOUT_SECONDS", None)
+                else:
+                    os.environ["DANUS_FACTGRAPH_LOCK_TIMEOUT_SECONDS"] = prior
+        finally:
+            holder.terminate()
+            holder.wait(timeout=5)
+
+        lock_path.unlink()
+        target = root.parent / "attacker-lock-target"
+        target.write_text("do not open\n", encoding="utf-8")
+        lock_path.symlink_to(target)
+        with pytest.raises(ValueError, match="opened safely"):
+            fg.list()
+        assert target.read_text(encoding="utf-8") == "do not open\n"
 
 
 def test_external_refs():

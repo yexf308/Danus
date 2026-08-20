@@ -1,13 +1,14 @@
-# danus/integrations — arXiv theorem search
+# danus/integrations — gated literature retrieval
 
-A thin, swappable adapter over external literature search. Currently one integration:
-`matlas.py`, a stdlib-only client for **Matlas** arXiv theorem search, which returns
-verbatim, as-published arXiv theorem/lemma/definition statements (statement fidelity
-is load-bearing for math reasoning and citation checking).
+A thin, swappable adapter over external literature search. The exported surface is
+`gated_search.py`: production defaults to the legacy Danus/LeanSearch arXiv index,
+while evaluation runs can select official Matlas, a dated arXiv cutoff, or no
+retrieval. `matlas.py` remains the direct legacy client for compatibility tests.
 
 ```
 danus/integrations/
-  matlas.py       search(query, num_results=10, timeout=30) -> {query, count, results, endpoint[, error]}
+  gated_search.py search(query, num_results=10, timeout=30) -> gated envelope
+  matlas.py       direct legacy arXiv-index compatibility client
   __init__.py     re-exports search + RESULT_FIELDS
   tests/test_integrations.py
 ```
@@ -16,21 +17,24 @@ danus/integrations/
 
 - `search(...)` **never raises** — on any failure it returns the same envelope with
   `results: []` and an `error` key (empty query, `http …`, `network: …`, bad JSON, …).
-- Each result is normalized to exactly `("title", "theorem", "arxiv_id",
-  "theorem_id")`, all coerced to `str`.
+- Each result contains the legacy `("title", "theorem", "arxiv_id",
+  "theorem_id")` fields. Official Matlas results also carry bounded provenance.
 - Sends a real `User-Agent` (Cloudflare 403s otherwise); endpoint overridable via
-  `MATLAS_URL`.
+  `DANUS_ARXIV_INDEX_URL` or `DANUS_MATLAS_URL`.
+- External bodies, result counts, and individual fields are bounded before text
+  reaches a model. Evaluation configuration failures return no results.
 
 ## Exposed as
 
-The gateway wraps it as the MCP tool `search_arxiv_theorems(query, num_results)` — the
-one tool **all three** roles (worker/main/verifier) can call for literature grounding.
+The gateway wraps it as the compatibility MCP tool
+`search_arxiv_theorems(query, num_results)`. Its envelope records the actual mode,
+endpoint, and result digest; all three roles receive the same gate.
 
 ## Known limitation (cross-module)
 
-It returns theorem **statements**, not bibliographic metadata (authors/venue/year).
-The write-paper reference verifier therefore uses the returned `arxiv_id` + a web
-lookup for metadata. Keep this in mind if adding a citation-grounding consumer.
+Legacy arXiv results do not include complete bibliographic metadata. Official
+Matlas results do, so consumers must branch on `source_type` instead of assuming
+every lead has an `arxiv_id`.
 
 ## Tests
 

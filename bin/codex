@@ -5,7 +5,17 @@
 # This wrapper keeps every Danus role on one codex version.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-. "$HERE/../scripts/env.sh" >/dev/null 2>&1
+if [ "${DANUS_CODEX_SANITIZED_ENV:-0}" = "1" ]; then
+  # A caller already supplied an explicit minimal environment. Load only the
+  # machine-derived executable paths; never re-import config/*.env secrets.
+  if [ -f "$HERE/../runtime/runtime.env" ]; then
+    set -a
+    . "$HERE/../runtime/runtime.env"
+    set +a
+  fi
+else
+  . "$HERE/../scripts/env.sh" >/dev/null 2>&1
+fi
 if [ -z "${DANUS_NODE:-}" ] || [ -z "${DANUS_CODEX_JS:-}" ]; then
   echo "codex not provisioned — run scripts/bootstrap.sh (sets DANUS_NODE/DANUS_CODEX_JS)" >&2
   exit 127

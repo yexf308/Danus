@@ -335,6 +335,20 @@ def test_build_codex_command_shape():
     assert "BEGIN_AUTHORITATIVE_FACT_CONTEXT_JSON" not in prompt
 
 
+def test_launcher_and_gateway_share_exact_prompt_serialization():
+    from danus.verification_prompt import build_verification_prompt
+
+    expected = build_verification_prompt(
+        run_id="RID",
+        statement=_STMT,
+        proof=_PROOF,
+        fact_context=_FACT_CONTEXT,
+    )
+    assert launcher.build_prompt(
+        "RID", _STMT, _PROOF, fact_context=_FACT_CONTEXT
+    ) == expected
+
+
 def test_captured_execution_profile_is_immutable_across_environment_drift():
     with tempfile.TemporaryDirectory() as tmp:
         with _env(

@@ -1238,6 +1238,51 @@ def test_dispatch_replay_never_reauthorizes_click(tmp_path: Path):
         )
 
 
+def test_dispatch_projection_rearm_is_blocked_by_external_anchor(tmp_path: Path):
+    broker = BrowserAdvisorBroker(tmp_path)
+    request = _prepare(broker)
+    _authorize(broker, request)
+    broker.dispatch_started(request["request_id"])
+    with sqlite3.connect(broker.path) as db:
+        db.execute(
+            "UPDATE advisor_requests SET state='authorized', "
+            "pre_click_token_sha256=NULL, dispatch_anchor_sha256=NULL "
+            "WHERE request_id=?",
+            (request["request_id"],),
+        )
+
+    with pytest.raises(BrowserAdvisorConflict, match="dispatch anchor"):
+        broker.get(request["request_id"])
+    with pytest.raises(BrowserAdvisorConflict, match="dispatch anchor"):
+        broker.dispatch_started(request["request_id"])
+
+
+def test_dispatch_anchor_precedes_sql_commit_and_fails_closed_on_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    broker = BrowserAdvisorBroker(tmp_path)
+    request = _prepare(broker)
+    _authorize(broker, request)
+    original_event = broker._event
+
+    def fail_after_anchor(*args, **kwargs):
+        if args[2] == "dispatching":
+            raise sqlite3.OperationalError("fault after external dispatch anchor")
+        return original_event(*args, **kwargs)
+
+    monkeypatch.setattr(broker, "_event", fail_after_anchor)
+    with pytest.raises(sqlite3.OperationalError, match="external dispatch anchor"):
+        broker.dispatch_started(request["request_id"])
+    with sqlite3.connect(broker.path) as db:
+        assert db.execute(
+            "SELECT state, pre_click_token_sha256 FROM advisor_requests "
+            "WHERE request_id=?",
+            (request["request_id"],),
+        ).fetchone() == ("authorized", None)
+    with pytest.raises(BrowserAdvisorConflict, match="dispatch anchor"):
+        broker.dispatch_started(request["request_id"])
+
+
 def test_dispatch_replay_cli_is_nonzero_and_explicitly_no_click(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ):
@@ -2854,7 +2899,7 @@ def test_schema_v2_migrates_without_changing_existing_receipt_hash(tmp_path: Pat
     assert migrated["lineage"]["kind"] == "new_chat"
     assert migrated["lineage"]["lineage_root_request_id"] == "legacy-request"
     with broker._connect() as migrated_db:
-        assert migrated_db.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert migrated_db.execute("PRAGMA user_version").fetchone()[0] == 6
         column_names = {
             row[1] for row in migrated_db.execute("PRAGMA table_info(advisor_requests)")
         }
@@ -2931,7 +2976,7 @@ def test_schema_v3_migration_preserves_legacy_binding_receipt_and_client_replay(
     )
     assert replay == {**migrated, "prompt": PROMPT}
     with reopened._connect() as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 6
         assert db.execute("SELECT COUNT(*) FROM advisor_requests").fetchone()[0] == 1
 
 

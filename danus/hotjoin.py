@@ -4423,7 +4423,7 @@ def app_server_argv(
     """Exact app-server launch with a worker root boundary and MCP table."""
     if not os.path.isabs(codex_bin):
         raise ValueError("codex binary must be absolute")
-    return [
+    argv = [
         codex_bin,
         "app-server",
         "--stdio",
@@ -4433,6 +4433,9 @@ def app_server_argv(
         "--config",
         mcp_config,
     ]
+    if os.environ.get("DANUS_RETRIEVAL_MODE", "open").strip().lower() != "open":
+        argv.extend(["--config", "tools.web_search=false"])
+    return argv
 
 
 def resolved_executable(path: str) -> str:

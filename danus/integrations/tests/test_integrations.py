@@ -132,6 +132,27 @@ def test_num_results_non_positive_defaults_to_ten():
     assert '"num_results": 10' in captured["body"]
 
 
+def test_non_numeric_num_results_degrades_to_default_without_raising():
+    captured = {}
+    orig = matlas.urllib.request.urlopen
+
+    class _Resp(io.BytesIO):
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    def fake(req, timeout=None):
+        captured["body"] = req.data.decode("utf-8")
+        return _Resp(b"[]")
+
+    matlas.urllib.request.urlopen = fake
+    try:
+        out = matlas.search("q", num_results="not-a-number")
+    finally:
+        matlas.urllib.request.urlopen = orig
+    assert out["results"] == []
+    assert '"num_results": 10' in captured["body"]
+
+
 def test_main_smoke_runs_offline(capsys=None):
     # matlas.py:94-100 — the __main__ smoke block prints count/error + up to 3
     # results, using a mocked endpoint (no network). Run via runpy with argv set.
