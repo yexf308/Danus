@@ -4124,6 +4124,115 @@ class CoordinationStore:
         finally:
             connection.close()
 
+    def record_exact_fact_reuse(
+        self,
+        worker: str,
+        *,
+        slot_id: str,
+        candidate_fact_id: str,
+        candidate_fact_identity: str,
+        source_id: str | None,
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        """Record a zero-verifier active-fact reuse as one terminal slot receipt."""
+
+        slot_id = _validate_identifier(slot_id, "slot_id")
+        context_material = json.dumps(
+            [
+                "active_exact_fact_reuse_v1",
+                slot_id,
+                candidate_fact_id,
+                candidate_fact_identity,
+                source_id,
+            ],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        context_digest = hashlib.sha256(context_material).hexdigest()
+        receipt = candidate_receipt_id(
+            slot_id=slot_id,
+            candidate_fact_id=candidate_fact_id,
+            candidate_fact_identity=candidate_fact_identity,
+            source_id=source_id,
+            context_digest=context_digest,
+        )
+        recorded_at = time.time() if now is None else float(now)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT * FROM candidates WHERE candidate_id=?",
+                (receipt,),
+            ).fetchone()
+            slot = (
+                self._canonical_paid_slot(connection, worker, slot_id=slot_id)
+                if existing is None
+                else self._canonical_candidate_slot(
+                    connection,
+                    worker,
+                    slot_id=slot_id,
+                    require_current_generation=False,
+                )
+            )
+            identity = (
+                int(slot["generation"]),
+                slot_id,
+                candidate_fact_id,
+                candidate_fact_identity,
+                source_id,
+                context_digest,
+                worker,
+                str(slot["lane"]),
+            )
+            if existing is None:
+                connection.execute(
+                    """
+                    INSERT INTO candidates(
+                        candidate_id, generation, slot_id, candidate_fact_id,
+                        candidate_fact_identity, source_id, context_digest,
+                        worker, lane, state, outcome, created_at, updated_at,
+                        terminal_at
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 'terminal', 'correct', ?, ?, ?)
+                    """,
+                    (receipt, *identity, recorded_at, recorded_at, recorded_at),
+                )
+            else:
+                observed = tuple(
+                    existing[key]
+                    for key in (
+                        "generation",
+                        "slot_id",
+                        "candidate_fact_id",
+                        "candidate_fact_identity",
+                        "source_id",
+                        "context_digest",
+                        "worker",
+                        "lane",
+                    )
+                )
+                if (
+                    observed != identity
+                    or existing["state"] != "terminal"
+                    or existing["outcome"] != "correct"
+                ):
+                    raise CoordinationError(
+                        "exact-reuse receipt conflicts with prior candidate state"
+                    )
+            row = connection.execute(
+                "SELECT * FROM candidates WHERE candidate_id=?",
+                (receipt,),
+            ).fetchone()
+            connection.commit()
+            if row is None:
+                raise CoordinationError("exact-reuse receipt disappeared")
+            return self._candidate_projection(row)
+        except BaseException:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     def resolve_candidate_outcome_unknown(
         self,
         candidate_receipt_id: str,
@@ -4310,6 +4419,23 @@ class CoordinationStore:
                 (candidate_receipt_id,),
             ).fetchone()
             return self._candidate_projection(row) if row is not None else None
+        finally:
+            connection.close()
+
+    def slot_candidates(self, slot_id: str) -> list[dict[str, Any]]:
+        """Return full candidate receipts bound to one exact paid slot."""
+
+        _validate_identifier(slot_id, "slot_id")
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                """
+                SELECT * FROM candidates WHERE slot_id=?
+                ORDER BY created_at, candidate_id
+                """,
+                (slot_id,),
+            ).fetchall()
+            return [self._candidate_projection(row) for row in rows]
         finally:
             connection.close()
 

@@ -1053,7 +1053,7 @@ def test_reasoning_candidate_registration_failure_blocks_verifier(
     assert "candidate coordination error" in result["error"]
 
 
-def test_reasoning_exact_active_reuse_registers_no_candidate(
+def test_reasoning_exact_active_reuse_records_terminal_slot_receipt(
     tmp_path: Path,
 ):
     project = tmp_path / "candidate-exact-reuse"
@@ -1090,9 +1090,15 @@ def test_reasoning_exact_active_reuse_registers_no_candidate(
     assert result["fact_id"] == fact_id
     assert result["verification_reuse"] == "active_exact_fact"
     assert result["verification_calls"] == 0
-    assert "candidate_receipt_id" not in result
+    assert isinstance(result["candidate_receipt_id"], str)
+    assert result["candidate_outcome"] == "correct"
     assert store.project_status()["candidate"] is None
-    assert store.list_candidates() == []
+    receipts = store.slot_candidates(_admissions[0].slot_id)
+    assert len(receipts) == 1
+    assert receipts[0]["candidate_receipt_id"] == result["candidate_receipt_id"]
+    assert receipts[0]["candidate_fact_id"] == fact_id
+    assert receipts[0]["state"] == "terminal"
+    assert receipts[0]["outcome"] == "correct"
 
 
 def test_reasoning_duplicate_concurrent_candidate_uses_one_receipt(
@@ -1282,8 +1288,11 @@ def test_reasoning_exact_reuse_leaves_unrelated_active_candidate_unchanged(
 
     assert result["fact_id"] == reused_fact_id
     assert result["verification_reuse"] == "active_exact_fact"
-    assert "candidate_receipt_id" not in result
+    assert isinstance(result["candidate_receipt_id"], str)
+    assert result["candidate_outcome"] == "correct"
     assert store.project_status()["candidate"] == before
+    receipts = store.slot_candidates(admissions[0].slot_id)
+    assert {item["state"] for item in receipts} == {"active", "terminal"}
 
 
 def test_reasoning_exact_reuse_does_not_release_same_short_different_full_identity(
@@ -1341,8 +1350,11 @@ def test_reasoning_exact_reuse_does_not_release_same_short_different_full_identi
         server._verify = original_verify
 
     assert result["fact_id"] == fact_id
-    assert "candidate_receipt_id" not in result
+    assert isinstance(result["candidate_receipt_id"], str)
+    assert result["candidate_outcome"] == "correct"
     assert store.project_status()["candidate"] == before
+    receipts = store.slot_candidates(admissions[0].slot_id)
+    assert {item["state"] for item in receipts} == {"active", "terminal"}
 
 
 def test_fact_context_gateway_defaults_to_summary_only():

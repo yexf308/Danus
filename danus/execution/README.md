@@ -41,6 +41,10 @@ that every promoted lemma solves the project. The main agent hydrates the exact
 fact, stops the project if it closes the target, or explicitly restarts with
 non-duplicative assignments and the exact
 `--acknowledge-verified-fact-review <fact_id>` if it is supporting progress.
+Promotion attribution accepts either a typed `fact_submit` result retained by the
+transport or a terminal candidate/reuse receipt bound to the exact paid slot; the
+latter is accepted only after its full identity matches the active FactGraph under
+lock. Agent prose and arbitrary fact-id text remain non-authoritative.
 `stop --force` is also a durable request, not an external numeric-PID signal:
 the worker observes it during an active round, interrupts an app-server turn or
 asks its retained owned-child host to terminate the complete Codex/MCP group,

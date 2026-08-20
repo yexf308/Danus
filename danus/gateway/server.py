@@ -613,31 +613,37 @@ def _reconcile_exact_reuse_candidate(
                 "reasoning-first project has no canonical coordination store"
             )
         active = store.project_status().get("candidate")
-        if not isinstance(active, dict) or active.get("state") != "active":
-            return {}
-        if (
-            active.get("worker") != author
-            or active.get("candidate_fact_id") != candidate_fact_id
-            or active.get("candidate_fact_identity") != candidate_fact_identity
-            or active.get("source_id") != source_id
-            or not isinstance(active.get("slot_id"), str)
-        ):
-            return {}
-        bare_context_digest = active.get("context_digest")
-        if (
-            not isinstance(bare_context_digest, str)
-            or re.fullmatch(r"[0-9a-f]{64}", bare_context_digest) is None
-        ):
-            raise RuntimeError("candidate receipt has no canonical bound context")
-        receipt = candidate_receipt_id(
-            slot_id=active["slot_id"],
-            candidate_fact_id=candidate_fact_id,
-            candidate_fact_identity=candidate_fact_identity,
-            source_id=source_id,
-            context_digest=bare_context_digest,
+        matching_active = (
+            isinstance(active, dict)
+            and active.get("state") == "active"
+            and active.get("worker") == author
+            and active.get("candidate_fact_id") == candidate_fact_id
+            and active.get("candidate_fact_identity") == candidate_fact_identity
+            and active.get("source_id") == source_id
+            and isinstance(active.get("slot_id"), str)
         )
-        if active.get("candidate_receipt_id") != receipt:
-            return {}
+        if matching_active:
+            bare_context_digest = active.get("context_digest")
+            if (
+                not isinstance(bare_context_digest, str)
+                or re.fullmatch(r"[0-9a-f]{64}", bare_context_digest) is None
+            ):
+                raise RuntimeError("candidate receipt has no canonical bound context")
+            receipt = candidate_receipt_id(
+                slot_id=active["slot_id"],
+                candidate_fact_id=candidate_fact_id,
+                candidate_fact_identity=candidate_fact_identity,
+                source_id=source_id,
+                context_digest=bare_context_digest,
+            )
+            if active.get("candidate_receipt_id") != receipt:
+                return {}
+            slot_id = active["slot_id"]
+        else:
+            provenance = store.paid_slot_provenance(author)
+            if provenance is None or not isinstance(provenance.get("slot_id"), str):
+                return {}
+            slot_id = provenance["slot_id"]
         # Re-attest the short and full active identity while retaining the graph
         # snapshot through the coordination transition. A concurrent revoke,
         # semantic drift, or forced short-id collision cannot release another
@@ -651,16 +657,25 @@ def _reconcile_exact_reuse_candidate(
         ) as active_identity:
             if active_identity != (candidate_fact_id, candidate_fact_identity):
                 return {}
-            terminal = store.terminalize_candidate(
-                author,
-                receipt,
-                slot_id=active["slot_id"],
-                outcome="correct",
-            )
+            if matching_active:
+                terminal = store.terminalize_candidate(
+                    author,
+                    receipt,
+                    slot_id=slot_id,
+                    outcome="correct",
+                )
+            else:
+                terminal = store.record_exact_fact_reuse(
+                    author,
+                    slot_id=slot_id,
+                    candidate_fact_id=candidate_fact_id,
+                    candidate_fact_identity=candidate_fact_identity,
+                    source_id=source_id,
+                )
         if terminal.get("state") != "terminal" or terminal.get("outcome") != "correct":
             raise RuntimeError("candidate reconciliation did not become terminal")
         return {
-            "candidate_receipt_id": receipt,
+            "candidate_receipt_id": terminal["candidate_receipt_id"],
             "candidate_outcome": "correct",
         }
     except Exception as exc:

@@ -41,6 +41,7 @@ from danus.coordination import (
     CoordinationStore,
     candidate_receipt_id,
 )
+from danus.core.factgraph import FactGraph
 from danus.core.global_memory import GlobalMemory
 from danus.execution import layout as L
 from danus.execution import loop, scaffold
@@ -1025,6 +1026,138 @@ def test_main_pauses_after_a_promoted_fact_before_another_paid_round(tmp: Path):
         "action": "audit_verified_fact_before_restart",
         "fact_id": fact_id,
     }
+
+
+def test_slot_candidate_fallback_recovers_exact_active_promoted_fact(tmp: Path):
+    wl = _mk_worker(tmp)
+    store = _enable_reasoning(wl, roles="high:1", workers=["high"])
+    admission = store.admit("high")
+    assert admission is not None
+    store.pin_prompt(admission.slot_id, _coordination_prompt(wl, admission))
+    store.activate(admission.slot_id)
+
+    graph = FactGraph(wl.project_dir)
+    fact_id = graph.add(
+        problem_id=wl.project,
+        author="high",
+        statement="A promoted fact bound to one exact paid slot",
+        proof="A complete test proof.",
+    )
+    with graph.locked_active_fact_identity(fact_id) as fact_identity:
+        assert fact_identity is not None
+    receipt = candidate_receipt_id(
+        slot_id=admission.slot_id,
+        candidate_fact_id=fact_id,
+        candidate_fact_identity=fact_identity,
+        source_id=None,
+        context_digest="b" * 64,
+    )
+    store.register_candidate(
+        "high",
+        receipt,
+        slot_id=admission.slot_id,
+        candidate_fact_id=fact_id,
+        candidate_fact_identity=fact_identity,
+        source_id=None,
+        context_digest="b" * 64,
+    )
+    store.terminalize_candidate(
+        "high",
+        receipt,
+        slot_id=admission.slot_id,
+        outcome="correct",
+    )
+
+    assert (
+        loop._canonical_slot_candidate_fact_id(
+            wl.project_dir,
+            store,
+            admission,
+        )
+        == fact_id
+    )
+
+
+def test_reasoning_outer_loop_pauses_when_transport_fact_result_is_sparse(tmp: Path):
+    wl = _mk_worker(tmp)
+    store = _enable_reasoning(wl, roles="high:1", workers=["high"])
+    calls = []
+    promoted = []
+
+    def sparse_paid_round(_worker, _role, _prompt, log_path, _hard_timeout, **_kw):
+        calls.append(log_path.name)
+        provenance = store.paid_slot_provenance("high")
+        assert provenance is not None
+        graph = FactGraph(wl.project_dir)
+        fact_id = graph.add(
+            problem_id=wl.project,
+            author="high",
+            statement="A real promotion whose transport result is sparse",
+            proof="A complete sparse-transport test proof.",
+        )
+        promoted.append(fact_id)
+        with graph.locked_active_fact_identity(fact_id) as fact_identity:
+            assert fact_identity is not None
+        receipt = candidate_receipt_id(
+            slot_id=provenance["slot_id"],
+            candidate_fact_id=fact_id,
+            candidate_fact_identity=fact_identity,
+            source_id=None,
+            context_digest="b" * 64,
+        )
+        store.register_candidate(
+            "high",
+            receipt,
+            slot_id=provenance["slot_id"],
+            candidate_fact_id=fact_id,
+            candidate_fact_identity=fact_identity,
+            source_id=None,
+            context_digest="b" * 64,
+        )
+        store.terminalize_candidate(
+            "high",
+            receipt,
+            slot_id=provenance["slot_id"],
+            outcome="correct",
+        )
+        log_path.write_text(
+            json.dumps(
+                {
+                    "event": "item_completed",
+                    "item": {
+                        "type": "mcpToolCall",
+                        "id": "sparse-submit",
+                        "server": "danus",
+                        "tool": "fact_submit",
+                        "status": "completed",
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return 0
+
+    _patch_run_round(sparse_paid_round)
+    try:
+        with (
+            _restore_sigterm(),
+            _env(
+                DANUS_WORKER_TRANSPORT="exec",
+                DANUS_ROUND_BEAT="0",
+                DANUS_MAX_ROUNDS="2",
+                DANUS_MAX_CONSEC_FAILURES="0",
+            ),
+        ):
+            assert loop.main(str(wl.dir)) == 0
+    finally:
+        _unpatch_run_round()
+
+    status = json.loads(wl.status.read_text(encoding="utf-8"))
+    assert calls == ["round_1.log"]
+    assert status["state"] == "verified_fact_review"
+    assert status["last_fact_id"] == promoted[0]
+    assert status["verified_fact_review"]["fact_id"] == promoted[0]
 
 
 def test_reasoning_first_root_uses_pinned_directive_and_2700_timeout(
@@ -2569,6 +2702,8 @@ def main() -> None:
         test_main_stops_on_deadline,
         test_main_max_rounds_cap,
         test_main_pauses_after_a_promoted_fact_before_another_paid_round,
+        test_slot_candidate_fallback_recovers_exact_active_promoted_fact,
+        test_reasoning_outer_loop_pauses_when_transport_fact_result_is_sparse,
         test_main_restart_preserves_old_logs_and_advances_round_sequence,
         test_main_consecutive_failure_cap,
         test_main_timeout_rc124_does_not_count_as_failure,

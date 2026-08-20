@@ -1500,8 +1500,26 @@ def test_candidate_overlay_preserves_open_lanes_and_freezes_advance_until_termin
         context_digest="b" * 64,
     )
     assert candidate["state"] == "active" and candidate["source_id"] is None
+    assert store.slot_candidates(root.slot_id) == [candidate]
+    assert store.slot_candidates(critic.slot_id) == []
     assert store.project_status()["candidate"] == candidate
     assert store.admit("xhigh2").slot_id == critic.slot_id
+    reuse = store.record_exact_fact_reuse(
+        "xhigh2",
+        slot_id=critic.slot_id,
+        candidate_fact_id="d" * 16,
+        candidate_fact_identity="e" * 64,
+        source_id=None,
+    )
+    assert reuse["state"] == "terminal" and reuse["outcome"] == "correct"
+    assert store.record_exact_fact_reuse(
+        "xhigh2",
+        slot_id=critic.slot_id,
+        candidate_fact_id="d" * 16,
+        candidate_fact_identity="e" * 64,
+        source_id=None,
+    ) == reuse
+    assert store.project_status()["candidate"] == candidate
 
     store.complete(root.slot_id, outcome="terminal_rc_0")
     store.complete(critic.slot_id, outcome="terminal_rc_0")
@@ -1527,6 +1545,7 @@ def test_candidate_overlay_preserves_open_lanes_and_freezes_advance_until_termin
         outcome="correct",
     )
     assert terminal["state"] == "terminal" and terminal["outcome"] == "correct"
+    assert store.slot_candidates(root.slot_id) == [terminal]
     assert store.project_status()["candidate"] is None
     assert store.project_status()["generation"] == 2
     assert store.admit("xhigh") is not None

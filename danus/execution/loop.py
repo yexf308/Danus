@@ -59,6 +59,7 @@ from danus.coordination import (
     coordination_config,
 )
 from danus.coordination.store import load_project_metadata
+from danus.core.factgraph import FactGraph
 from danus.core.global_memory import GlobalMemory
 from danus.gateway_runtime import GatewayRuntimeUnavailable, require_gateway_runtime
 from danus.hotjoin import (
@@ -725,6 +726,47 @@ def _canonical_app_server_fact_id(project_dir: Path, worker: str) -> Optional[st
     if audit is None:
         return None
     return _last_promoted_fact_id(str(audit["payload"]))
+
+
+def _canonical_slot_candidate_fact_id(
+    project_dir: Path,
+    coordination_store: CoordinationStore,
+    admission: Admission,
+) -> Optional[str]:
+    """Recover an active promoted fact from an exact verifier candidate receipt."""
+
+    graph = FactGraph(project_dir)
+    observed: str | None = None
+    for candidate in coordination_store.slot_candidates(admission.slot_id):
+        if (
+            candidate.get("generation") != admission.generation
+            or candidate.get("worker") != admission.worker
+            or candidate.get("lane") != admission.lane
+            or candidate.get("state") != "terminal"
+            or candidate.get("outcome") != "correct"
+        ):
+            continue
+        fact_id = candidate.get("candidate_fact_id")
+        fact_identity = candidate.get("candidate_fact_identity")
+        if (
+            not isinstance(fact_id, str)
+            or _FACT_ID_RE.fullmatch(fact_id) is None
+            or not isinstance(fact_identity, str)
+            or len(fact_identity) != 64
+            or any(character not in "0123456789abcdef" for character in fact_identity)
+        ):
+            raise CoordinationError(
+                "correct terminal candidate has a malformed fact identity"
+            )
+        with graph.locked_active_fact_identity(fact_id) as active_identity:
+            if active_identity is None:
+                continue
+            if active_identity != fact_identity:
+                raise CoordinationError(
+                    "correct terminal candidate conflicts with the active fact identity"
+                )
+        observed = fact_id
+    return observed
 
 
 def _worker_mcp_config_arg(wl: L.WorkerLayout) -> str:
@@ -2858,6 +2900,28 @@ def main(worker_dir: str) -> int:
                 if transport == "app-server"
                 else _parse_last_fact_id(log_path, worker=wl)
             )
+            if (
+                observed_last_fact_id is None
+                and coordination_store is not None
+                and admission is not None
+            ):
+                try:
+                    observed_last_fact_id = _canonical_slot_candidate_fact_id(
+                        project_dir,
+                        coordination_store,
+                        admission,
+                    )
+                except (CoordinationError, OSError, sqlite3.Error, ValueError) as exc:
+                    write_status(
+                        wl,
+                        state="error",
+                        error=f"verified fact attribution failed: {exc}",
+                        recovery_required=(
+                            "audit the exact candidate receipt and active FactGraph "
+                            "identity before restart"
+                        ),
+                    )
+                    return 126
             finished_at = time.time()
             attempt = {
                 "round": round_seq,

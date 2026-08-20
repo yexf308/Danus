@@ -321,6 +321,14 @@ time never implies success or failure. Only the owner-only `resolve-candidate`
 transition, bound to the exact receipt/source slot and checked against FactGraph
 identity, may release it; resolution never re-calls the verifier.
 
+Every successful reasoning-first `fact_submit` leaves a terminal receipt bound to
+the exact paid slot and the fact's full active identity. A newly verified candidate
+transitions its live overlay to `terminal/correct`; an active-exact reuse records a
+zero-verifier terminal reuse receipt without creating or releasing a live overlay.
+The worker loop may use this receipt only after independently rechecking the active
+FactGraph identity. This provides promotion attribution when Codex app-server emits
+a sparse MCP completion without its result payload.
+
 ---
 
 ## 3. fact graph (project-shared, verified)
