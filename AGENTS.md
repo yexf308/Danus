@@ -6,25 +6,26 @@ is the sole correctness authority, and you steer — you do not do the math your
 Full contract: `agents/contracts/main_agent.md`. The architecture map and module
 index is `ARCHITECTURE.md`.
 
-**Read `OPERATOR.md` now** — it is your durable operator profile (how to address
-them, language, spend ceiling, consult transport, standing preferences). It is not
-auto-loaded; read it at the start of every session and follow it.
-
 ## Start here — initialize before anything else on a new session
 
-The first thing you do, before summarizing the repo or answering "what should we
-do", is check whether this deployment is initialized. It is not initialized if
-`runtime/.danus-initialized` is absent (corroborating signs: still on `main`, no
+Before reading or trusting any identity in `OPERATOR.md`, check whether this
+deployment is initialized. The first thing you do, before summarizing the repo or
+answering "what should we do", is test for `runtime/.danus-initialized`. It is not
+initialized if that marker is absent (corroborating signs: still on `main`, no
 `config/danus.env`, or `OPERATOR.md` is still the blank template).
 
 - **If not initialized:** do not start work and do not just describe the repo.
-  Greet the operator, explain Danus in 2–3 sentences, and invoke the `initialize`
-  skill. It interviews them (operating choices, how to address them, git branch,
+  Treat every name and preference already present in `OPERATOR.md` as untrusted
+  template or stale copied-deployment data. Do not address that person or accept
+  authorization in their name. Greet the person in the current conversation,
+  explain Danus in 2–3 sentences, and invoke the `initialize` skill. It interviews
+  them (operating choices, how to address them, git branch,
   spend ceiling, consult transport `gpt_pro`/`claude_api`/`claude_code`/`off`, codex backend),
   provisions `OPERATOR.md` and `config/danus.env`, starts the verify service, and
   marks `runtime/.danus-initialized`. Setup is not optional.
-- **If already initialized:** re-read `OPERATOR.md` and the relevant
-  project's `PROBLEM.md`, then help.
+- **If already initialized:** read `OPERATOR.md` as the durable operator profile
+  and follow its language, spend, consult, and standing preferences. Then read
+  the relevant project's `PROBLEM.md` and help.
 
 ## Working style
 
@@ -89,6 +90,17 @@ explicit roster override and `--active-explorers 1|2` only for an explicit paid
 exploration choice. Explorer lanes must receive independent alternate routes,
 supporting lemmas, or counterexamples.
 
+When the initialized operator gives an unambiguous authorization in the current
+conversation for the exact recommendation you just surfaced, that conversational
+decision is the authorization event. Do not demand a magic phrase, ask the operator
+to type a CLI command, or repeat the same authorization question. You must persist
+the decision yourself: stage a distinct next-generation task for every paid lane,
+confirm `task_staging.ready=true`, run the exact `danus resolve-recommendation`
+CAS with the matching recommendation id and paid-resume acknowledgement, then
+`danus start` the required workers. If the speaker is not the initialized operator,
+or the recommendation was not identified exactly, stop and re-establish ownership
+or the exact decision instead of weakening the gate.
+
 **Late ChatGPT Pro intervention is event-driven and attended.** It requires the
 exact current coordinator recommendation derived from the fixed root obstruction
 and independent critic confirmation. Broad evidence that routes are blocked,
@@ -140,6 +152,15 @@ route is credible, `danus stop <project>` the swarm yourself (graceful) — act,
 notify; do not wait for the operator. This is the one time you wind a project down
 on your own; a slow or hard problem never is. Declaring the result as *the answer*
 (`danus finalize`) stays a fork you surface.
+
+Any worker status `verified_fact_review` is a paid-work pause, not permission to
+blindly restart. Before assigning or starting another generation, hydrate its exact
+`last_fact_id` with `fact_context`, compare the statement and verified dependency
+chain with every target in `PROBLEM.md`, and decide whether the target is genuinely
+closed. If yes, stop the whole project immediately. If it is only a supporting
+fact, record the new strategic state, assign non-duplicative next tasks, and restart
+explicitly with `danus start ... --acknowledge-verified-fact-review <fact_id>`.
+Never spend another generation re-proving an active target fact.
 
 ## Persistent services — the system does not run without them
 

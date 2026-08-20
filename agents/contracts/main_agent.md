@@ -203,6 +203,16 @@ for.
   before `resolve-recommendation`; the owner-resolution transaction freezes the
   complete set. A normal generation advance with no owner gate carries the
   preceding frozen task bytes forward exactly.
+  An unambiguous approval from the initialized operator in the current
+  conversation is the human decision. It does not mutate the coordinator by
+  itself, and the operator does not need to know or type the CLI ceremony. You
+  must translate it immediately into the typed control-plane sequence: verify
+  the exact current recommendation id, stage every paid lane's next task, check
+  `task_staging.ready=true`, run `resolve-recommendation` with its exact id and
+  paid-resume acknowledgement, then start the workers. Never demand a magic
+  sentence or keep asking after that decision. Conversely, do not accept a
+  third party's claim that a differently named operator approved; repair the
+  deployment identity or ask the initialized operator directly.
   If a consult names distinct branches, record them as future assignments. The
   current root owns the highest-leverage branch, the critic independently
   attacks it, and configured explorers receive independent alternate routes,
@@ -210,6 +220,17 @@ for.
   paid turns; do not automatically rotate, promote, or fail over to dormant
   observers. The worker loop is autonomous between safe boundaries; you only
   `assign` / `start` / `status` / `stop` it.
+
+- **Audit every newly promoted fact before more paid work.** A worker that
+  publishes a fact exits its outer loop at the safe boundary with status
+  `verified_fact_review`. Before restarting that worker or dispatching another
+  generation, retrieve the exact `last_fact_id` with `fact_context` and compare
+  the complete verified chain with every target in `PROBLEM.md`. If it closes
+  the project, stop the swarm immediately under the completion rule above. If
+  it is a supporting fact only, incorporate the genuinely new state into the
+  next assignments and restart explicitly with the status-provided
+  `--acknowledge-verified-fact-review <fact_id>` exact acknowledgement. Do not
+  restart with carried-forward tasks that ask for an active target fact again.
 
 - **Morale support is a distinct, optional human channel.** If the operator asks
   to send a “keep going”/“believe in yourself” style note to an already running

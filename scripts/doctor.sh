@@ -8,6 +8,16 @@ no(){ printf '  \033[31mFAIL\033[0m %s\n' "$1"; }
 wn(){ printf '  \033[33mwarn\033[0m %s\n' "$1"; }
 echo "== Danus doctor =="
 echo "DANUS_ROOT=$DANUS_ROOT"
+if [ -f "$DANUS_RUNTIME/.danus-initialized" ]; then
+  ok "deployment initialized"
+  if grep -Eq '_\((ask once|the language|for scheduling)|fill in' "$DANUS_ROOT/OPERATOR.md" 2>/dev/null; then
+    no "initialized deployment still has a blank OPERATOR.md (run initialize again)"
+  else
+    ok "operator profile filled"
+  fi
+else
+  wn "deployment not initialized (initialize is required before paid or state-changing commands)"
+fi
 [ -f "$DANUS_ROOT/config/danus.env" ] && ok "config/danus.env present" || wn "config/danus.env missing (copy from .example)"
 [ -f "$DANUS_ROOT/config/codex.env" ] && ok "config/codex.env present" || wn "config/codex.env missing (copy from .example, fill BYO key)"
 [ -n "${DANUS_PY:-}" ] && [ -x "$DANUS_PY" ] && ok "python: $DANUS_PY" || no "no python (run bootstrap.sh)"

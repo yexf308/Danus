@@ -34,9 +34,16 @@ there is no default project.
 | `reset-thread` | `danus reset-thread <project>/<worker> --expected-thread-id ID` | CAS-fenced reset of a server-deleted thread mapping; fail closed for a live/busy worker and share `start`'s `.pid.lock` |
 | `rotate-thread` | `danus rotate-thread <project>/<worker> --expected-thread-id ID --reason TEXT` | explicitly accept terminal conversation-context loss after bounded resume failure; fail closed for a live/busy worker, share `start`'s `.pid.lock`, and preserve research stores |
 | `finalize` | `danus finalize <project> [--paper <paper_id>] [<fact_id> …]` | record the approved target theorem(s) in the paper's `TARGET.md` (what write-paper reads; default paper → `<project>/TARGET.md`, a non-default `--paper` → `<project>/papers/<paper_id>/TARGET.md`). **With no id:** print candidate terminal facts as suggestions (writes nothing) |
-| `start` | `danus start <project>[/<worker>]` | launch the autonomous worker loop(s); a live loop is not necessarily a paid model turn |
+| `start` | `danus start <project>[/<worker>] [--acknowledge-verified-fact-review FACT_ID ...]` | launch the autonomous worker loop(s); a live loop is not necessarily a paid model turn; a worker paused on a promoted fact requires the exact post-audit acknowledgement |
 | `status` | `danus status <project>[/<worker>] [--json]` | liveness, round, exact per-worker lane/generation, `explorer_workers`, paid-active vs waiting admission, task staging, candidate/paid-intent state, and last-turn telemetry |
 | `stop` | `danus stop <project>[/<worker>] [--force]` | graceful (finish the round, exit at the boundary) or `--force` (durably request the worker to interrupt its active turn/direct child and exit) |
+
+`status --json` includes a bounded `owner_action` object while a reviewed
+recommendation is open. It distinguishes missing next-generation task assignments
+from a fully staged recommendation that only needs the initialized operator's
+decision persisted by the main agent. A worker that promoted a fact reports
+`verified_fact_review` plus the exact `last_fact_id`; audit that fact against
+`PROBLEM.md` before `start`.
 
 Notes:
 - `--active-explorers N` is represented only as

@@ -608,7 +608,12 @@ def _fact_submit_summary(item: dict) -> Optional[dict]:
         "verification_verdict": verification_verdict,
         "fact_id": fact_id,
     }
-    for key in ("verdict", "adaptive_rounds", "verification_calls"):
+    for key in (
+        "verdict",
+        "adaptive_rounds",
+        "verification_calls",
+        "verification_reuse",
+    ):
         if isinstance(value.get(key), (str, int)) and not isinstance(
             value.get(key), bool
         ):
@@ -2515,6 +2520,7 @@ def main(worker_dir: str) -> int:
         state="running",
         round=round_seq,
         started_at=time.time(),
+        verified_fact_review=None,
         **coordination_fields(initial_coordination),
     )
     attempts = 0
@@ -3040,6 +3046,23 @@ def main(worker_dir: str) -> int:
                     wl, state="error", error=f"{consec_fail} consecutive failed rounds"
                 )
                 return 1
+
+            if observed_last_fact_id is not None:
+                # A verified fact is genuine new strategic state. Pause this
+                # worker before another paid turn so the main agent can hydrate
+                # the exact fact, stop a completed project, or deliberately
+                # retask supporting work. This never treats an arbitrary model
+                # message as completion: observed_last_fact_id comes only from
+                # a typed promoted fact_submit result.
+                write_status(
+                    wl,
+                    state="verified_fact_review",
+                    verified_fact_review={
+                        "action": "audit_verified_fact_before_restart",
+                        "fact_id": observed_last_fact_id,
+                    },
+                )
+                break
 
             if beat > 0:
                 time.sleep(beat)

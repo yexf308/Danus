@@ -138,6 +138,12 @@ and `.agents/skills/` load). On the **first** session, the main agent runs the
 spend ceiling, consult transport, codex backend), provisions `OPERATOR.md` +
 `config/danus.env`, brings up verify, and writes `runtime/.danus-initialized`.
 
+Until that marker exists, `bin/danus` permits read-only inspection and emergency
+stop but refuses paid or state-changing commands. It also ignores any pre-filled
+identity in `OPERATOR.md`, since a copied deployment may contain another person's
+profile. Initialization creates a deployment branch; the public `main` branch
+keeps the blank operator template.
+
 After initialize, continue with `operating-guide.md` to create and run a project.
 `danus new <project>` defaults to reasoning-first coordination and roster
 `max:2,high:5`: the two `max` workers become the paid root/critic lanes and the

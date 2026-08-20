@@ -995,6 +995,38 @@ def test_main_max_rounds_cap(tmp: Path):
     assert st["round"] == 2 and st["last_rc"] == 0
 
 
+def test_main_pauses_after_a_promoted_fact_before_another_paid_round(tmp: Path):
+    wl = _mk_worker(tmp)
+    calls = []
+    fact_id = "a" * 16
+    original_parse = loop._parse_last_fact_id
+    loop._parse_last_fact_id = lambda *_args, **_kwargs: fact_id
+    with (
+        _restore_sigterm(),
+        _env(
+            DANUS_ROUND_BEAT="0",
+            DANUS_MAX_ROUNDS="0",
+            DANUS_MAX_CONSEC_FAILURES="0",
+        ),
+    ):
+        _patch_run_round(lambda *_args, **_kwargs: (calls.append(1) or 0))
+        try:
+            rc = loop.main(str(wl.dir))
+        finally:
+            _unpatch_run_round()
+            loop._parse_last_fact_id = original_parse
+
+    assert rc == 0
+    assert calls == [1]
+    status = json.loads(wl.status.read_text(encoding="utf-8"))
+    assert status["state"] == "verified_fact_review"
+    assert status["last_fact_id"] == fact_id
+    assert status["verified_fact_review"] == {
+        "action": "audit_verified_fact_before_restart",
+        "fact_id": fact_id,
+    }
+
+
 def test_reasoning_first_root_uses_pinned_directive_and_2700_timeout(
     tmp: Path,
 ):
@@ -1840,11 +1872,32 @@ def test_main_legacy_status_retains_promoted_fact_across_no_submit_round(tmp: Pa
             assert loop.main(str(wl.dir)) == 0
 
         status = json.loads(wl.status.read_text(encoding="utf-8"))
+        assert status["state"] == "verified_fact_review"
+        assert status["round"] == 1
+        assert status["last_fact_id"] == first_fact_id
+        assert status["verified_fact_review"]["fact_id"] == first_fact_id
+
+        # An explicit restart after the review runs the no-submit round. Exec
+        # status must retain the prior verified fact rather than trusting fact
+        # ids in prose or fact_context output.
+        with (
+            _restore_sigterm(),
+            _env(
+                DANUS_ROUND_BEAT="0",
+                DANUS_MAX_ROUNDS="1",
+                DANUS_MAX_CONSEC_FAILURES="0",
+            ),
+        ):
+            assert loop.main(str(wl.dir)) == 0
+
+        status = json.loads(wl.status.read_text(encoding="utf-8"))
+        assert status["state"] == "max_rounds"
         assert status["round"] == 2
         assert status["last_fact_id"] == first_fact_id
         assert status["last_attempt"]["round"] == 2
         assert status["last_attempt"]["dispatch_state"] == "none"
 
+        # A second audited restart observes the newer promotion and pauses again.
         with (
             _restore_sigterm(),
             _env(
@@ -2515,6 +2568,7 @@ def main() -> None:
         test_main_stops_on_stop_flag,
         test_main_stops_on_deadline,
         test_main_max_rounds_cap,
+        test_main_pauses_after_a_promoted_fact_before_another_paid_round,
         test_main_restart_preserves_old_logs_and_advances_round_sequence,
         test_main_consecutive_failure_cap,
         test_main_timeout_rc124_does_not_count_as_failure,

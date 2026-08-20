@@ -35,6 +35,12 @@ round boundary: `.stop` flag,
 (5). Config read at call time (`DANUS_ROUND_HARD_TIMEOUT` 4h, `DANUS_ROUND_BEAT` 5s).
 `.status.json` is written atomically. **Resumability is continuity in the stores**,
 not process state — a fresh `start` rebuilds context from memory + the fact graph.
+After a paid turn promotes any fact, that worker exits at the same safe boundary
+with `state=verified_fact_review`. This is a cost and strategy pause, not a claim
+that every promoted lemma solves the project. The main agent hydrates the exact
+fact, stops the project if it closes the target, or explicitly restarts with
+non-duplicative assignments and the exact
+`--acknowledge-verified-fact-review <fact_id>` if it is supporting progress.
 `stop --force` is also a durable request, not an external numeric-PID signal:
 the worker observes it during an active round, interrupts an app-server turn or
 asks its retained owned-child host to terminate the complete Codex/MCP group,

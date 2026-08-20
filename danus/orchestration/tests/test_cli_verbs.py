@@ -789,6 +789,32 @@ def test_worker_status_working_and_dead_labels(tmp: Path):
         # not alive + recognized terminal state => that state as label
         wl.status.write_text(json.dumps({"state": "deadline", "round": 3}))
         assert cli.worker_status(wl)["label"] == "deadline"
+        review = {
+            "action": "audit_verified_fact_before_restart",
+            "fact_id": "a" * 16,
+        }
+        wl.status.write_text(
+            json.dumps(
+                {
+                    "state": "verified_fact_review",
+                    "round": 4,
+                    "last_fact_id": "a" * 16,
+                    "verified_fact_review": review,
+                }
+            )
+        )
+        paused = cli.worker_status(wl)
+        assert paused["label"] == "verified_fact_review"
+        assert paused["verified_fact_review"] == {
+            **review,
+            "restart_argv": [
+                "bin/danus",
+                "start",
+                "P/high",
+                "--acknowledge-verified-fact-review",
+                "a" * 16,
+            ],
+        }
 
 
 def test_worker_status_json_exposes_layered_paid_and_recovery_outcomes(tmp: Path):
@@ -910,6 +936,46 @@ def test_do_start_calls_spawn_with_worker_dir(tmp: Path):
         res2 = cli.do_start("P/high")
         assert res2 == [{"worker": "high", "result": "already-running"}]
         assert len(fake.calls) == 1  # spawn NOT called again
+
+
+def test_do_start_requires_exact_verified_fact_review_acknowledgement(tmp: Path):
+    fact_id = "a" * 16
+    with _project_env(tmp), _patch_spawn() as fake:
+        cli.do_new("P", roles="high:1")
+        wl = _wl("P", "high")
+        wl.status.write_text(
+            json.dumps(
+                {
+                    "state": "verified_fact_review",
+                    "round": 1,
+                    "last_fact_id": fact_id,
+                    "verified_fact_review": {
+                        "action": "audit_verified_fact_before_restart",
+                        "fact_id": fact_id,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        blocked = _expect_exit(cli.do_start, "P/high")
+        assert "must be audited against PROBLEM.md" in str(blocked)
+        assert fake.calls == []
+
+        wrong = _expect_exit(
+            cli.do_start,
+            "P/high",
+            acknowledge_verified_fact_reviews=["b" * 16],
+        )
+        assert fact_id in str(wrong)
+        assert fake.calls == []
+
+        started = cli.do_start(
+            "P/high",
+            acknowledge_verified_fact_reviews=[fact_id],
+        )
+        assert started == [{"worker": "high", "result": "started"}]
+        assert fake.calls == [wl.dir]
 
 
 def test_do_start_locked_returns_locked(tmp: Path):
@@ -1443,6 +1509,38 @@ def test_fmt_status_rows():
     assert "—" in out  # None age / fact => dash
 
 
+def test_fmt_status_surfaces_verified_fact_and_owner_next_actions():
+    recommendation_id = "recommendation_abc"
+    rows = [
+        {
+            "worker": "max",
+            "lane": "root",
+            "label": "verified_fact_review",
+            "state": "verified_fact_review",
+            "round": 1,
+            "age_s": 1.0,
+            "last_fact_id": "a" * 16,
+            "candidate": None,
+            "verified_fact_review": {
+                "action": "audit_verified_fact_before_restart",
+                "fact_id": "a" * 16,
+            },
+            "owner_action": {
+                "action": "stage_generation_tasks",
+                "recommendation_id": recommendation_id,
+                "task_generation": 4,
+                "missing_workers": ["max", "max2"],
+                "task_staging_ready": False,
+            },
+        }
+    ]
+    out = cli._fmt_status(rows)
+    assert "VERIFIED FACT REVIEW " + "a" * 16 in out
+    assert "audit against PROBLEM.md before restart" in out
+    assert "OWNER ACTION " + recommendation_id in out
+    assert "stage generation 4 tasks for max, max2" in out
+
+
 # --------------------------------------------------------------------------- #
 # _task_from_args: --task / --file / --stdin / none                             #
 # --------------------------------------------------------------------------- #
@@ -1556,6 +1654,15 @@ def test_resolve_requires_complete_next_generation_tasks_and_host_drift_is_ignor
         assert initial["task_staging"]["generation"] == 2
         assert initial["task_staging"]["missing_workers"] == ["xhigh", "xhigh2"]
         assert initial["fail_stop_reason"] == "durable_task_assignment_required"
+        assert initial["owner_action"] == {
+            "action": "stage_generation_tasks",
+            "recommendation_id": recommendation_id,
+            "task_generation": 2,
+            "missing_workers": ["xhigh", "xhigh2"],
+            "task_staging_ready": False,
+            "operator_decision_required": True,
+            "main_agent_executes_control_plane": True,
+        }
 
         root_assignment = cli.do_assign(
             "P/xhigh",
@@ -2387,7 +2494,18 @@ def test_build_parser_all_verbs():
         a.cmd == "finalize" and a.project == "P" and a.fact_ids == ["fact_a", "fact_b"]
     )
     assert p.parse_args(["finalize", "P"]).fact_ids == []  # suggestion mode
-    assert p.parse_args(["start", "P"]).cmd == "start"
+    start = p.parse_args(
+        [
+            "start",
+            "P",
+            "--acknowledge-verified-fact-review",
+            "a" * 16,
+            "--acknowledge-verified-fact-review",
+            "b" * 16,
+        ]
+    )
+    assert start.cmd == "start"
+    assert start.acknowledge_verified_fact_review == ["a" * 16, "b" * 16]
     assert p.parse_args(["status", "P", "--json"]).json is True
     assert p.parse_args(["stop", "P", "--force"]).force is True
     a = p.parse_args(["reset-thread", "P/high", "--expected-thread-id", "thread-lost"])
@@ -2591,6 +2709,7 @@ def test_main_resolve_recommendation_dispatch(tmp: Path):
         )
         assert rc == 0
         assert f"owner-resolved recommendation {recommendation_id}" in out
+        assert "next: bin/danus start P" in out
 
 
 def test_main_start_status_stop(tmp: Path):
@@ -2663,6 +2782,7 @@ def main() -> None:
     no_arg = [
         test_fmt_list_empty_and_rows,
         test_fmt_status_rows,
+        test_fmt_status_surfaces_verified_fact_and_owner_next_actions,
         test_task_from_args_task,
         test_task_from_args_stdin,
         test_task_from_args_none_raises,
@@ -2684,6 +2804,7 @@ def main() -> None:
         test_worker_status_stuck_label,
         test_worker_status_working_and_dead_labels,
         test_do_start_calls_spawn_with_worker_dir,
+        test_do_start_requires_exact_verified_fact_review_acknowledgement,
         test_do_start_locked_returns_locked,
         test_do_start_clears_stale_stop,
         test_do_start_no_workers_raises,

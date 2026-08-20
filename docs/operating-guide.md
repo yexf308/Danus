@@ -29,6 +29,11 @@ codex backend), fills `OPERATOR.md` + `config/danus.env`, brings up the verify
 service, and marks `runtime/.danus-initialized`. After that, every session
 re-reads your `OPERATOR.md` and the project's `PROBLEM.md`.
 
+The initialization marker is authoritative. Without it, the CLI blocks paid and
+state-changing commands and the main agent must not trust a name inherited in
+`OPERATOR.md`. A clean public `main` therefore contains only the blank template;
+the filled profile belongs on a deployment branch such as `deploy/alice`.
+
 ## 1. Start a project
 
 Tell the main agent the problem. It will:
@@ -95,8 +100,10 @@ transmits. `chatgpt_pro_browser` is not the `gpt_pro` API. A browser import is
 untrusted and cannot be guidance until the main agent reviews, synthesizes, and
 records `adopt`. Adoption or `master_guidance` does not release
 `owner_action_required`: audited owner-only resolution of the exact recommendation
-is required before that generation can resume. The owner runs
-`danus resolve-recommendation` with exact-id and paid-resume acknowledgements;
+is required before that generation can resume. After the initialized operator
+makes the decision in the current conversation, the main agent runs
+`danus resolve-recommendation` with exact-id and paid-resume acknowledgements.
+The operator does not need to type the CLI command or repeat a magic phrase;
 adopted guidance must link the same recommendation. Before resolving, run
 `danus assign` for **every** paid lane: while this gate is open those assignments
 target the next generation. Confirm `task_staging.ready=true` in
@@ -109,6 +116,13 @@ prompt/request, and verified local terminal predecessor, with the exact URL
 supplied by file/stdin at prepare and dispatch. Preparation still stops for a
 fresh owner decision; lineage never triggers or inherits Send authority. See
 `browser-advisor.md`.
+
+When a worker promotes any fact, its loop pauses at the round boundary with
+`verified_fact_review`. Before spending another turn, the main agent retrieves
+that exact fact and audits it against `PROBLEM.md`. A target-closing fact stops the
+whole swarm immediately; a supporting fact is incorporated into fresh,
+non-duplicative assignments before an explicit restart using the exact
+`--acknowledge-verified-fact-review <fact_id>` shown by status.
 
 If a worker crashes while a verification candidate is active and the paid
 outcome cannot be reconstructed, the candidate overlay remains frozen with no

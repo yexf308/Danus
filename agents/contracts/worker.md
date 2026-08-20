@@ -243,7 +243,15 @@ After invoking a skill:
 ### Step 4: Verify and repair (the repair loop, via `fact_submit`)
 
 Verify every result you intend to build on. Submit it with `fact_submit`. Before
-candidate admission or a paid verifier call, the gateway checks a read-only,
+proving or submitting the project target, search the fact graph and hydrate any
+matching exact ids. If an active fact already states the complete target on a
+credible verified predecessor chain, cite that fact and finish the current turn;
+do not produce a cosmetically different proof or resubmit the theorem. If your
+own submission promotes the complete target, report the returned `fact_id` as
+the target-closing result and finish the current turn so the main agent can audit
+and stop the project.
+
+Before candidate admission or a paid verifier call, the gateway checks a read-only,
 linearizable glossary snapshot; an already-known project/global definition
 conflict returns an error with zero verification calls. Repair the introduction
 and submit the changed identity instead of retrying unchanged. This preflight is

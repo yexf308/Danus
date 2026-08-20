@@ -25,6 +25,7 @@
     danus rotate-thread <project>/<worker> --expected-thread-id ID --reason TEXT
     danus finalize <project> [--paper <paper_id>] [<fact_id> ...]
     danus start  <project>[/<worker>]
+                 [--acknowledge-verified-fact-review FACT_ID ...]
     danus status <project>[/<worker>] [--json]
     danus stop   <project>[/<worker>] [--force]
 
@@ -47,6 +48,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import signal
 import sqlite3
 import stat
@@ -107,10 +109,15 @@ __all__ = [
 _PID_RECORD_SCHEMA_VERSION = 1
 _MAX_PID_RECORD_BYTES = 4096
 _DARWIN_PROC_PIDTBSDINFO = 3
+_FACT_ID_RE = re.compile(r"[0-9a-f]{16}")
 
 
 class ProcessIdentityError(RuntimeError):
     """A supervisor PID record is malformed or names a different process."""
+
+
+class VerifiedFactReviewRequired(RuntimeError):
+    """A stopped worker has a promoted fact that must be audited before restart."""
 
 
 class _DarwinProcBSDInfo(ctypes.Structure):
@@ -611,6 +618,15 @@ def do_resolve_recommendation(
 ) -> Dict:
     """Owner-only exact-CAS resume after one terminal critic review."""
 
+    def with_resume_action(record: Dict) -> Dict:
+        return {
+            **record,
+            "next_action": {
+                "action": "start_workers",
+                "argv": ["bin/danus", "start", project],
+            },
+        }
+
     try:
         project = L.validate_segment(project, label="project")
         project_dir = L.existing_project_dir(project)
@@ -662,7 +678,7 @@ def do_resolve_recommendation(
                     and prior_resolution["master_guidance_entry_id"]
                     == master_guidance_entry_id
                 ):
-                    return prior_resolution
+                    return with_resume_action(prior_resolution)
                 raise CoordinationError(
                     "recommendation already has a conflicting owner resolution"
                 )
@@ -724,14 +740,16 @@ def do_resolve_recommendation(
                             raise CoordinationError(
                                 "browser master guidance has incomplete adopted receipt"
                             )
-            return store.resolve_recommendation(
-                recommendation_id,
-                resolution=normalized_resolution,
-                owner_acknowledgement=acknowledge_recommendation_id,
-                master_guidance_entry_id=master_guidance_entry_id,
-                master_guidance_record_sha256=record_sha256,
-                browser_request_id=browser_request_id,
-                browser_receipt_sha256=browser_receipt_sha256,
+            return with_resume_action(
+                store.resolve_recommendation(
+                    recommendation_id,
+                    resolution=normalized_resolution,
+                    owner_acknowledgement=acknowledge_recommendation_id,
+                    master_guidance_entry_id=master_guidance_entry_id,
+                    master_guidance_record_sha256=record_sha256,
+                    browser_request_id=browser_request_id,
+                    browser_receipt_sha256=browser_receipt_sha256,
+                )
             )
     except (
         BrowserAdvisorError,
@@ -1241,7 +1259,11 @@ def _cleanup_unregistered_child(proc: subprocess.Popen) -> None:
             pass
 
 
-def _start_one(wl: L.WorkerLayout) -> str:
+def _start_one(
+    wl: L.WorkerLayout,
+    *,
+    acknowledged_verified_fact_ids: frozenset[str] = frozenset(),
+) -> str:
     """Returns 'started' / 'already-running' / 'locked'. Idempotent via an flock
     on .pid.lock; clears a stale .stop before spawning."""
     wl.dir.mkdir(parents=True, exist_ok=True)
@@ -1257,6 +1279,26 @@ def _start_one(wl: L.WorkerLayout) -> str:
             if _pid_record_is_live(previous):
                 return "already-running"
             _unlink_pid_record(wl, previous)
+        prior_status = _read_status(wl)
+        if prior_status.get("state") == "verified_fact_review":
+            fact_id = prior_status.get("last_fact_id")
+            review = prior_status.get("verified_fact_review")
+            if (
+                not isinstance(fact_id, str)
+                or _FACT_ID_RE.fullmatch(fact_id) is None
+                or not isinstance(review, dict)
+                or review.get("fact_id") != fact_id
+            ):
+                raise VerifiedFactReviewRequired(
+                    "verified-fact review state is malformed; inspect status and "
+                    "the fact graph before any restart"
+                )
+            if fact_id not in acknowledged_verified_fact_ids:
+                raise VerifiedFactReviewRequired(
+                    f"verified fact {fact_id} must be audited against PROBLEM.md; "
+                    "after review, repeat start with "
+                    f"--acknowledge-verified-fact-review {fact_id}"
+                )
         wl.stop.unlink(missing_ok=True)  # clear a stale stop flag
         previous_sigchld = signal.getsignal(signal.SIGCHLD)
         # SIG_IGN/SA_NOCLDWAIT inherited from an embedding shell would let a
@@ -1301,17 +1343,32 @@ def _start_one(wl: L.WorkerLayout) -> str:
         lock.close()
 
 
-def do_start(target: str, stagger: float = 0.2) -> List[Dict]:
+def do_start(
+    target: str,
+    stagger: float = 0.2,
+    *,
+    acknowledge_verified_fact_reviews: Optional[List[str]] = None,
+) -> List[Dict]:
     dirs = L.target_worker_dirs(target)
     if not dirs:
         raise SystemExit(f"no workers for target {target!r}")
+    acknowledged = frozenset(acknowledge_verified_fact_reviews or [])
+    if any(_FACT_ID_RE.fullmatch(fact_id) is None for fact_id in acknowledged):
+        raise SystemExit(
+            "--acknowledge-verified-fact-review requires a 16-hex fact_id"
+        )
     out = []
     for i, wdir in enumerate(dirs):
         if i and stagger:
             time.sleep(stagger)
         wl = L.WorkerLayout(wdir)
         try:
-            result = _start_one(wl)
+            result = _start_one(
+                wl,
+                acknowledged_verified_fact_ids=acknowledged,
+            )
+        except VerifiedFactReviewRequired as exc:
+            raise SystemExit(f"cannot start {wl.project}/{wl.name}: {exc}") from exc
         except ProcessIdentityError as exc:
             raise SystemExit(
                 f"cannot start {wl.project}/{wl.name}: {exc}. Inspect {wl.pid}; "
@@ -1362,6 +1419,74 @@ def _bounded_status_scalar(value: object, *, max_bytes: int = 512) -> object:
             return None
         return value if len(encoded) <= max_bytes else None
     return None
+
+
+def _owner_action_projection(coordination_view: Dict[str, object]) -> Optional[Dict]:
+    """Return one bounded, actionable projection for an owner gate."""
+
+    if coordination_view.get("phase") != "owner_action_required":
+        return None
+    recommendation = coordination_view.get("recommendation")
+    task_staging = coordination_view.get("task_staging")
+    if not isinstance(recommendation, dict) or not isinstance(task_staging, dict):
+        return None
+    recommendation_id = recommendation.get("recommendation_id")
+    missing_workers = task_staging.get("missing_workers")
+    ready = task_staging.get("ready")
+    generation = task_staging.get("generation")
+    if (
+        not isinstance(recommendation_id, str)
+        or not recommendation_id
+        or len(recommendation_id.encode("utf-8")) > 256
+        or not isinstance(missing_workers, list)
+        or not all(
+            isinstance(worker, str) and worker and len(worker.encode("utf-8")) <= 128
+            for worker in missing_workers
+        )
+        or not isinstance(ready, bool)
+        or isinstance(generation, bool)
+        or not isinstance(generation, int)
+    ):
+        return None
+    return {
+        "action": (
+            "stage_generation_tasks" if missing_workers else "resolve_recommendation"
+        ),
+        "recommendation_id": recommendation_id,
+        "task_generation": generation,
+        "missing_workers": list(missing_workers),
+        "task_staging_ready": ready,
+        "operator_decision_required": True,
+        "main_agent_executes_control_plane": True,
+    }
+
+
+def _verified_fact_review_projection(
+    wl: L.WorkerLayout,
+    status: Dict,
+) -> Optional[Dict]:
+    raw = status.get("verified_fact_review")
+    if raw is None:
+        return None
+    fact_id = status.get("last_fact_id")
+    if (
+        not isinstance(raw, dict)
+        or not isinstance(fact_id, str)
+        or _FACT_ID_RE.fullmatch(fact_id) is None
+        or raw.get("fact_id") != fact_id
+    ):
+        return {"action": "inspect_malformed_verified_fact_review"}
+    return {
+        "action": "audit_verified_fact_before_restart",
+        "fact_id": fact_id,
+        "restart_argv": [
+            "bin/danus",
+            "start",
+            f"{wl.project}/{wl.name}",
+            "--acknowledge-verified-fact-review",
+            fact_id,
+        ],
+    }
 
 
 def worker_status(wl: L.WorkerLayout) -> Dict:
@@ -1468,7 +1593,15 @@ def worker_status(wl: L.WorkerLayout) -> Dict:
         label = (
             state
             if state
-            in ("stopped", "deadline", "max_rounds", "error", "terminated", "created")
+            in (
+                "stopped",
+                "deadline",
+                "max_rounds",
+                "error",
+                "terminated",
+                "created",
+                "verified_fact_review",
+            )
             else "dead"
         )
     recovery_required = st.get("recovery_required")
@@ -1542,6 +1675,7 @@ def worker_status(wl: L.WorkerLayout) -> Dict:
         "round": st.get("round", 0),
         "age_s": round(age, 1) if age is not None else None,
         "last_fact_id": st.get("last_fact_id"),
+        "verified_fact_review": _verified_fact_review_projection(wl, st),
         "label": label,
         # Kept out of the compact table but exposed in --json so an owner can
         # CAS-fence an explicit recovery after a server-side thread deletion.
@@ -1601,6 +1735,7 @@ def worker_status(wl: L.WorkerLayout) -> Dict:
         "explorer_workers": coordination_view.get("explorer_workers", []),
         "coordination_mode": coordination_view.get("mode"),
         "coordination_error": coordination_error,
+        "owner_action": _owner_action_projection(coordination_view),
     }
 
 
@@ -1717,9 +1852,41 @@ def do_list() -> List[Dict]:
                 "coordination_mode": coordination_view.get("mode"),
                 "coordination_error": coordination_error,
                 "model": meta.get("model", "—"),
+                "owner_action": _owner_action_projection(coordination_view),
             }
         )
     return out
+
+
+def _owner_action_lines(rows: List[Dict]) -> List[str]:
+    actions = {
+        action["recommendation_id"]: action
+        for action in (row.get("owner_action") for row in rows)
+        if isinstance(action, dict)
+        and isinstance(action.get("recommendation_id"), str)
+    }
+    lines: List[str] = []
+    for action in actions.values():
+        missing = action.get("missing_workers") or []
+        if missing:
+            message = (
+                "OWNER ACTION "
+                + str(action["recommendation_id"])
+                + ": stage generation "
+                + str(action.get("task_generation"))
+                + " tasks for "
+                + ", ".join(str(worker) for worker in missing)
+                + "; then resolve the exact recommendation."
+            )
+        else:
+            message = (
+                "OWNER ACTION "
+                + str(action["recommendation_id"])
+                + ": tasks are staged; the main agent must persist the "
+                "initialized operator's decision with resolve-recommendation."
+            )
+        lines.extend(["", message])
+    return lines
 
 
 def _fmt_list(rows: List[Dict]) -> str:
@@ -1738,7 +1905,10 @@ def _fmt_list(rows: List[Dict]) -> str:
             f"{str((r.get('candidate') or {}).get('state', '—')):<16}"
             f"{str(r['model']):<12}"
         )
-    return "\n".join(lines) if rows else "(no projects under the agents root)"
+    if not rows:
+        return "(no projects under the agents root)"
+    lines.extend(_owner_action_lines(rows))
+    return "\n".join(lines)
 
 
 def _fmt_status(rows: List[Dict]) -> str:
@@ -1755,6 +1925,20 @@ def _fmt_status(rows: List[Dict]) -> str:
             f"{str((r.get('candidate') or {}).get('state', '—')):<16}"
             f"{str(r['last_fact_id'] or '—'):<16}"
         )
+    reviews = {
+        review.get("fact_id")
+        for review in (row.get("verified_fact_review") for row in rows)
+        if isinstance(review, dict) and isinstance(review.get("fact_id"), str)
+    }
+    for fact_id in sorted(reviews):
+        lines.extend(
+            [
+                "",
+                f"VERIFIED FACT REVIEW {fact_id}: audit against PROBLEM.md "
+                "before restart; stop the project if it closes the target.",
+            ]
+        )
+    lines.extend(_owner_action_lines(rows))
     return "\n".join(lines)
 
 
@@ -2035,6 +2219,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("start", help="launch worker loop(s)")
     s.add_argument("target", help="<project> or <project>/<worker>")
+    s.add_argument(
+        "--acknowledge-verified-fact-review",
+        action="append",
+        default=[],
+        metavar="FACT_ID",
+        help=(
+            "exact promoted fact already audited against PROBLEM.md; repeat for "
+            "each paused fact when starting a whole project"
+        ),
+    )
 
     st = sub.add_parser("status", help="liveness + progress")
     st.add_argument("target", help="<project> or <project>/<worker>")
@@ -2150,7 +2344,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
         print(
             f"{args.project}: owner-resolved recommendation "
-            f"{r['recommendation_id']} as {r['resolution']}"
+            f"{r['recommendation_id']} as {r['resolution']}\n"
+            f"next: {' '.join(r['next_action']['argv'])}"
         )
     elif args.cmd == "cancel-prepared-intent":
         r = do_cancel_prepared_intent(
@@ -2204,7 +2399,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                 f"  wrote {r['target_file']}"
             )
     elif args.cmd == "start":
-        for r in do_start(args.target):
+        for r in do_start(
+            args.target,
+            acknowledge_verified_fact_reviews=(
+                args.acknowledge_verified_fact_review
+            ),
+        ):
             print(f"{r['worker']}: {r['result']}")
     elif args.cmd == "status":
         rows = do_status(args.target)

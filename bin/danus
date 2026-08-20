@@ -4,4 +4,22 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/../scripts/env.sh"
+
+# Do not launch paid or state-changing work under a stale OPERATOR.md from a
+# clean clone or copied source tree. Read-only inspection and emergency stop
+# remain available so an operator can diagnose or wind down a copied runtime.
+case "${1:-}" in
+  ""|-h|--help|list|status|messages|stop) ;;
+  *)
+    if [ ! -f "$DANUS_RUNTIME/.danus-initialized" ] || \
+       [ ! -f "$DANUS_ROOT/OPERATOR.md" ] || \
+       grep -Eq '_\((ask once|the language|for scheduling)|fill in' "$DANUS_ROOT/OPERATOR.md" 2>/dev/null; then
+      printf '%s\n' \
+        "Danus deployment identity is not initialized; paid or state-changing commands are blocked." \
+        "Open Codex at the repository root and run the initialize interview. Do not trust any name already present in OPERATOR.md." >&2
+      exit 78
+    fi
+    ;;
+esac
+
 exec "$DANUS_PY" -I -B -m danus.orchestration "$@"

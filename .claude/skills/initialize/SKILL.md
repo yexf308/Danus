@@ -7,10 +7,13 @@ description: First-run setup interview for a Danus deployment. Run it on the FIR
 
 You are the Danus main agent meeting this operator for the first time on this
 deployment. Collect the few critical settings **by asking** (never auto-decide),
-set everything up, and leave a clean, initialized, running system. Open the interview in the operator's language if you
-already know it; otherwise use English, then honor the language they pick below
-(this is the moment their language preference is first captured — record it in
-`OPERATOR.md` and follow it thereafter).
+set everything up, and leave a clean, initialized, running system. When
+`runtime/.danus-initialized` is absent, do not infer the operator's identity or
+language from an existing `OPERATOR.md`; it may have arrived from a copied or
+mis-published deployment. Open in English unless the person in the current
+conversation has already chosen another language, then honor the language they
+pick below. This is the moment their preference is first captured: record it in
+`OPERATOR.md` and follow it thereafter.
 
 ## 0. Greet + orient (brief)
 
@@ -57,7 +60,10 @@ Then ask, as plain text questions:
 
 ## 3. Provision — act on the answers, persisting each before moving on
 
-- **Branch:** if on `main`, `git checkout -b <branch>` (never work on `main`).
+- **Branch:** if on `main`, `git switch -c <branch>` (never work on `main`). A
+  filled `OPERATOR.md` belongs only to this deployment branch. Keep the
+  distributable `main` copy as the blank template, and never merge a personalized
+  operator profile back into it.
 - **Config:** `cp -n config/danus.env.example config/danus.env`; set `CODEX_BACKEND`
   and `DANUS_CONSULT_TRANSPORT` (`gpt_pro` / `claude_api` / `claude_code` / `off`) to their choices. If the backend is
   the OpenAI-compatible key, `cp -n config/codex.env.example config/codex.env` and
@@ -110,3 +116,6 @@ voice** (see that folder's `README.md`; a complete paper is produced either way)
   `bash scripts/...` call fail — `cd` to the project dir first if unsure.
 - **Persist each answer before moving on**, and only write `runtime/.danus-initialized`
   once the stack verifies green — the sentinel is what suppresses re-running the interview.
+- **No inherited owner:** without that sentinel, a pre-filled name in
+  `OPERATOR.md` never authorizes work, spend, browser transmission, or a
+  recommendation resolution.
